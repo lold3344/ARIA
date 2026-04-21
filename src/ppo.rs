@@ -1,4 +1,4 @@
-use ndarray::{Array1, Array2};
+use ndarray::Array1;
 use crate::model::Model;
 
 pub struct PPOTrainer {
@@ -43,20 +43,17 @@ impl PPOTrainer {
         }
 
         let mean_return = returns.iter().sum::<f32>() / returns.len() as f32;
-        let std_return = {
-            let variance = returns.iter()
-                .map(|r| (r - mean_return).powi(2))
-                .sum::<f32>() / returns.len() as f32;
-            variance.sqrt().max(1e-8)
-        };
+        let _variance = returns.iter()
+            .map(|r| (r - mean_return).powi(2))
+            .sum::<f32>() / returns.len() as f32;
 
         for exp in batch.iter() {
-            let (logits, value) = model.forward(&exp.tokens);
+            let (logits, state_value) = model.forward(&exp.tokens);
             
             let new_log_prob = model.get_action_log_prob(&logits, exp.action);
             let ratio = (new_log_prob - exp.log_prob).exp();
             
-            let advantage = (exp.reward - value).max(-1.0).min(1.0);
+            let advantage = (exp.reward - state_value).max(-1.0).min(1.0);
             
             let policy_loss = -(ratio * advantage).min(
                 ((1.0 + self.clip_ratio) * advantage).min(
@@ -64,7 +61,7 @@ impl PPOTrainer {
                 )
             );
 
-            let value_loss = (value - exp.reward).powi(2);
+            let value_loss = (state_value - exp.reward).powi(2);
             
             let probs = model.softmax(&logits);
             let entropy = -probs.iter()
@@ -75,11 +72,11 @@ impl PPOTrainer {
             let total_loss = policy_loss + 0.5 * value_loss - self.entropy_coef * entropy;
 
             let lr_scaled = self.learning_rate / (batch.len() as f32);
-            self.apply_gradient(model, &logits, total_loss, lr_scaled);
+            self.apply_gradient(model, total_loss, lr_scaled);
         }
     }
 
-    fn apply_gradient(&self, model: &mut Model, logits: &Array1<f32>, loss: f32, lr: f32) {
+    fn apply_gradient(&self, model: &mut Model, loss: f32, lr: f32) {
         let dloss = loss * lr;
         
         for layer in model.policy_head.iter_mut() {

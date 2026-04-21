@@ -10,10 +10,8 @@ use crate::model::Model;
 use crate::ppo::{PPOTrainer, Experience};
 use crate::tokenizer::Tokenizer;
 use crate::storage::{EncryptionManager, DialogEntry, get_current_timestamp};
-use crate::db;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     println!("╔════════════════════════════════════╗");
     println!("║     ARIA - Adaptive Reasoning      ║");
     println!("║        Intelligence Agent         ║");
@@ -24,11 +22,10 @@ async fn main() -> anyhow::Result<()> {
 
     let encryptor = EncryptionManager::new(&encryption_key)?;
     
-    let db_url = "sqlite:///tmp/aria_dialogs.db";
-    let pool = db::init_db(db_url).await?;
+    let db_path = "aria_dialogs.json";
+    db::init_db(db_path)?;
 
     let session_id = Uuid::new_v4().to_string();
-    db::create_session(&pool, &session_id).await?;
     println!("📝 Session ID: {}\n", session_id);
 
     let mut tokenizer = Tokenizer::new();
@@ -80,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
             reward: None,
         };
 
-        db::insert_dialog(&pool, &user_entry, &session_id).await?;
+        db::insert_dialog(db_path, &user_entry, &session_id)?;
 
         let (logits, value) = model.forward(&tokens);
         let (action, log_prob) = model.sample_action(&logits);
@@ -110,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
             reward: None,
         };
 
-        db::insert_dialog(&pool, &aria_entry, &session_id).await?;
+        db::insert_dialog(db_path, &aria_entry, &session_id)?;
 
         println!("ARIA: {}\n", response_text);
 
@@ -127,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
             -0.5
         };
 
-        db::update_dialog_reward(&pool, &aria_entry_id, reward).await?;
+        db::update_dialog_reward(db_path, &aria_entry_id, reward)?;
 
         let experience = Experience {
             tokens: tokens.clone(),

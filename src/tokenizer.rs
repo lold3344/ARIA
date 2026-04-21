@@ -22,9 +22,8 @@ impl Tokenizer {
     }
 
     pub fn encode(&mut self, text: &str) -> Vec<usize> {
-        let words: Vec<&str> = text.to_lowercase()
-            .split_whitespace()
-            .collect();
+        let lowercase = text.to_lowercase();
+        let words: Vec<&str> = lowercase.split_whitespace().collect();
 
         let mut tokens = vec![self.word_to_id["<START>"]];
 

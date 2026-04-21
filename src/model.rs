@@ -1,10 +1,7 @@
 use ndarray::{Array1, Array2};
-use rand::thread_rng;
-use rand_distr::StandardNormal;
 use ndarray_rand::RandomExt;
-use serde::{Deserialize, Serialize};
+use rand_distr::Normal;
 
-#[derive(Serialize, Deserialize, Clone)]
 pub struct Model {
     pub embed: Array2<f32>,
     pub w1: Array2<f32>,
@@ -17,22 +14,17 @@ pub struct Model {
 
 impl Model {
     pub fn new(vocab_size: usize, embed_dim: usize, hidden_dim: usize, output_dim: usize) -> Self {
-        let mut rng = thread_rng();
         let scale = 1.0 / (embed_dim as f32).sqrt();
+        let normal = Normal::new(0.0, scale).unwrap();
         
         Model {
-            embed: Array2::random_using(&mut rng, (vocab_size, embed_dim), StandardNormal)
-                * scale,
-            w1: Array2::random_using(&mut rng, (embed_dim, hidden_dim), StandardNormal)
-                * (1.0 / (embed_dim as f32).sqrt()),
+            embed: Array2::random((vocab_size, embed_dim), normal),
+            w1: Array2::random((embed_dim, hidden_dim), Normal::new(0.0, 1.0 / (embed_dim as f32).sqrt()).unwrap()),
             b1: Array1::zeros(hidden_dim),
-            w2: Array2::random_using(&mut rng, (hidden_dim, output_dim), StandardNormal)
-                * (1.0 / (hidden_dim as f32).sqrt()),
+            w2: Array2::random((hidden_dim, output_dim), Normal::new(0.0, 1.0 / (hidden_dim as f32).sqrt()).unwrap()),
             b2: Array1::zeros(output_dim),
-            policy_head: Array2::random_using(&mut rng, (output_dim, vocab_size), StandardNormal)
-                * (1.0 / (output_dim as f32).sqrt()),
-            value_head: Array2::random_using(&mut rng, (output_dim, 1), StandardNormal)
-                * (1.0 / (output_dim as f32).sqrt()),
+            policy_head: Array2::random((output_dim, vocab_size), Normal::new(0.0, 1.0 / (output_dim as f32).sqrt()).unwrap()),
+            value_head: Array2::random((output_dim, 1), Normal::new(0.0, 1.0 / (output_dim as f32).sqrt()).unwrap()),
         }
     }
 
@@ -57,7 +49,7 @@ impl Model {
         let logits = output.dot(&self.policy_head);
         let value = output.dot(&self.value_head);
 
-        (logits, value[[0, 0]])
+        (logits, value[0])
     }
 
     pub fn relu(&self, x: &Array1<f32>) -> Array1<f32> {
@@ -79,11 +71,11 @@ impl Model {
         for (i, &prob) in probs.iter().enumerate() {
             cumsum += prob;
             if rand_val < cumsum {
-                return (i, prob.ln());
+                return (i, prob.ln().max(-20.0));
             }
         }
         
-        (probs.len() - 1, probs[probs.len() - 1].ln())
+        (probs.len() - 1, probs[probs.len() - 1].ln().max(-20.0))
     }
 
     pub fn get_action_log_prob(&self, logits: &Array1<f32>, action: usize) -> f32 {
