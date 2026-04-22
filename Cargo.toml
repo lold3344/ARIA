@@ -1,6 +1,6 @@
 [package]
 name = "aria"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -15,6 +15,8 @@ base64 = "0.21"
 anyhow = "1.0"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 hex = "0.4"
+half = "2.4"
+rayon = "1.7"
 
 [[bin]]
 name = "aria"

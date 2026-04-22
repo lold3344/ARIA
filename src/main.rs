@@ -20,7 +20,8 @@ struct Stats {
 
 fn main() -> anyhow::Result<()> {
     println!("=====================================");
-    println!("ARIA - Adaptive Reasoning Intelligence Agent");
+    println!("ARIA v2 - LSTM with 25M Parameters");
+    println!("GPU-Optimized Language Model");
     println!("=====================================\n");
 
     let encryption_key = storage::EncryptionManager::generate_key();
@@ -50,13 +51,12 @@ fn main() -> anyhow::Result<()> {
     println!("  - data base/fan fiction.txt");
     println!("  - data base/words.txt");
     println!("  - data base/news.txt\n");
-    println!("Add your text content to these files and run ARIA again.\n");
 
     let session_id = Uuid::new_v4().to_string();
     println!("Session ID: {}\n", session_id);
-    
-    let embed_dim = 128;
-    let hidden_dim = 256;
+    let embed_dim = 384;      // Embedding dimension
+    let hidden_dim = 1536;    // LSTM hidden dimension
+    let vocab_size = 8000;    // Vocabulary size
     
     let model_path = "aria_model.json";
     let tokenizer_path = "aria_tokenizer.json";
@@ -64,9 +64,9 @@ fn main() -> anyhow::Result<()> {
     let model_exists = std::path::Path::new(model_path).exists();
     let tokenizer_exists = std::path::Path::new(tokenizer_path).exists();
     
-    let (mut model, mut tokenizer) = if model_exists && tokenizer_exists {
+    let (model, mut tokenizer) = if model_exists && tokenizer_exists {
         println!("Loading pre-trained model and tokenizer...");
-        match (LSTMModel::load(model_path, 5000, embed_dim, hidden_dim), Tokenizer::load(tokenizer_path)) {
+        match (LSTMModel::load(model_path, vocab_size, embed_dim, hidden_dim), Tokenizer::load(tokenizer_path)) {
             (Ok(m), Ok(t)) => {
                 println!("Model loaded from: {}", model_path);
                 println!("Tokenizer loaded from: {}", tokenizer_path);
@@ -76,7 +76,7 @@ fn main() -> anyhow::Result<()> {
             _ => {
                 println!("Failed to load. Training from scratch.\n");
                 let mut t = Tokenizer::new();
-                let mut m = LSTMModel::new(5000, embed_dim, hidden_dim);
+                let mut m = LSTMModel::new(vocab_size, embed_dim, hidden_dim);
                 
                 println!("Pre-training on text files from: {}", data_dir);
                 pretraining::pretrain_from_files(&mut m, &mut t, data_dir).ok();
@@ -91,14 +91,16 @@ fn main() -> anyhow::Result<()> {
             }
         }
     } else {
-        println!("Initializing LSTM model...");
+        println!("Initializing LSTM model with 25M parameters...");
         println!("  - Embedding dim: {}", embed_dim);
         println!("  - Hidden dim: {}", hidden_dim);
+        println!("  - Vocabulary: {}", vocab_size);
+        println!();
         
         let mut t = Tokenizer::new();
-        let mut m = LSTMModel::new(5000, embed_dim, hidden_dim);
+        let mut m = LSTMModel::new(vocab_size, embed_dim, hidden_dim);
         
-        println!("\nPre-training on text files from: {}", data_dir);
+        println!("Pre-training on text files from: {}", data_dir);
         pretraining::pretrain_from_files(&mut m, &mut t, data_dir).ok();
         
         println!("\nSaving model to: {}", model_path);
@@ -110,7 +112,7 @@ fn main() -> anyhow::Result<()> {
         (m, t)
     };
 
-    println!("\nTokenizer vocabulary size: {}", tokenizer.vocab_size());
+    println!("Tokenizer vocabulary size: {}", tokenizer.vocab_size());
     println!("\nCommands:");
     println!("  stats - show statistics");
     println!("  Reward: 'I like' at the start of response");
@@ -133,7 +135,7 @@ fn main() -> anyhow::Result<()> {
         let input = input.trim();
 
         if input == "exit" {
-            println!("\nGoodbye!");
+            println!("\nGoodbye");
             break;
         }
 
@@ -175,9 +177,9 @@ fn main() -> anyhow::Result<()> {
         let (action, _log_prob) = model.sample_action(&logits);
 
         let mut response_tokens = Vec::new();
-        let mut current_state = model.init_state(256);
+        let mut current_state = model.init_state();
 
-        for _ in 0..8 {
+        for _ in 0..12 {
             if action >= tokenizer.vocab_size() {
                 break;
             }
