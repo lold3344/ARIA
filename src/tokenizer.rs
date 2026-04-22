@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs;
 
 pub struct Tokenizer {
     word_to_id: HashMap<String, usize>,
@@ -23,7 +24,9 @@ impl Tokenizer {
 
     pub fn encode(&mut self, text: &str) -> Vec<usize> {
         let lowercase = text.to_lowercase();
-        let words: Vec<&str> = lowercase.split_whitespace().collect();
+        let words: Vec<&str> = lowercase
+            .split_whitespace()
+            .collect();
 
         let mut tokens = vec![self.word_to_id["<START>"]];
 
@@ -63,13 +66,49 @@ impl Tokenizer {
         self.word_to_id.len()
     }
 
-    pub fn add_word(&mut self, word: &str) -> usize {
-        let id = self.word_to_id.len();
-        let token_id = *self.word_to_id.entry(word.to_string())
-            .or_insert(id);
-        if !self.id_to_word.contains_key(&token_id) {
-            self.id_to_word.insert(token_id, word.to_string());
+    pub fn id_to_word(&self, id: usize) -> Option<String> {
+        self.id_to_word.get(&id).cloned()
+    }
+
+    pub fn save(&self, path: &str) -> anyhow::Result<()> {
+        let data = serde_json::json!({
+            "word_to_id": self.word_to_id,
+            "id_to_word": self.id_to_word.iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect::<HashMap<String, String>>(),
+        });
+        
+        fs::write(path, serde_json::to_string_pretty(&data)?)?;
+        Ok(())
+    }
+
+    pub fn load(path: &str) -> anyhow::Result<Self> {
+        let content = fs::read_to_string(path)?;
+        let data: serde_json::Value = serde_json::from_str(&content)?;
+        
+        let mut tokenizer = Tokenizer {
+            word_to_id: HashMap::new(),
+            id_to_word: HashMap::new(),
+        };
+        
+        if let Some(w2i) = data["word_to_id"].as_object() {
+            for (word, id) in w2i {
+                if let Some(id_num) = id.as_u64() {
+                    tokenizer.word_to_id.insert(word.clone(), id_num as usize);
+                }
+            }
         }
-        token_id
+        
+        if let Some(i2w) = data["id_to_word"].as_object() {
+            for (id_str, word) in i2w {
+                if let Ok(id_num) = id_str.parse::<usize>() {
+                    if let Some(w) = word.as_str() {
+                        tokenizer.id_to_word.insert(id_num, w.to_string());
+                    }
+                }
+            }
+        }
+        
+        Ok(tokenizer)
     }
 }
