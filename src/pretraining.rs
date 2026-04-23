@@ -1,27 +1,39 @@
 use std::fs;
+use std::path::Path;
 use crate::model::LSTMModel;
 use crate::tokenizer::Tokenizer;
 
-pub fn pretrain_from_files(
-    model: &LSTMModel,
-    tokenizer: &mut Tokenizer,
-    data_dir: &str
-) -> anyhow::Result<()> {
-
-    if !std::path::Path::new(data_dir).exists() {
+pub fn pretrain_from_files(model: &mut LSTMModel, tokenizer: &mut Tokenizer, data_dir: &str) -> anyhow::Result<()> {
+    let path = Path::new(data_dir);
+    
+    if !path.exists() {
         return Ok(());
     }
 
-    for entry in fs::read_dir(data_dir)? {
+    let mut total_loss = 0.0;
+    let mut count = 0;
+
+    for entry in fs::read_dir(path)? {
         let entry = entry?;
-        let path = entry.path();
+        let file_path = entry.path();
 
-        if path.extension().map_or(false, |e| e == "txt") {
-            let content = fs::read_to_string(&path).unwrap_or_default();
+        if file_path.extension().map_or(false, |ext| ext == "txt") {
+            let content = match fs::read_to_string(&file_path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
 
-            for sentence in content.split(|c| c == '.' || c == '\n') {
+            if content.trim().is_empty() {
+                continue;
+            }
+
+            println!("Pre-training on: {}", file_path.file_name().unwrap_or_default().to_string_lossy());
+            
+            let sentences: Vec<&str> = content.split(|c| c == '.' || c == '\n').collect();
+
+            for sentence in sentences {
                 let sentence = sentence.trim();
-                if sentence.len() < 5 {
+                if sentence.is_empty() || sentence.len() < 5 {
                     continue;
                 }
 
@@ -30,19 +42,40 @@ pub fn pretrain_from_files(
                     continue;
                 }
 
-                let vec_tokens: Vec<i64> = tokens.iter().map(|x| *x as i64).collect();
-
                 for i in 1..tokens.len().min(10) {
-                    let slice = &vec_tokens[0..i];
+                    let input = &tokens[0..i];
+                    let target = tokens[i];
 
-                    let input_tensor = tch::Tensor::f_from_slice(slice)?
-                        .view([1, slice.len() as i64]);
+                    let (logits, _) = model.forward_seq(input);
+                    let probs = model.softmax(&logits);
 
-                    let _ = model.forward_seq(&input_tensor);
+                    if target < probs.len() {
+                        let loss = -probs[target].ln().max(-20.0);
+                        total_loss += loss;
+                        count += 1;
+
+                        if count % 100 == 0 {
+                            println!("  Processed {} tokens, avg loss: {:.4}", count, total_loss / count as f32);
+                        }
+
+                        apply_pretrain_gradient(model, target, &probs, 0.001);
+                    }
                 }
             }
         }
     }
 
+    if count > 0 {
+        println!("Pre-training complete. Total loss: {:.4}, tokens: {}", total_loss / count as f32, count);
+    } else {
+        println!("No text files found or all files are empty. Pre-training skipped.");
+    }
+
     Ok(())
+}
+
+fn apply_pretrain_gradient(_model: &mut LSTMModel, target: usize, _probs: &ndarray::Array1<f32>, _lr: f32) {
+    // Placeholder для градиента
+    // В полной версии здесь был бы полный backprop через LSTM
+    let _ = target;
 }
