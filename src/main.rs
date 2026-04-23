@@ -20,8 +20,8 @@ struct Stats {
 
 fn main() -> anyhow::Result<()> {
     println!("=====================================");
-    println!("ARIA v2 - LSTM with 25M Parameters");
-    println!("GPU-Optimized Language Model");
+    println!("                 ARIA                ");
+    println!("Adaptive Reasoning Intelligence Agent");
     println!("=====================================\n");
 
     let encryption_key = storage::EncryptionManager::generate_key();
@@ -54,8 +54,6 @@ fn main() -> anyhow::Result<()> {
 
     let session_id = Uuid::new_v4().to_string();
     println!("Session ID: {}\n", session_id);
-    
-    // 25M параметров модель
     let embed_dim = 384;      // Embedding dimension
     let hidden_dim = 1536;    // LSTM hidden dimension
     let vocab_size = 8000;    // Vocabulary size
@@ -93,7 +91,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
     } else {
-        println!("Initializing LSTM model with 25M parameters...");
+        println!("Initializing...");
         println!("  - Embedding dim: {}", embed_dim);
         println!("  - Hidden dim: {}", hidden_dim);
         println!("  - Vocabulary: {}", vocab_size);
@@ -137,7 +135,7 @@ fn main() -> anyhow::Result<()> {
         let input = input.trim();
 
         if input == "exit" {
-            println!("\nGoodbye!");
+            println!("\nGoodbye");
             break;
         }
 
@@ -197,7 +195,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         let response_text = if response_tokens.is_empty() {
-            "I cannot generate a response right now.".to_string()
+            "Cannot generate a response right now.".to_string()
         } else {
             tokenizer.decode(&response_tokens)
         };
