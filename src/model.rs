@@ -1,181 +1,130 @@
-use ndarray::{Array1, Array2};
-use ndarray_rand::RandomExt;
-use rand_distr::Normal;
-use std::sync::Arc;
+mod model;
+mod tokenizer;
+mod storage;
+mod db;
+mod pretraining;
 
-pub struct LSTMModel {
-    pub embed: Arc<Array2<f32>>,
-    
-    pub w_ii: Arc<Array2<f32>>,
-    pub w_hi: Arc<Array2<f32>>,
-    pub b_i: Arc<Array1<f32>>,
-    
-    pub w_if: Arc<Array2<f32>>,
-    pub w_hf: Arc<Array2<f32>>,
-    pub b_f: Arc<Array1<f32>>,
-    
-    pub w_io: Arc<Array2<f32>>,
-    pub w_ho: Arc<Array2<f32>>,
-    pub b_o: Arc<Array1<f32>>,
-    
-    pub w_ig: Arc<Array2<f32>>,
-    pub w_hg: Arc<Array2<f32>>,
-    pub b_g: Arc<Array1<f32>>,
-    
-    pub w_out: Arc<Array2<f32>>,
-    pub b_out: Arc<Array1<f32>>,
-    
-    pub vocab_size: usize,
-    pub embed_dim: usize,
-    pub hidden_dim: usize,
+use std::io::{self, Write};
+use std::fs;
+use uuid::Uuid;
+use tch::Tensor;
+use crate::model::LSTMModel;
+use crate::tokenizer::Tokenizer;
+use crate::storage::EncryptionManager;
+
+struct Stats {
+    total_messages: u32,
+    positive_rewards: u32,
+    negative_rewards: u32,
+    total_loss: f32,
 }
 
-#[derive(Clone)]
-pub struct LSTMState {
-    pub h: Array1<f32>,
-    pub c: Array1<f32>,
-}
+fn main() -> anyhow::Result<()> {
+    println!("=====================================");
+    println!("ARIA - Adaptive Reasoning Intelligence Agent");
+    println!("=====================================\n");
 
-impl LSTMModel {
-    pub fn new(vocab_size: usize, embed_dim: usize, hidden_dim: usize) -> Self {
-        let scale_embed = 1.0 / (embed_dim as f32).sqrt();
-        let scale_hidden = 1.0 / (hidden_dim as f32).sqrt();
-        
-        LSTMModel {
-            embed: Arc::new(Array2::random((vocab_size, embed_dim), Normal::new(0.0, scale_embed).unwrap())),
-            
-            w_ii: Arc::new(Array2::random((embed_dim, hidden_dim), Normal::new(0.0, scale_hidden).unwrap())),
-            w_hi: Arc::new(Array2::random((hidden_dim, hidden_dim), Normal::new(0.0, scale_hidden).unwrap())),
-            b_i: Arc::new(Array1::zeros(hidden_dim)),
-            
-            w_if: Arc::new(Array2::random((embed_dim, hidden_dim), Normal::new(0.0, scale_hidden).unwrap())),
-            w_hf: Arc::new(Array2::random((hidden_dim, hidden_dim), Normal::new(0.0, scale_hidden).unwrap())),
-            b_f: Arc::new(Array1::zeros(hidden_dim)),
-            
-            w_io: Arc::new(Array2::random((embed_dim, hidden_dim), Normal::new(0.0, scale_hidden).unwrap())),
-            w_ho: Arc::new(Array2::random((hidden_dim, hidden_dim), Normal::new(0.0, scale_hidden).unwrap())),
-            b_o: Arc::new(Array1::zeros(hidden_dim)),
-            
-            w_ig: Arc::new(Array2::random((embed_dim, hidden_dim), Normal::new(0.0, scale_hidden).unwrap())),
-            w_hg: Arc::new(Array2::random((hidden_dim, hidden_dim), Normal::new(0.0, scale_hidden).unwrap())),
-            b_g: Arc::new(Array1::zeros(hidden_dim)),
-            
-            w_out: Arc::new(Array2::random((hidden_dim, vocab_size), Normal::new(0.0, scale_hidden).unwrap())),
-            b_out: Arc::new(Array1::zeros(vocab_size)),
-            
-            vocab_size,
-            embed_dim,
-            hidden_dim,
+    let encryption_key = EncryptionManager::generate_key();
+    println!("Encryption key: {}\n", &encryption_key[..16]);
+
+    let _encryptor = EncryptionManager::new(&encryption_key)?;
+
+    let db_path = "aria_dialogs.json";
+    db::init_db(db_path)?;
+
+    let data_dir = "data base";
+    fs::create_dir_all(&data_dir)?;
+
+    let files = [
+        "Books.txt",
+        "Reddit.txt",
+        "Poetry.txt",
+        "summary.txt",
+        "fan fiction.txt",
+        "words.txt",
+        "news.txt",
+    ];
+
+    for filename in &files {
+        let filepath = format!("{}/{}", data_dir, filename);
+        if !std::path::Path::new(&filepath).exists() {
+            fs::write(&filepath, "")?;
         }
     }
 
-    pub fn init_state(&self) -> LSTMState {
-        LSTMState {
-            h: Array1::zeros(self.hidden_dim),
-            c: Array1::zeros(self.hidden_dim),
+    let _session_id = Uuid::new_v4().to_string();
+
+    let embed_dim = 384;
+    let hidden_dim = 1536;
+    let vocab_size = 8000;
+
+    let model_path = "aria_model.ot";
+    let tokenizer_path = "aria_tokenizer.json";
+
+    let (model, mut tokenizer) = if std::path::Path::new(model_path).exists()
+        && std::path::Path::new(tokenizer_path).exists()
+    {
+        let m = LSTMModel::load(model_path, vocab_size, embed_dim, hidden_dim);
+        let t = Tokenizer::load(tokenizer_path)?;
+        (m, t)
+    } else {
+        let m = LSTMModel::new(vocab_size, embed_dim, hidden_dim);
+        let t = Tokenizer::new();
+        (m, t)
+    };
+
+    let mut _stats = Stats {
+        total_messages: 0,
+        positive_rewards: 0,
+        negative_rewards: 0,
+        total_loss: 0.0,
+    };
+
+    loop {
+        print!("You: ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let input = input.trim();
+
+        if input == "exit" {
+            break;
         }
-    }
 
-    pub fn step(&self, token_id: usize, state: &LSTMState) -> (Array1<f32>, LSTMState) {
-        if token_id >= self.embed.nrows() {
-            return (Array1::zeros(self.b_out.len()), state.clone());
+        let tokens = tokenizer.encode(input);
+        if tokens.is_empty() {
+            continue;
         }
 
-        let x = self.embed.row(token_id).to_owned();
+        let vec_tokens: Vec<i64> = tokens.iter().map(|x| *x as i64).collect();
 
-        let i = self.sigmoid(&(x.dot(&*self.w_ii) + state.h.dot(&*self.w_hi) + &*self.b_i));
-        let f = self.sigmoid(&(x.dot(&*self.w_if) + state.h.dot(&*self.w_hf) + &*self.b_f));
-        let o = self.sigmoid(&(x.dot(&*self.w_io) + state.h.dot(&*self.w_ho) + &*self.b_o));
-        let g = self.tanh(&(x.dot(&*self.w_ig) + state.h.dot(&*self.w_hg) + &*self.b_g));
+        let input_tensor = Tensor::f_from_slice(&vec_tokens)?
+            .view([1, vec_tokens.len() as i64]);
 
-        let c_new = &(&f * &state.c) + &(&i * &g);
-        let h_new = &o * &self.tanh(&c_new);
+        let (logits, mut state) = model.forward_seq(&input_tensor);
+        let mut action = model.sample(&logits);
 
-        let logits = h_new.dot(&*self.w_out) + &*self.b_out;
+        let mut response_tokens = vec![action as usize];
 
-        (logits, LSTMState { h: h_new, c: c_new })
-    }
+        for _ in 0..12 {
+            let (logits, new_state) = model.step(action, Some(state));
+            state = new_state;
 
-    pub fn forward_seq(&self, tokens: &[usize]) -> (Array1<f32>, LSTMState) {
-        let mut state = self.init_state();
-        let mut logits = Array1::zeros(self.b_out.len());
-
-        for &token_id in tokens {
-            let (next_logits, next_state) = self.step(token_id, &state);
-            logits = next_logits;
-            state = next_state;
-        }
-
-        (logits, state)
-    }
-
-    pub fn softmax(&self, x: &Array1<f32>) -> Array1<f32> {
-        let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let exp = x.map(|a| (a - max).exp());
-        let sum: f32 = exp.sum();
-        &exp / sum
-    }
-
-    pub fn sample_action(&self, logits: &Array1<f32>) -> (usize, f32) {
-        let probs = self.softmax(logits);
-        let mut cumsum = 0.0;
-        let rand_val: f32 = rand::random();
-
-        for (i, &p) in probs.iter().enumerate() {
-            cumsum += p;
-            if rand_val < cumsum {
-                return (i, p.ln().max(-20.0));
+            let next = model.sample(&logits);
+            if next < 2 {
+                break;
             }
+
+            response_tokens.push(next as usize);
+            action = next;
         }
 
-        let last = probs.len() - 1;
-        (last, probs[last].ln().max(-20.0))
+        let response = tokenizer.decode(&response_tokens);
+        println!("ARIA: {}\n", response);
+
+        _stats.total_messages += 1;
     }
 
-    fn sigmoid(&self, x: &Array1<f32>) -> Array1<f32> {
-        x.map(|a| 1.0 / (1.0 + (-a).exp()))
-    }
-
-    fn tanh(&self, x: &Array1<f32>) -> Array1<f32> {
-        x.map(|a| a.tanh())
-    }
-
-    pub fn save(&self, path: &str) -> anyhow::Result<()> {
-        use std::fs;
-        
-        let data = serde_json::json!({
-            "embed": self.embed.as_ref().clone().into_shape((self.vocab_size * self.embed_dim,)).unwrap().to_vec(),
-            "w_out": self.w_out.as_ref().clone().into_shape((self.hidden_dim * self.vocab_size,)).unwrap().to_vec(),
-            "b_out": self.b_out.as_ref().to_vec(),
-        });
-        
-        fs::write(path, serde_json::to_string_pretty(&data)?)?;
-        Ok(())
-    }
-
-    pub fn load(path: &str, vocab_size: usize, embed_dim: usize, hidden_dim: usize) -> anyhow::Result<Self> {
-        use std::fs;
-        
-        let content = fs::read_to_string(path)?;
-        let data: serde_json::Value = serde_json::from_str(&content)?;
-        
-        let mut model = LSTMModel::new(vocab_size, embed_dim, hidden_dim);
-        
-        if let Some(embed_data) = data["embed"].as_array() {
-            let vec: Vec<f32> = embed_data.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
-            model.embed = Arc::new(Array2::from_shape_vec((vocab_size, embed_dim), vec)?);
-        }
-        
-        if let Some(w_out_data) = data["w_out"].as_array() {
-            let vec: Vec<f32> = w_out_data.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
-            model.w_out = Arc::new(Array2::from_shape_vec((hidden_dim, vocab_size), vec)?);
-        }
-        
-        if let Some(b_out_data) = data["b_out"].as_array() {
-            let vec: Vec<f32> = b_out_data.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
-            model.b_out = Arc::new(Array1::from_vec(vec));
-        }
-        
-        Ok(model)
-    }
+    Ok(())
 }
