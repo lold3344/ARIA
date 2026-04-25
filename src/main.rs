@@ -54,7 +54,7 @@ fn main() -> anyhow::Result<()> {
 
     let session_id = Uuid::new_v4().to_string();
     println!("Session ID: {}\n", session_id);
-    let embed_dim = 384;      // Embedding dimension
+    let embed_dim = 512;      // Embedding dimension (увеличено)
     let hidden_dim = 1536;    // LSTM hidden dimension
     let vocab_size = 8000;    // Vocabulary size
     

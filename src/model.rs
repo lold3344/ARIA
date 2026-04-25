@@ -38,7 +38,7 @@ pub struct LSTMState {
 impl LSTMModel {
     pub fn new(vocab_size: usize, embed_dim: usize, hidden_dim: usize) -> Self {
         println!("\n================================");
-        println!("ARIA v3 - 27M Parameter LSTM");
+        println!("           ARIA v3 LSTM           ");
         println!("================================");
         println!("Initializing model with:");
         println!("  - Vocabulary size: {}", vocab_size);
