@@ -151,12 +151,71 @@ impl LSTMModel {
         (probs.len() - 1, probs[probs.len() - 1].ln().max(-20.0))
     }
 
+    pub fn sample_action_with_temp(&self, logits: &Array1<f32>, temperature: f32) -> (usize, f32) {
+        let scaled_logits = logits.map(|x| x / temperature.max(0.1));
+        let probs = self.softmax(&scaled_logits);
+        let mut cumsum = 0.0;
+        let rand_val: f32 = rand::random();
+
+        for (i, &prob) in probs.iter().enumerate() {
+            cumsum += prob;
+            if rand_val < cumsum {
+                return (i, prob.ln().max(-20.0));
+            }
+        }
+
+        (probs.len() - 1, probs[probs.len() - 1].ln().max(-20.0))
+    }
+
     fn sigmoid(&self, x: &Array1<f32>) -> Array1<f32> {
         x.map(|a| 1.0 / (1.0 + (-a).exp()))
     }
 
     fn tanh(&self, x: &Array1<f32>) -> Array1<f32> {
         x.map(|a| a.tanh())
+    }
+
+    pub fn backward_step(&mut self, tokens: &[usize], learning_rate: f32) -> f32 {
+        let mut state = self.init_state();
+        let mut total_loss = 0.0;
+
+        for (step, &token_id) in tokens.iter().enumerate() {
+            if token_id >= self.vocab_size {
+                continue;
+            }
+
+            let (logits, next_state) = self.step(token_id, &state);
+            let probs = self.softmax(&logits);
+
+            let mut loss_grad = probs.clone();
+            if step + 1 < tokens.len() {
+                let target = tokens[step + 1];
+                if target < self.vocab_size {
+                    loss_grad[target] -= 1.0;
+                    let loss = -probs[target].ln().max(-20.0);
+                    total_loss += loss;
+
+                    let output_grad = &loss_grad / tokens.len().max(1) as f32;
+                    
+                    let h_grad = output_grad.dot(&self.w_out.t());
+                    let w_out_grad = next_state.h.view().into_shape((self.hidden_dim, 1)).unwrap()
+                        .dot(&output_grad.view().into_shape((1, self.vocab_size)).unwrap());
+                    
+                    self.w_out = &self.w_out - &(w_out_grad * learning_rate);
+                    self.b_out = &self.b_out - &(&output_grad * learning_rate);
+
+                    let x = self.embed.row(token_id).to_owned();
+                    let small_lr = learning_rate * 0.01;
+                    
+                    self.w_ii = &self.w_ii - &x.view().into_shape((self.embed_dim, 1)).unwrap()
+                        .dot(&h_grad.view().into_shape((1, self.hidden_dim)).unwrap()) * small_lr;
+                }
+            }
+
+            state = next_state;
+        }
+
+        total_loss
     }
 
     pub fn save(&self, path: &str) -> anyhow::Result<()> {

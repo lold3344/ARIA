@@ -3,6 +3,7 @@ mod tokenizer;
 mod storage;
 mod db;
 mod pretraining;
+mod lstm_gpu;
 
 use std::io::{self, Write};
 use std::fs;
@@ -54,9 +55,10 @@ fn main() -> anyhow::Result<()> {
 
     let session_id = Uuid::new_v4().to_string();
     println!("Session ID: {}\n", session_id);
-    let embed_dim = 512;      // Embedding dimension (увеличено)
-    let hidden_dim = 1536;    // LSTM hidden dimension
-    let vocab_size = 8000;    // Vocabulary size
+    
+    let embed_dim = 1024;
+    let hidden_dim = 2048;
+    let vocab_size = 16000;
     
     let model_path = "aria_model.json";
     let tokenizer_path = "aria_tokenizer.json";
@@ -174,22 +176,25 @@ fn main() -> anyhow::Result<()> {
         db::insert_dialog(db_path, &user_entry, &session_id)?;
 
         let (logits, _state) = model.forward_seq(&tokens);
-        let (action, _log_prob) = model.sample_action(&logits);
 
         let mut response_tokens = Vec::new();
         let mut current_state = model.init_state();
+        let mut current_logits = logits;
+        let temperature = 0.7;
 
-        for _ in 0..12 {
-            if action >= tokenizer.vocab_size() {
+        for step in 0..12 {
+            let (action, _) = model.sample_action_with_temp(&current_logits, temperature);
+            
+            if action >= tokenizer.vocab_size() || action < 2 {
                 break;
             }
 
             response_tokens.push(action);
             let (next_logits, next_state) = model.step(action, &current_state);
             current_state = next_state;
+            current_logits = next_logits;
 
-            let (next_action, _) = model.sample_action(&next_logits);
-            if next_action < 2 {
+            if response_tokens.len() >= 12 {
                 break;
             }
         }
