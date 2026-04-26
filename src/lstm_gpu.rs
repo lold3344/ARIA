@@ -30,8 +30,6 @@ impl LSTMGPU {
             .await
             .map_err(|e| format!("Device request failed: {}", e))?;
 
-        println!("GPU Device initialized successfully");
-
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("LSTM Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("lstm.wgsl").into()),
