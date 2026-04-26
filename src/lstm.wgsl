@@ -1,36 +1,27 @@
-@group(0) @binding(0) var<storage, read> input: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<f32>;
-@group(0) @binding(2) var<storage, read> hidden: array<f32>;
-@group(0) @binding(3) var<storage, read_write> output: array<f32>;
-
-fn sigmoid(x: f32) -> f32 {
-    return 1.0 / (1.0 + exp(-x));
+struct Dims {
+    m: u32,
+    n: u32,
+    k: u32,
+    pad: u32,
 }
 
-fn tanh_approx(x: f32) -> f32 {
-    return tanh(x);
-}
+@group(0) @binding(0) var<storage, read> a: array<f32>;
+@group(0) @binding(1) var<storage, read> b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+@group(0) @binding(3) var<uniform> dims: Dims;
 
-@compute @workgroup_size(256)
-fn main(@builtin(global_invocation_id) id: vec3<u32>) {
-    let i = id.x;
-    let input_len = arrayLength(&input);
-    
-    if i >= input_len {
+@compute @workgroup_size(16, 16)
+fn matmul(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.x;
+    let col = gid.y;
+
+    if (row >= dims.m || col >= dims.n) {
         return;
     }
 
-    let x = input[i];
-    let h = hidden[i % arrayLength(&hidden)];
-    let w = weights[i % arrayLength(&weights)];
-
-    let f = sigmoid(x * w);
-    let i_gate = sigmoid(x * w);
-    let o = sigmoid(x * w);
-    let g = tanh_approx(x * w);
-
-    let c = f * h + i_gate * g;
-    let h_new = o * tanh_approx(c);
-
-    output[i] = h_new;
+    var sum: f32 = 0.0;
+    for (var i: u32 = 0u; i < dims.k; i = i + 1u) {
+        sum = sum + a[row * dims.k + i] * b[i * dims.n + col];
+    }
+    c[row * dims.n + col] = sum;
 }

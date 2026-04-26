@@ -6,10 +6,11 @@ use crate::tokenizer::Tokenizer;
 use rayon::prelude::*;
 use rand::seq::SliceRandom;
 
-const LEARNING_RATE: f32 = 0.05;
+const LEARNING_RATE: f32 = 0.001;
 const MAX_TOKENS_PER_SEQ: usize = 80;
 const MIN_TOKENS_PER_SEQ: usize = 4;
 const EPOCHS: usize = 5;
+const BATCH_SIZE: usize = 32;
 
 pub fn pretrain_from_files(
     model: &mut LSTMModel,
@@ -17,7 +18,6 @@ pub fn pretrain_from_files(
     data_dir: &str,
 ) -> anyhow::Result<()> {
     let path = Path::new(data_dir);
-
     if !path.exists() {
         println!("Data directory not found: {}", data_dir);
         return Ok(());
@@ -25,13 +25,13 @@ pub fn pretrain_from_files(
 
     let start_time = Instant::now();
 
-    println!("\nARIA - Training with Next-Token Prediction");
+    println!("\nARIA - Batch Training");
     println!("===============================================");
     println!("Learning rate:   {}", LEARNING_RATE);
     println!("Epochs:          {}", EPOCHS);
+    println!("Batch size:      {}", BATCH_SIZE);
     println!("Max seq length:  {}", MAX_TOKENS_PER_SEQ);
-    println!("Loss:            Cross Entropy with Softmax");
-    println!("Optimizer:       SGD with gradient clipping");
+    println!("Optimizer:       Adam");
     println!("===============================================\n");
 
     println!("Stage 1: Loading text files...");
@@ -57,17 +57,17 @@ pub fn pretrain_from_files(
     let read_time = read_start.elapsed();
 
     if file_contents.is_empty() {
-        println!("No text files found. Pre-training skipped.");
+        println!("No text files found.");
         return Ok(());
     }
 
     println!("Loaded {} files in {:.3}s", file_contents.len(), read_time.as_secs_f32());
     println!(
-        "Total size: {:.2} MB\n",
+        "Total: {:.2} MB\n",
         file_contents.iter().map(|(_, c)| c.len()).sum::<usize>() as f32 / 1_000_000.0
     );
 
-    println!("Stage 2: Splitting into sentences and tokenizing...");
+    println!("Stage 2: Tokenizing...");
     let process_start = Instant::now();
 
     let all_sentences: Vec<(String, Vec<String>)> = file_contents
@@ -85,68 +85,67 @@ pub fn pretrain_from_files(
     let mut all_sequences: Vec<Vec<usize>> = Vec::new();
 
     for (filename, sentences) in all_sentences {
-        let mut count_for_file = 0usize;
+        let mut cnt = 0usize;
         for sentence in sentences {
             let tokens = tokenizer.encode(&sentence);
             if tokens.len() >= MIN_TOKENS_PER_SEQ && tokens.len() <= MAX_TOKENS_PER_SEQ {
                 all_sequences.push(tokens);
-                count_for_file += 1;
+                cnt += 1;
             }
         }
-        println!("  Processed {} ({} sequences)", filename, count_for_file);
+        println!("  {} ({} seqs)", filename, cnt);
     }
 
     let process_time = process_start.elapsed();
     let total_tokens: usize = all_sequences.iter().map(|s| s.len()).sum();
 
     println!(
-        "\nCreated {} sequences ({} tokens) in {:.3}s",
-        all_sequences.len(),
-        total_tokens,
-        process_time.as_secs_f32()
+        "\n{} sequences, {} tokens in {:.3}s",
+        all_sequences.len(), total_tokens, process_time.as_secs_f32()
     );
-    println!("Vocabulary size: {}\n", tokenizer.vocab_size());
+    println!("Vocabulary: {}\n", tokenizer.vocab_size());
 
     if all_sequences.is_empty() {
-        println!("No usable sequences. Skipping training.");
+        println!("No usable sequences.");
         return Ok(());
     }
 
-    println!("Stage 3: Training (BPTT, full LSTM gradient)...");
-    println!("Sequences per epoch: {}\n", all_sequences.len());
+    println!("Stage 3: Training...");
+    let num_batches = (all_sequences.len() + BATCH_SIZE - 1) / BATCH_SIZE;
+    println!("{} batches per epoch\n", num_batches);
 
     let training_start = Instant::now();
 
     for epoch in 0..EPOCHS {
+        let epoch_start = Instant::now();
         let mut shuffled = all_sequences.clone();
         shuffled.shuffle(&mut rand::thread_rng());
 
         let mut epoch_loss = 0.0f32;
-        let mut count = 0usize;
+        let mut batch_count = 0usize;
+        let report_every = (num_batches / 5).max(1);
 
-        let report_every = (shuffled.len() / 10).max(1);
+        for chunk in shuffled.chunks(BATCH_SIZE) {
+            let batch: Vec<Vec<usize>> = chunk.to_vec();
+            let loss = model.train_batch(&batch, LEARNING_RATE);
+            if loss.is_finite() { epoch_loss += loss; batch_count += 1; }
 
-        for (idx, tokens) in shuffled.iter().enumerate() {
-            if tokens.len() >= 2 {
-                let loss = model.backward_step(tokens, LEARNING_RATE);
-                if loss.is_finite() {
-                    epoch_loss += loss;
-                    count += 1;
-                }
-            }
-
-            if idx > 0 && idx % report_every == 0 {
-                let avg = if count > 0 { epoch_loss / count as f32 } else { 0.0 };
+            if batch_count > 0 && batch_count % report_every == 0 {
+                let avg = epoch_loss / batch_count as f32;
+                let elapsed = epoch_start.elapsed().as_secs_f32();
+                let speed = (batch_count * BATCH_SIZE) as f32 / elapsed;
                 println!(
-                    "  epoch {}/{}  step {}/{}  avg_loss = {:.4}",
-                    epoch + 1, EPOCHS, idx, shuffled.len(), avg
+                    "  epoch {}/{}  batch {}/{}  loss={:.4}  {:.0} seq/s",
+                    epoch + 1, EPOCHS, batch_count, num_batches, avg, speed
                 );
             }
         }
 
-        if count > 0 {
-            let avg_loss = epoch_loss / count as f32;
-            println!("Epoch {}/{} complete: avg loss = {:.6}\n", epoch + 1, EPOCHS, avg_loss);
+        let et = epoch_start.elapsed();
+        if batch_count > 0 {
+            let avg = epoch_loss / batch_count as f32;
+            let speed = all_sequences.len() as f32 / et.as_secs_f32();
+            println!("Epoch {}/{}: loss={:.6}  {:.1}s  {:.0} seq/s\n", epoch + 1, EPOCHS, avg, et.as_secs_f32(), speed);
         }
     }
 
@@ -154,17 +153,13 @@ pub fn pretrain_from_files(
     let total_time = start_time.elapsed();
 
     println!("===============================================");
-    println!("TRAINING RESULTS:");
-    println!("===============================================");
-    println!("File I/O:            {:.3}s", read_time.as_secs_f32());
-    println!("Processing:          {:.3}s", process_time.as_secs_f32());
-    println!("Training:            {:.3}s", training_time.as_secs_f32());
-    println!("TOTAL TIME:          {:.3}s", total_time.as_secs_f32());
-    println!("");
-    println!("Total sequences:     {}", all_sequences.len());
-    println!("Epochs:              {}", EPOCHS);
-    println!("Total tokens:        {}", total_tokens);
-    println!("Learning method:     Next-token prediction with Cross Entropy + BPTT");
+    println!("TRAINING COMPLETE");
+    println!("  I/O:       {:.3}s", read_time.as_secs_f32());
+    println!("  Process:   {:.3}s", process_time.as_secs_f32());
+    println!("  Training:  {:.3}s", training_time.as_secs_f32());
+    println!("  Total:     {:.3}s", total_time.as_secs_f32());
+    println!("  Sequences: {}", all_sequences.len());
+    println!("  Tokens:    {}", total_tokens);
     println!("===============================================\n");
 
     Ok(())
