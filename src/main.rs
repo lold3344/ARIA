@@ -54,8 +54,8 @@ fn main() -> anyhow::Result<()> {
     let session_id = Uuid::new_v4().to_string();
     println!("Session ID: {}\n", session_id);
 
-    let embed_dim = 512;
-    let hidden_dim = 1024;
+    let embed_dim = 500;
+    let hidden_dim = 1200;
 
     let model_path = "aria_model.json";
     let tokenizer_path = "aria_tokenizer.json";
