@@ -1,6 +1,6 @@
 use ndarray::{s, Array1, Array2, Axis};
 use ndarray_rand::RandomExt;
-use rand_distr::Normal;
+use ndarray_rand::rand_distr::Normal;
 use crate::lstm_gpu::LSTMGpu;
 
 pub struct LSTMModel {
@@ -116,9 +116,11 @@ impl LSTMModel {
     fn matmul_2d(&self, a: &Array2<f32>, b: &Array2<f32>) -> Array2<f32> {
         let (m, k) = (a.nrows(), a.ncols());
         let n = b.ncols();
+        let flops = m * k * n;
 
-        if let Some(ref gpu) = self.gpu {
-            if m * k * n > 100_000 {
+        // GPU only worth it for large matmuls (>50M FLOPs) to amortize dispatch overhead
+        if flops > 50_000_000 {
+            if let Some(ref gpu) = self.gpu {
                 let a_slice = a.as_slice().unwrap_or_else(|| {
                     panic!("non-contiguous");
                 });

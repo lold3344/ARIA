@@ -1,14 +1,13 @@
-mod model;
+mod model_cuda;
 mod tokenizer;
 mod storage;
 mod db;
-mod pretraining;
-mod lstm_gpu;
+mod lstm_cuda;
 
 use std::io::{self, Write};
 use std::fs;
 use uuid::Uuid;
-use crate::model::LSTMModel;
+use crate::model_cuda::LSTMModelCuda;
 use crate::tokenizer::Tokenizer;
 use crate::storage::{EncryptionManager, DialogEntry, get_current_timestamp};
 
@@ -67,7 +66,7 @@ fn main() -> anyhow::Result<()> {
         println!("Loading pre-trained model and tokenizer...");
         let t = Tokenizer::load(tokenizer_path)?;
         let actual_vocab = t.vocab_size();
-        match LSTMModel::load(model_path, actual_vocab, embed_dim, hidden_dim) {
+        match LSTMModelCuda::load(model_path, actual_vocab, embed_dim, hidden_dim) {
             Ok(m) => {
                 println!("Model loaded. Vocabulary: {}\n", actual_vocab);
                 (m, t)
@@ -223,7 +222,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn train_fresh(tokenizer: &mut Tokenizer, data_dir: &str, embed_dim: usize, hidden_dim: usize) -> anyhow::Result<LSTMModel> {
+fn train_fresh(tokenizer: &mut Tokenizer, data_dir: &str, embed_dim: usize, hidden_dim: usize) -> anyhow::Result<LSTMModelCuda> {
     println!("Building vocabulary from data...\n");
 
     let path = std::path::Path::new(data_dir);
@@ -245,10 +244,10 @@ fn train_fresh(tokenizer: &mut Tokenizer, data_dir: &str, embed_dim: usize, hidd
     println!("Vocabulary built: {} words", actual_vocab);
     tokenizer.freeze();
 
-    let mut model = LSTMModel::new(actual_vocab, embed_dim, hidden_dim);
+    let mut model = LSTMModelCuda::new(actual_vocab, embed_dim, hidden_dim);
 
     println!("Pre-training...");
-    pretraining::pretrain_from_files(&mut model, tokenizer, data_dir).ok();
+    model_cuda::pretrain_from_files(&mut model, tokenizer, data_dir).ok();
 
     println!("Training complete.\n");
     Ok(model)

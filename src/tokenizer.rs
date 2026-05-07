@@ -10,10 +10,14 @@ pub struct Tokenizer {
 
 impl Tokenizer {
     pub fn new() -> Self {
-        let mut tokenizer = Tokenizer {
+        Self::with_max_vocab(25000)
+    }
+
+    pub fn with_max_vocab(max: usize) -> Self {
+        let mut tokenizer = Self {
             word_to_id: HashMap::new(),
             id_to_word: HashMap::new(),
-            max_vocab: 0,
+            max_vocab: max,
             frozen: false,
         };
 
