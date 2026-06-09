@@ -314,6 +314,39 @@ impl LSTMModelCuda {
             .unwrap_or(0)
     }
 
+    pub fn sample_top_p(&self, logits: &[f32], temperature: f32, top_p: f32) -> usize {
+        let temp = temperature.max(0.05);
+        let scaled: Vec<f32> = logits.iter().map(|x| x / temp).collect();
+        let mut indexed: Vec<(usize, f32)> = scaled.iter().copied().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mx = indexed[0].1;
+        let exps: Vec<f32> = indexed.iter().map(|(_, v)| (v - mx).exp()).collect();
+        let sum: f32 = exps.iter().sum();
+        if sum <= 0.0 || !sum.is_finite() {
+            return indexed[0].0;
+        }
+
+        let p = top_p.clamp(0.01, 1.0);
+        let mut cum = 0.0f32;
+        let mut candidates: Vec<(usize, f32)> = Vec::new();
+        for (i, (idx, _)) in indexed.iter().enumerate() {
+            let prob = exps[i] / sum;
+            candidates.push((*idx, prob));
+            cum += prob;
+            if cum >= p { break; }
+        }
+
+        let r: f32 = rand::random();
+        let cand_sum: f32 = candidates.iter().map(|(_, p)| p).sum();
+        let mut sample_cum = 0.0f32;
+        for (idx, prob) in &candidates {
+            sample_cum += prob / cand_sum;
+            if r < sample_cum { return *idx; }
+        }
+        candidates.last().map(|(idx, _)| *idx).unwrap_or(0)
+    }
+
     pub fn sample_top_k(&self, logits: &[f32], temperature: f32, top_k: usize) -> usize {
         let temp = temperature.max(0.05);
         let scaled: Vec<f32> = logits.iter().map(|x| x / temp).collect();

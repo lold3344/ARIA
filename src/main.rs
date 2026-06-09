@@ -22,6 +22,7 @@ struct Stats {
 enum SamplingMode {
     Greedy,
     TopK { k: usize, temperature: f32 },
+    TopP { p: f32, temperature: f32 },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -90,10 +91,15 @@ fn main() -> anyhow::Result<()> {
 
     println!("Vocabulary: {}", tokenizer.vocab_size());
     println!("\nCommands:");
-    println!("  stats       - show statistics");
-    println!("  mode greedy - greedy decoding");
-    println!("  mode topk   - top-k sampling (default)");
-    println!("  exit        - quit\n");
+    println!("  stats            - show statistics");
+    println!("  settings         - show current sampling settings");
+    println!("  mode greedy      - greedy decoding");
+    println!("  mode topk        - top-k sampling (default, k=20)");
+    println!("  mode topp        - nucleus (top-p) sampling (default p=0.9)");
+    println!("  temp <0.1-2.0>   - set temperature");
+    println!("  topk <n>         - set top-k value");
+    println!("  topp <0.0-1.0>   - set top-p value");
+    println!("  exit             - quit\n");
 
     let mut stats = Stats {
         total_messages: 0, positive_rewards: 0, negative_rewards: 0, total_loss: 0.0,
@@ -121,8 +127,53 @@ fn main() -> anyhow::Result<()> {
             println!();
             continue;
         }
+        if input == "settings" {
+            match mode {
+                SamplingMode::Greedy => println!("\nMode: greedy\n"),
+                SamplingMode::TopK { k, temperature } => println!("\nMode: top-k  k={}  temp={:.2}\n", k, temperature),
+                SamplingMode::TopP { p, temperature } => println!("\nMode: top-p  p={:.2}  temp={:.2}\n", p, temperature),
+            }
+            continue;
+        }
         if input == "mode greedy" { mode = SamplingMode::Greedy; println!("Mode: greedy\n"); continue; }
-        if input == "mode topk" { mode = SamplingMode::TopK { k: 20, temperature: 0.7 }; println!("Mode: top-k\n"); continue; }
+        if input == "mode topk"   { mode = SamplingMode::TopK { k: 20, temperature: 0.7 }; println!("Mode: top-k  k=20  temp=0.70\n"); continue; }
+        if input == "mode topp"   { mode = SamplingMode::TopP { p: 0.9, temperature: 0.7 }; println!("Mode: top-p  p=0.90  temp=0.70\n"); continue; }
+
+        if let Some(rest) = input.strip_prefix("temp ") {
+            if let Ok(t) = rest.trim().parse::<f32>() {
+                let t = t.clamp(0.05, 2.0);
+                mode = match mode {
+                    SamplingMode::Greedy               => SamplingMode::TopK { k: 20, temperature: t },
+                    SamplingMode::TopK { k, .. }       => SamplingMode::TopK { k, temperature: t },
+                    SamplingMode::TopP { p, .. }       => SamplingMode::TopP { p, temperature: t },
+                };
+                println!("Temperature set to {:.2}\n", t);
+            } else {
+                println!("Usage: temp <0.05-2.0>\n");
+            }
+            continue;
+        }
+        if let Some(rest) = input.strip_prefix("topk ") {
+            if let Ok(k) = rest.trim().parse::<usize>() {
+                let temperature = match mode { SamplingMode::TopK { temperature, .. } | SamplingMode::TopP { temperature, .. } => temperature, _ => 0.7 };
+                mode = SamplingMode::TopK { k: k.max(1), temperature };
+                println!("Mode: top-k  k={}  temp={:.2}\n", k.max(1), temperature);
+            } else {
+                println!("Usage: topk <n>\n");
+            }
+            continue;
+        }
+        if let Some(rest) = input.strip_prefix("topp ") {
+            if let Ok(p) = rest.trim().parse::<f32>() {
+                let temperature = match mode { SamplingMode::TopK { temperature, .. } | SamplingMode::TopP { temperature, .. } => temperature, _ => 0.7 };
+                let p = p.clamp(0.01, 1.0);
+                mode = SamplingMode::TopP { p, temperature };
+                println!("Mode: top-p  p={:.2}  temp={:.2}\n", p, temperature);
+            } else {
+                println!("Usage: topp <0.0-1.0>\n");
+            }
+            continue;
+        }
         if input.is_empty() { continue; }
 
         let tokens = tokenizer.encode(input);
@@ -148,6 +199,7 @@ fn main() -> anyhow::Result<()> {
             let action = match mode {
                 SamplingMode::Greedy => model.sample_greedy(&current_logits),
                 SamplingMode::TopK { k, temperature } => model.sample_top_k(&current_logits, temperature, k),
+                SamplingMode::TopP { p, temperature } => model.sample_top_p(&current_logits, temperature, p),
             };
 
             if action >= tokenizer.vocab_size() { break; }
