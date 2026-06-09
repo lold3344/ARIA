@@ -1,48 +1,36 @@
-use tch::{Device, Tensor};
+use ocl::{Platform, Device, Context, Queue, DeviceType};
 
-pub struct LSTMCuda {
-    pub device: Device,
+pub struct GpuContext {
+    pub context: Context,
+    pub queue:   Queue,
+    pub device:  Device,
 }
 
-impl LSTMCuda {
+impl GpuContext {
     pub fn try_init() -> Option<Self> {
-        let device = Device::cuda_if_available();
-        if !device.is_cuda() {
-            println!("[LSTMCuda] No CUDA device found.");
-            return None;
-        }
+        let platform = Platform::list().into_iter()
+            .find(|p| {
+                let name = p.name().unwrap_or_default().to_lowercase();
+                name.contains("nvidia") || name.contains("amd") || name.contains("intel")
+            })
+            .or_else(|| Platform::list().into_iter().next())?;
 
-        println!("[LSTMCuda] CUDA device detected: {:?}", device);
+        let device = Device::list(platform, Some(DeviceType::GPU))
+            .ok()?
+            .into_iter()
+            .next()?;
 
-        // Allocate a tiny tensor to force driver initialization
-        let _probe = Tensor::zeros(&[1], (tch::Kind::Float, device));
-        println!("[LSTMCuda] CUDA ready.\n");
+        println!("[GPU] Platform: {}", platform.name().unwrap_or_default());
+        println!("[GPU] Device:   {}\n", device.name().unwrap_or_default());
 
-        Some(LSTMCuda { device })
-    }
+        let context = Context::builder()
+            .platform(platform)
+            .devices(device)
+            .build()
+            .ok()?;
 
-    pub fn is_available(&self) -> bool {
-        Device::cuda_if_available().is_cuda()
-    }
+        let queue = Queue::new(&context, device, None).ok()?;
 
-    pub fn get_memory_info() -> (f64, f64, f64) {
-        if !Device::cuda_if_available().is_cuda() {
-            return (0.0, 0.0, 0.0);
-        }
-        // tch doesn't expose per-GPU memory directly
-        (0.0, 0.0, 0.0)
-    }
-
-    pub fn synchronize(&self) {
-        // Force sync by doing a no-op CUDA operation
-        let _ = Tensor::zeros(&[1], (tch::Kind::Float, self.device));
-    }
-}
-
-impl Default for LSTMCuda {
-    fn default() -> Self {
-        Self {
-            device: Device::Cpu,
-        }
+        Some(GpuContext { context, queue, device })
     }
 }
