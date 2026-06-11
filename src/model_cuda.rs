@@ -17,6 +17,16 @@ use crate::lstm_cuda::GpuContext;
 
 const KERNELS_SRC: &str = r#"
 
+inline void atomic_add_float(__global float* addr, float val) {
+    union { unsigned int u32; float f32; } next, expected, current;
+    current.f32 = *addr;
+    do {
+        expected.f32 = current.f32;
+        next.f32 = expected.f32 + val;
+        current.u32 = atomic_cmpxchg((volatile __global unsigned int*)addr, expected.u32, next.u32);
+    } while (current.u32 != expected.u32);
+}
+
 // Embedding lookup: out[b*E + d] = embed[ids[b]*E + d]
 __kernel void embedding_fwd(
     __global const float* embed,
