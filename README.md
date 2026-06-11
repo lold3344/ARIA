@@ -73,7 +73,6 @@ data base/
   Reddit.txt       - диалоги, посты
   Poetry.txt       - поэзия
   summary.txt      - краткие изложения
-  fan fiction.txt  - фанфики
   words.txt        - словарный запас
   news.txt         - новостные тексты
 ```
