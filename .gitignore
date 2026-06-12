@@ -1333,3 +1333,4 @@ target/release/deps/version_check-4492238a367376bd.d
 target/release/deps/zerocopy-0efb9e1a8b623f7b.d
 target/release/deps/zeroize-f4186cad4dc0b6d0.d
 target/release/deps/zmij-ea9a0d5bc36a6b46.d
+data base/DataBase.txt
