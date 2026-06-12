@@ -2,11 +2,304 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use rayon::prelude::*;
+use ocl::{Buffer, Context, Device, DeviceType, Kernel, Platform, Program, Queue};
 
 const PAD: usize   = 0;
 const UNK: usize   = 1;
 const START: usize = 2;
 const END: usize   = 3;
+
+// ── GPU-resident BPE kernels ──────────────────────────────────────────────────
+//
+// Tokens are stored as a flat i32 array on GPU the ENTIRE training run.
+// Merged tokens are marked -1 (tombstone) in place - no memory moves.
+//
+// count_pairs: each work-item = one word.
+//   Skips tombstones, accumulates freq into pair_counts[a * vocab_size + b].
+//
+// apply_merge: each work-item = one position in flat token array.
+//   If tokens[i]==a and next non-tombstone == b, replace tokens[i]=merged,
+//   mark tokens[j]=-1.
+//
+// reduce_argmax: two-pass parallel reduction over pair_counts[V*V].
+//   Pass 1: each work-group finds its local max -> writes to partial[group].
+//   Pass 2: single work-group reduces partial[] -> out[0]=idx, out[1]=freq.
+const BPE_KERNELS: &str = r#"
+inline int next_live(__global const int* tokens, int pos, int off, int raw_len) {
+    for (int k = pos + 1; k < off + raw_len; k++) {
+        if (tokens[k] != -1) return k;
+    }
+    return -1;
+}
+
+__kernel void count_pairs(
+    __global const int* tokens,
+    __global const int* offsets,
+    __global const int* raw_lens,
+    __global const int* freqs,
+    __global       int* pair_counts,
+    int vocab_size
+) {
+    int wi = get_global_id(0);
+    int off     = offsets[wi];
+    int raw_len = raw_lens[wi];
+    int freq    = freqs[wi];
+
+    int prev = -1;
+    for (int i = off; i < off + raw_len; i++) {
+        int t = tokens[i];
+        if (t == -1) continue;
+        if (prev >= 0) {
+            atomic_add(&pair_counts[prev * vocab_size + t], freq);
+        }
+        prev = t;
+    }
+}
+
+__kernel void apply_merge(
+    __global       int* tokens,
+    __global const int* offsets,
+    __global const int* raw_lens,
+    int merge_a,
+    int merge_b,
+    int merge_ab
+) {
+    int wi = get_global_id(0);
+    int off     = offsets[wi];
+    int raw_len = raw_lens[wi];
+
+    for (int i = off; i < off + raw_len; i++) {
+        if (tokens[i] != merge_a) continue;
+        int j = next_live(tokens, i, off, raw_len);
+        if (j < 0) continue;
+        if (tokens[j] == merge_b) {
+            tokens[i] = merge_ab;
+            tokens[j] = -1;
+        }
+    }
+}
+
+// Parallel reduction: find argmax of pair_counts[0..n].
+// Each work-group reduces its chunk into partial_idx/partial_val.
+// Call with global_size = n (rounded up to multiple of local_size).
+__kernel void reduce_argmax(
+    __global const int* counts,
+    __global       int* partial_idx,
+    __global       int* partial_val,
+    int n,
+    __local int* lcl_val,
+    __local int* lcl_idx
+) {
+    int gid = get_global_id(0);
+    int lid = get_local_id(0);
+    int lsz = get_local_size(0);
+    int grp = get_group_id(0);
+
+    int val = (gid < n) ? counts[gid] : 0;
+    int idx = (gid < n) ? gid : -1;
+    lcl_val[lid] = val;
+    lcl_idx[lid] = idx;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int s = lsz >> 1; s > 0; s >>= 1) {
+        if (lid < s) {
+            if (lcl_val[lid + s] > lcl_val[lid] ||
+                (lcl_val[lid + s] == lcl_val[lid] && lcl_idx[lid + s] < lcl_idx[lid])) {
+                lcl_val[lid] = lcl_val[lid + s];
+                lcl_idx[lid] = lcl_idx[lid + s];
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) {
+        partial_val[grp] = lcl_val[0];
+        partial_idx[grp] = lcl_idx[0];
+    }
+}
+"#;
+
+// GPU-resident BPE state. Flat token array lives on GPU the whole training run.
+// Tombstones (-1) replace the second token of each merged pair in-place.
+struct GpuBpe {
+    queue:        Queue,
+    context:      Context,
+    n_words:      usize,
+    // GPU buffers (never reallocated after init)
+    buf_tokens:   Buffer<i32>,
+    buf_offsets:  Buffer<i32>,
+    buf_raw_lens: Buffer<i32>,
+    buf_freqs:    Buffer<i32>,
+    buf_counts:   Buffer<i32>,
+    buf_part_idx: Buffer<i32>,  // partial argmax results
+    buf_part_val: Buffer<i32>,
+    n_groups:     usize,
+    vocab_cap:    usize,
+    local_size:   usize,
+    // pre-compiled kernels
+    k_count:      Kernel,
+    k_merge:      Kernel,
+    k_argmax:     Kernel,
+}
+
+impl GpuBpe {
+    fn try_init(
+        flat_tokens: &[i32],
+        offsets: &[i32],
+        raw_lens: &[i32],
+        freqs: &[i32],
+        vocab_cap: usize,
+    ) -> Option<Self> {
+        let platform = Platform::list().into_iter()
+            .find(|p| {
+                let name = p.name().unwrap_or_default().to_lowercase();
+                name.contains("nvidia") || name.contains("amd") || name.contains("intel")
+            })
+            .or_else(|| Platform::list().into_iter().next())?;
+        let device = Device::list(platform, Some(DeviceType::GPU))
+            .ok()?.into_iter().next()?;
+        let context = Context::builder()
+            .platform(platform).devices(device).build().ok()?;
+        let queue = Queue::new(&context, device, None).ok()?;
+
+        let program = Program::builder()
+            .src(BPE_KERNELS).devices(device).build(&context).ok()?;
+
+        let n_words  = offsets.len();
+        let pc_size  = vocab_cap * vocab_cap;
+        let local_size: usize = 256;
+        let n_groups = (pc_size + local_size - 1) / local_size;
+
+        let buf_tokens = Buffer::<i32>::builder()
+            .queue(queue.clone()).len(flat_tokens.len())
+            .copy_host_slice(flat_tokens).build().ok()?;
+        let buf_offsets = Buffer::<i32>::builder()
+            .queue(queue.clone()).len(n_words)
+            .copy_host_slice(offsets).build().ok()?;
+        let buf_raw_lens = Buffer::<i32>::builder()
+            .queue(queue.clone()).len(n_words)
+            .copy_host_slice(raw_lens).build().ok()?;
+        let buf_freqs = Buffer::<i32>::builder()
+            .queue(queue.clone()).len(n_words)
+            .copy_host_slice(freqs).build().ok()?;
+        let buf_counts = Buffer::<i32>::builder()
+            .queue(queue.clone()).len(pc_size).fill_val(0i32).build().ok()?;
+        let buf_part_idx = Buffer::<i32>::builder()
+            .queue(queue.clone()).len(n_groups).build().ok()?;
+        let buf_part_val = Buffer::<i32>::builder()
+            .queue(queue.clone()).len(n_groups).build().ok()?;
+
+        let k_count = Kernel::builder()
+            .program(&program).name("count_pairs")
+            .queue(queue.clone())
+            .global_work_size(n_words)
+            .arg(&buf_tokens)
+            .arg(&buf_offsets)
+            .arg(&buf_raw_lens)
+            .arg(&buf_freqs)
+            .arg(&buf_counts)
+            .arg(0i32)
+            .build().ok()?;
+
+        let k_merge = Kernel::builder()
+            .program(&program).name("apply_merge")
+            .queue(queue.clone())
+            .global_work_size(n_words)
+            .arg(&buf_tokens)
+            .arg(&buf_offsets)
+            .arg(&buf_raw_lens)
+            .arg(0i32)
+            .arg(0i32)
+            .arg(0i32)
+            .build().ok()?;
+
+        let global_argmax = ((pc_size + local_size - 1) / local_size) * local_size;
+        let k_argmax = Kernel::builder()
+            .program(&program).name("reduce_argmax")
+            .queue(queue.clone())
+            .global_work_size(global_argmax)
+            .local_work_size(local_size)
+            .arg(&buf_counts)
+            .arg(&buf_part_idx)
+            .arg(&buf_part_val)
+            .arg(0i32) // n - set each step
+            .arg_local::<i32>(local_size)
+            .arg_local::<i32>(local_size)
+            .build().ok()?;
+
+        println!("[BPE-GPU] {} | tokens={}K words={} pc_buf={}MB",
+            device.name().unwrap_or_default(),
+            flat_tokens.len() / 1000,
+            n_words,
+            pc_size * 4 / 1_000_000);
+
+        Some(GpuBpe {
+            queue, context, n_words,
+            buf_tokens, buf_offsets, buf_raw_lens, buf_freqs, buf_counts,
+            buf_part_idx, buf_part_val, n_groups,
+            vocab_cap, local_size,
+            k_count, k_merge, k_argmax,
+        })
+    }
+
+    fn ensure_vocab_cap(&mut self, v: usize) -> Option<()> {
+        if v <= self.vocab_cap { return Some(()); }
+        let pc_size  = v * v;
+        let n_groups = (pc_size + self.local_size - 1) / self.local_size;
+        self.buf_counts = Buffer::<i32>::builder()
+            .queue(self.queue.clone()).len(pc_size).fill_val(0i32).build().ok()?;
+        self.buf_part_idx = Buffer::<i32>::builder()
+            .queue(self.queue.clone()).len(n_groups).build().ok()?;
+        self.buf_part_val = Buffer::<i32>::builder()
+            .queue(self.queue.clone()).len(n_groups).build().ok()?;
+        self.k_count.set_arg(4, &self.buf_counts).ok()?;
+        let global = ((pc_size + self.local_size - 1) / self.local_size) * self.local_size;
+        self.k_argmax.set_arg(0, &self.buf_counts).ok()?;
+        self.k_argmax.set_arg(1, &self.buf_part_idx).ok()?;
+        self.k_argmax.set_arg(2, &self.buf_part_val).ok()?;
+        unsafe { self.k_argmax.set_default_global_work_size(ocl::SpatialDims::One(global)); }
+        self.vocab_cap = v;
+        self.n_groups  = n_groups;
+        Some(())
+    }
+
+    // One BPE step fully on GPU. Returns (best_a_id, best_b_id, freq).
+    fn step(&mut self, vocab_size: usize) -> Option<(usize, usize, i32)> {
+        let pc_size = vocab_size * vocab_size;
+        self.ensure_vocab_cap(vocab_size)?;
+
+        // Zero counts, count pairs.
+        self.buf_counts.cmd().fill(0i32, Some(pc_size)).enq().ok()?;
+        self.k_count.set_arg(5, vocab_size as i32).ok()?;
+        unsafe { self.k_count.enq().ok()?; }
+
+        // GPU argmax reduction - reads only n_groups*8 bytes back (~2KB).
+        self.k_argmax.set_arg(3, pc_size as i32).ok()?;
+        unsafe { self.k_argmax.enq().ok()?; }
+
+        let mut part_val = vec![0i32; self.n_groups];
+        let mut part_idx = vec![0i32; self.n_groups];
+        self.buf_part_val.read(&mut part_val).enq().ok()?;
+        self.buf_part_idx.read(&mut part_idx).enq().ok()?;
+
+        // Final reduce on CPU over n_groups results (negligible).
+        let (best_grp, &freq) = part_val.iter().enumerate()
+            .filter(|(_, &v)| v > 0)
+            .max_by(|(ia, &va), (ib, &vb)| va.cmp(&vb).then_with(|| ib.cmp(ia)))?;
+        if freq == 0 { return None; }
+        let idx = part_idx[best_grp] as usize;
+
+        Some((idx / vocab_size, idx % vocab_size, freq))
+    }
+
+    // Apply merge on GPU in-place (tombstone pattern).
+    fn apply_merge(&mut self, a: i32, b: i32, ab: i32) -> Option<()> {
+        self.k_merge.set_arg(3, a).ok()?;
+        self.k_merge.set_arg(4, b).ok()?;
+        self.k_merge.set_arg(5, ab).ok()?;
+        unsafe { self.k_merge.enq().ok()?; }
+        Some(())
+    }
+}
 
 pub struct Tokenizer {
     merges:      Vec<(String, String)>,
@@ -25,76 +318,129 @@ fn clean_word(w: &str) -> String {
      .to_lowercase()
 }
 
-// Standard BPE training: returns merge rules in priority order.
+// BPE training: tokens live on GPU for entire run, CPU only does argmax.
 fn train_bpe(word_freq: &HashMap<String, usize>, num_merges: usize) -> Vec<(String, String)> {
-    let mut vocab: Vec<(Vec<String>, usize)> = word_freq
-        .iter()
+    // Build initial char-level vocab.
+    let words: Vec<(&str, usize)> = word_freq.iter()
         .filter(|(_, &f)| f > 0)
-        .map(|(word, &freq)| {
-            let chars: Vec<String> = word.chars().map(|c| c.to_string()).collect();
-            (chars, freq)
-        })
+        .map(|(w, &f)| (w.as_str(), f))
         .collect();
+
+    // Token <-> u32 ID mapping (CPU side, grows as merges happen).
+    let mut tok_to_id: HashMap<String, u32> = HashMap::new();
+    let mut id_to_tok: Vec<String> = Vec::new();
+
+    let mut get_id = |tok: &str,
+                      m: &mut HashMap<String, u32>,
+                      v: &mut Vec<String>| -> u32 {
+        if let Some(&id) = m.get(tok) { return id; }
+        let id = v.len() as u32;
+        m.insert(tok.to_string(), id);
+        v.push(tok.to_string());
+        id
+    };
+
+    // Build flat token arrays for GPU upload.
+    let mut flat_tokens: Vec<i32> = Vec::new();
+    let mut offsets:  Vec<i32> = Vec::new();
+    let mut raw_lens: Vec<i32> = Vec::new();
+    let mut freqs:    Vec<i32> = Vec::new();
+
+    for &(word, freq) in &words {
+        offsets.push(flat_tokens.len() as i32);
+        let chars: Vec<i32> = word.chars().map(|c| {
+            get_id(&c.to_string(), &mut tok_to_id, &mut id_to_tok) as i32
+        }).collect();
+        raw_lens.push(chars.len() as i32);
+        freqs.push(freq as i32);
+        flat_tokens.extend_from_slice(&chars);
+    }
+
+    let vocab_cap = id_to_tok.len() + num_merges + 64;
+    let mut gpu = GpuBpe::try_init(&flat_tokens, &offsets, &raw_lens, &freqs, vocab_cap);
+    if gpu.is_none() {
+        println!("  [BPE] GPU unavailable, falling back to CPU");
+        return train_bpe_cpu(word_freq, num_merges);
+    }
+    let g = gpu.as_mut().unwrap();
 
     let mut merges: Vec<(String, String)> = Vec::with_capacity(num_merges);
 
     for step in 0..num_merges {
-        // Count pairs in parallel.
-        let pair_freq: HashMap<(String, String), usize> = vocab
-            .par_iter()
-            .fold(
-                HashMap::new,
-                |mut acc, (word, freq)| {
-                    for i in 0..word.len().saturating_sub(1) {
-                        let pair = (word[i].clone(), word[i + 1].clone());
-                        *acc.entry(pair).or_insert(0) += freq;
-                    }
-                    acc
-                },
-            )
-            .reduce(HashMap::new, |mut a, b| {
-                for (k, v) in b { *a.entry(k).or_insert(0) += v; }
-                a
-            });
+        let vocab_size = id_to_tok.len();
+        let (a_id, b_id, freq) = match g.step(vocab_size) {
+            Some(r) => r,
+            None => break,
+        };
 
-        if pair_freq.is_empty() { break; }
-
-        let best = pair_freq
-            .iter()
-            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
-            .map(|(p, _)| p.clone())
-            .unwrap();
+        let a_tok = id_to_tok[a_id].clone();
+        let b_tok = id_to_tok[b_id].clone();
+        let merged = format!("{}{}", a_tok, b_tok);
+        let merged_id = get_id(&merged, &mut tok_to_id, &mut id_to_tok) as i32;
 
         if step % 500 == 0 {
-            println!("  BPE step {}/{} best={}{} (freq={})",
-                step, num_merges, best.0, best.1,
-                pair_freq[&best]);
+            println!("  BPE step {}/{} best={} (freq={})",
+                step, num_merges, merged, freq);
             let _ = std::io::stdout().flush();
         }
 
-        merges.push(best.clone());
-
-        let merged = format!("{}{}", best.0, best.1);
-        vocab = vocab
-            .into_par_iter()
-            .map(|(word, freq)| {
-                let mut out: Vec<String> = Vec::with_capacity(word.len());
-                let mut i = 0;
-                while i < word.len() {
-                    if i + 1 < word.len() && word[i] == best.0 && word[i + 1] == best.1 {
-                        out.push(merged.clone());
-                        i += 2;
-                    } else {
-                        out.push(word[i].clone());
-                        i += 1;
-                    }
-                }
-                (out, freq)
-            })
-            .collect();
+        merges.push((a_tok, b_tok));
+        if g.apply_merge(a_id as i32, b_id as i32, merged_id).is_none() {
+            println!("  [BPE] apply_merge failed at step {}, aborting GPU", step);
+            break;
+        }
     }
 
     merges
+}
+
+// Pure CPU fallback (rayon) - same algorithm as before.
+fn train_bpe_cpu(word_freq: &HashMap<String, usize>, num_merges: usize) -> Vec<(String, String)> {
+    let mut vocab: Vec<(Vec<String>, usize)> = word_freq.iter()
+        .filter(|(_, &f)| f > 0)
+        .map(|(w, &f)| (w.chars().map(|c| c.to_string()).collect(), f))
+        .collect();
+    let mut merges = Vec::with_capacity(num_merges);
+    for step in 0..num_merges {
+        let pair_freq = cpu_count_pairs(&vocab);
+        if pair_freq.is_empty() { break; }
+        let (best, &freq) = pair_freq.iter()
+            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0))).unwrap();
+        if step % 500 == 0 {
+            println!("  BPE step {}/{} best={}{} (freq={})", step, num_merges, best.0, best.1, freq);
+            let _ = std::io::stdout().flush();
+        }
+        let merged = format!("{}{}", best.0, best.1);
+        merges.push(best.clone());
+        let best = best.clone();
+        vocab = vocab.into_par_iter().map(|(word, freq)| {
+            let mut out = Vec::with_capacity(word.len());
+            let mut i = 0;
+            while i < word.len() {
+                if i + 1 < word.len() && word[i] == best.0 && word[i+1] == best.1 {
+                    out.push(merged.clone()); i += 2;
+                } else { out.push(word[i].clone()); i += 1; }
+            }
+            (out, freq)
+        }).collect();
+    }
+    merges
+}
+
+fn cpu_count_pairs(vocab: &[(Vec<String>, usize)]) -> HashMap<(String, String), usize> {
+    vocab
+        .par_iter()
+        .fold(HashMap::new, |mut acc, (word, freq)| {
+            for i in 0..word.len().saturating_sub(1) {
+                let pair = (word[i].clone(), word[i + 1].clone());
+                *acc.entry(pair).or_insert(0) += freq;
+            }
+            acc
+        })
+        .reduce(HashMap::new, |mut a, b| {
+            for (k, v) in b { *a.entry(k).or_insert(0) += v; }
+            a
+        })
 }
 
 // Apply learned merges to a single word, return list of sub-word tokens.

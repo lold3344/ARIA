@@ -64,58 +64,109 @@ __kernel void add_bias(
     out[b*N + i] += bias[i];
 }
 
-// GEMM: C = alpha*A*B + beta*C
+#define TILE 16
+
+// GEMM: C = alpha*A*B + beta*C  — tiled 16×16 shared memory
 // A: [M x K], B: [K x N], C: [M x N]  row-major
-__kernel void gemm(
+__kernel __attribute__((reqd_work_group_size(TILE, TILE, 1)))
+void gemm(
     __global const float* A,
     __global const float* B,
     __global       float* C,
     int M, int N, int K,
     float alpha, float beta)
 {
-    int row = get_global_id(0); // [0, M)
-    int col = get_global_id(1); // [0, N)
-    if (row >= M || col >= N) return;
-    float sum = 0.0f;
-    for (int k = 0; k < K; k++)
-        sum += A[row*K + k] * B[k*N + col];
-    C[row*N + col] = alpha * sum + beta * C[row*N + col];
-}
-
-// GEMM_TN: C = alpha * A^T * B + beta*C
-// A: [K x M] stored, A^T is [M x K]; B: [K x N]; C: [M x N]
-__kernel void gemm_tn(
-    __global const float* A,
-    __global const float* B,
-    __global       float* C,
-    int M, int N, int K,
-    float alpha, float beta)
-{
+    __local float As[TILE][TILE];
+    __local float Bs[TILE][TILE];
     int row = get_global_id(0);
     int col = get_global_id(1);
-    if (row >= M || col >= N) return;
+    int lr  = get_local_id(0);
+    int lc  = get_local_id(1);
     float sum = 0.0f;
-    for (int k = 0; k < K; k++)
-        sum += A[k*M + row] * B[k*N + col];
-    C[row*N + col] = alpha * sum + beta * C[row*N + col];
+    for (int t = 0; t < (K + TILE - 1) / TILE; t++) {
+        int k1 = t * TILE + lc;
+        int k2 = t * TILE + lr;
+        As[lr][lc] = (row < M && k1 < K) ? A[row*K + k1] : 0.0f;
+        Bs[lr][lc] = (k2 < K && col < N) ? B[k2*N + col]  : 0.0f;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int k = 0; k < TILE; k++) sum += As[lr][k] * Bs[k][lc];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (row < M && col < N)
+        C[row*N + col] = alpha * sum + beta * C[row*N + col];
 }
 
-// GEMM_NT: C = alpha * A * B^T + beta*C
-// A: [M x K]; B: [N x K] stored, B^T is [K x N]; C: [M x N]
-__kernel void gemm_nt(
+// GEMM_TN: C = alpha * A^T * B + beta*C  — tiled 16×16
+// A: [K x M], B: [K x N], C: [M x N]
+__kernel __attribute__((reqd_work_group_size(TILE, TILE, 1)))
+void gemm_tn(
     __global const float* A,
     __global const float* B,
     __global       float* C,
     int M, int N, int K,
     float alpha, float beta)
 {
+    __local float As[TILE][TILE];
+    __local float Bs[TILE][TILE];
     int row = get_global_id(0);
     int col = get_global_id(1);
-    if (row >= M || col >= N) return;
+    int lr  = get_local_id(0);
+    int lc  = get_local_id(1);
     float sum = 0.0f;
-    for (int k = 0; k < K; k++)
-        sum += A[row*K + k] * B[col*K + k];
-    C[row*N + col] = alpha * sum + beta * C[row*N + col];
+    for (int t = 0; t < (K + TILE - 1) / TILE; t++) {
+        int k1 = t * TILE + lc;
+        int k2 = t * TILE + lr;
+        // A^T[row][k1] = A[k1][row]
+        As[lr][lc] = (row < M && k1 < K) ? A[k1*M + row] : 0.0f;
+        Bs[lr][lc] = (k2 < K && col < N) ? B[k2*N + col]  : 0.0f;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int k = 0; k < TILE; k++) sum += As[lr][k] * Bs[k][lc];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (row < M && col < N)
+        C[row*N + col] = alpha * sum + beta * C[row*N + col];
+}
+
+// GEMM_NT: C = alpha * A * B^T + beta*C  — tiled 16×16
+// A: [M x K], B: [N x K], C: [M x N]
+__kernel __attribute__((reqd_work_group_size(TILE, TILE, 1)))
+void gemm_nt(
+    __global const float* A,
+    __global const float* B,
+    __global       float* C,
+    int M, int N, int K,
+    float alpha, float beta)
+{
+    __local float As[TILE][TILE];
+    __local float Bs[TILE][TILE];
+    int row = get_global_id(0);
+    int col = get_global_id(1);
+    int lr  = get_local_id(0);
+    int lc  = get_local_id(1);
+    float sum = 0.0f;
+    for (int t = 0; t < (K + TILE - 1) / TILE; t++) {
+        int k1 = t * TILE + lc;
+        int k2 = t * TILE + lr;
+        As[lr][lc] = (row < M && k1 < K) ? A[row*K + k1]  : 0.0f;
+        // B^T[k2][col] = B[col][k2]
+        Bs[lr][lc] = (k2 < K && col < N) ? B[col*K + k2]  : 0.0f;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int k = 0; k < TILE; k++) sum += As[lr][k] * Bs[k][lc];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (row < M && col < N)
+        C[row*N + col] = alpha * sum + beta * C[row*N + col];
+}
+
+// Accumulate mean loss on GPU: total[0] += sum(x[0..batch]) / batch
+__kernel void accum_mean(
+    __global const float* x,
+    __global       float* total,
+    int batch)
+{
+    int i = get_global_id(0);
+    if (i >= batch) return;
+    atomic_add_float(total, x[i] / (float)batch);
 }
 
 // LSTM forward: gates[b, 4*H] + c_prev[b, H] -> h[b,H], c[b,H]
@@ -283,6 +334,48 @@ __kernel void grad_scale(
     grad[i] *= scale;
 }
 
+// Compute L2 norm^2 of grad, then if norm > clip_val scale grad in-place.
+// Runs in two passes using work-group local reduction, all on GPU — no CPU readback.
+// Pass 1 (this kernel): each work-group writes its partial sum^2 to partial[group_id].
+__kernel void norm_reduce(
+    __global const float* grad,
+    __global       float* partial,
+    int n)
+{
+    __local float lmem[256];
+    int lid = get_local_id(0);
+    int gid = get_global_id(0);
+    lmem[lid] = (gid < n) ? grad[gid] * grad[gid] : 0.0f;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = get_local_size(0) / 2; s > 0; s >>= 1) {
+        if (lid < s) lmem[lid] += lmem[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) partial[get_group_id(0)] = lmem[0];
+}
+
+// Pass 2: reduce partial[] -> norm_sq[0], then scale grad if needed.
+__kernel void clip_if_needed(
+    __global const float* partial,
+    __global       float* grad,
+    int partial_n, int grad_n, float clip_val)
+{
+    __local float lmem[256];
+    int lid = get_local_id(0);
+    lmem[lid] = (lid < partial_n) ? partial[lid] : 0.0f;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = get_local_size(0) / 2; s > 0; s >>= 1) {
+        if (lid < s) lmem[lid] += lmem[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid != 0) return;
+    float norm = sqrt(lmem[0]);
+    if (norm > clip_val) {
+        float scale = clip_val / norm;
+        for (int i = 0; i < grad_n; i++) grad[i] *= scale;
+    }
+}
+
 // ---- AdaptiveSoftmax kernels ----
 
 // matmul: C[batch x out] = A[batch x in] * W^T[out x in]  (W row-major)
@@ -424,6 +517,9 @@ pub struct LSTMModelCuda {
     k_adam:           Kernel,
     k_grad_norm_sq:   Kernel,
     k_grad_scale:     Kernel,
+    k_accum_mean:     Kernel,
+    k_norm_reduce:    Kernel,
+    k_clip_if_needed: Kernel,
     // AdaptiveSoftmax GPU kernels
     k_asm_linear:     Kernel,
     k_asm_softmax:    Kernel,
@@ -575,6 +671,12 @@ impl LSTMModelCuda {
             .arg(&d1f).arg(&d1f).arg(&zero_i).build().unwrap();
         let k_grad_scale = Kernel::builder().program(&program).name("grad_scale").queue(queue.clone())
             .arg(&d1f).arg(&zero_f).build().unwrap();
+        let k_accum_mean = Kernel::builder().program(&program).name("accum_mean").queue(queue.clone())
+            .arg(&d1f).arg(&d1f).arg(&zero_i).build().unwrap();
+        let k_norm_reduce = Kernel::builder().program(&program).name("norm_reduce").queue(queue.clone())
+            .arg(&d1f).arg(&d1f).arg(&zero_i).build().unwrap();
+        let k_clip_if_needed = Kernel::builder().program(&program).name("clip_if_needed").queue(queue.clone())
+            .arg(&d1f).arg(&d1f).arg(&zero_i).arg(&zero_i).arg(&zero_f).build().unwrap();
 
         let k_asm_linear = Kernel::builder().program(&program).name("asm_linear").queue(queue.clone())
             .arg(&d1f).arg(&d1f).arg(&d1f).arg(&d1f).arg(&zero_i).arg(&zero_i).build().unwrap();
@@ -611,7 +713,8 @@ impl LSTMModelCuda {
             k_embed_fwd, k_embed_bwd, k_add_bias,
             k_lstm_fwd, k_lstm_bwd,
             k_gemm, k_gemm_tn, k_gemm_nt,
-            k_reduce_sum, k_adam, k_grad_norm_sq, k_grad_scale,
+            k_reduce_sum, k_adam, k_grad_norm_sq, k_grad_scale, k_accum_mean,
+            k_norm_reduce, k_clip_if_needed,
             k_asm_linear, k_asm_softmax, k_asm_ce_grad,
             k_asm_wgrad, k_asm_bgrad, k_asm_igrad,
             asm_head_size, asm_tail1_size, asm_tail2_size, asm_dim1, asm_dim2,
@@ -651,10 +754,15 @@ impl LSTMModelCuda {
     }
 
     // -------------------------------------------------------------------------
-    // GEMM helpers — use pre-built kernels, set args dynamically
+    // GEMM helpers — tiled 16×16 dispatch
     // -------------------------------------------------------------------------
+    #[inline(always)]
+    fn tile_size(n: usize) -> usize { (n + 15) / 16 * 16 }
+
     fn gemm(&self, a: &Buffer<f32>, b: &Buffer<f32>, c: &Buffer<f32>,
             m: usize, n: usize, k: usize, alpha: f32, beta: f32) {
+        let gm = Self::tile_size(m);
+        let gn = Self::tile_size(n);
         unsafe {
             self.k_gemm.set_arg(0, a).unwrap();
             self.k_gemm.set_arg(1, b).unwrap();
@@ -664,12 +772,14 @@ impl LSTMModelCuda {
             self.k_gemm.set_arg(5, &(k as i32)).unwrap();
             self.k_gemm.set_arg(6, &alpha).unwrap();
             self.k_gemm.set_arg(7, &beta).unwrap();
-            self.k_gemm.cmd().global_work_size([m, n]).enq().unwrap();
+            self.k_gemm.cmd().global_work_size([gm, gn]).local_work_size([16usize, 16usize]).enq().unwrap();
         }
     }
 
     fn gemm_tn(&self, a: &Buffer<f32>, b: &Buffer<f32>, c: &Buffer<f32>,
                m: usize, n: usize, k: usize, alpha: f32, beta: f32) {
+        let gm = Self::tile_size(m);
+        let gn = Self::tile_size(n);
         unsafe {
             self.k_gemm_tn.set_arg(0, a).unwrap();
             self.k_gemm_tn.set_arg(1, b).unwrap();
@@ -679,12 +789,14 @@ impl LSTMModelCuda {
             self.k_gemm_tn.set_arg(5, &(k as i32)).unwrap();
             self.k_gemm_tn.set_arg(6, &alpha).unwrap();
             self.k_gemm_tn.set_arg(7, &beta).unwrap();
-            self.k_gemm_tn.cmd().global_work_size([m, n]).enq().unwrap();
+            self.k_gemm_tn.cmd().global_work_size([gm, gn]).local_work_size([16usize, 16usize]).enq().unwrap();
         }
     }
 
     fn gemm_nt(&self, a: &Buffer<f32>, b: &Buffer<f32>, c: &Buffer<f32>,
                m: usize, n: usize, k: usize, alpha: f32, beta: f32) {
+        let gm = Self::tile_size(m);
+        let gn = Self::tile_size(n);
         unsafe {
             self.k_gemm_nt.set_arg(0, a).unwrap();
             self.k_gemm_nt.set_arg(1, b).unwrap();
@@ -694,7 +806,7 @@ impl LSTMModelCuda {
             self.k_gemm_nt.set_arg(5, &(k as i32)).unwrap();
             self.k_gemm_nt.set_arg(6, &alpha).unwrap();
             self.k_gemm_nt.set_arg(7, &beta).unwrap();
-            self.k_gemm_nt.cmd().global_work_size([m, n]).enq().unwrap();
+            self.k_gemm_nt.cmd().global_work_size([gm, gn]).local_work_size([16usize, 16usize]).enq().unwrap();
         }
     }
 
@@ -822,61 +934,49 @@ impl LSTMModelCuda {
         h_list.push(gpu_zeros(&self.queue, batch * H));
         c_list.push(gpu_zeros(&self.queue, batch * H));
 
-        let mut total_loss = 0.0f32;
+        // GPU-side loss accumulator — one f32, avoids per-step CPU readback
+        let gpu_total_loss = gpu_zeros(&self.queue, 1);
 
-        // Pre-allocate reusable per-step buffers (avoid GPU alloc inside the loops)
-        let mut tok_step_buf = gpu_zeros_i32(&self.queue, batch);
-        let mut x_buf        = gpu_zeros(&self.queue, batch * E);
+        // Pre-allocate ALL per-step buffers before the loops — zero GPU alloc inside
+        let tok_step_buf = gpu_zeros_i32(&self.queue, batch);
+        // xs_list / gates_list: pre-allocate all slots, reuse by writing in-place
+        for _ in 0..steps {
+            xs_list.push(gpu_zeros(&self.queue, batch * E));
+            gates_list.push(gpu_zeros(&self.queue, batch * fh));
+            h_list.push(gpu_zeros(&self.queue, batch * H));
+            c_list.push(gpu_zeros(&self.queue, batch * H));
+        }
 
         // ---- FORWARD ----
         for t in 0..steps {
             let tok_step = &tok_all_cpu[t * batch .. (t + 1) * batch];
             tok_step_buf.write(tok_step).enq().unwrap();
 
-            let mut x = gpu_zeros(&self.queue, batch * E);
             unsafe {
                 self.k_embed_fwd.set_arg(0, &self.embed).unwrap();
                 self.k_embed_fwd.set_arg(1, &tok_step_buf).unwrap();
-                self.k_embed_fwd.set_arg(2, &x).unwrap();
+                self.k_embed_fwd.set_arg(2, &xs_list[t]).unwrap();
                 self.k_embed_fwd.set_arg(3, &(E as i32)).unwrap();
                 self.k_embed_fwd.cmd().global_work_size([batch, E]).enq().unwrap();
             }
 
-            let mut gates = gpu_zeros(&self.queue, batch * fh);
-            self.gemm(&x, &self.w_x, &gates, batch, fh, E, 1.0, 0.0);
-            self.gemm(&h_list[t], &self.w_h, &gates, batch, fh, H, 1.0, 1.0);
+            self.gemm(&xs_list[t], &self.w_x, &gates_list[t], batch, fh, E, 1.0, 0.0);
+            self.gemm(&h_list[t],  &self.w_h, &gates_list[t], batch, fh, H, 1.0, 1.0);
             unsafe {
-                self.k_add_bias.set_arg(0, &gates).unwrap();
+                self.k_add_bias.set_arg(0, &gates_list[t]).unwrap();
                 self.k_add_bias.set_arg(1, &self.b).unwrap();
                 self.k_add_bias.set_arg(2, &(fh as i32)).unwrap();
                 self.k_add_bias.cmd().global_work_size([batch, fh]).enq().unwrap();
             }
 
-            let mut h_new = gpu_zeros(&self.queue, batch * H);
-            let mut c_new = gpu_zeros(&self.queue, batch * H);
             unsafe {
-                self.k_lstm_fwd.set_arg(0, &gates).unwrap();
+                self.k_lstm_fwd.set_arg(0, &gates_list[t]).unwrap();
                 self.k_lstm_fwd.set_arg(1, &c_list[t]).unwrap();
-                self.k_lstm_fwd.set_arg(2, &h_new).unwrap();
-                self.k_lstm_fwd.set_arg(3, &c_new).unwrap();
+                self.k_lstm_fwd.set_arg(2, &h_list[t + 1]).unwrap();
+                self.k_lstm_fwd.set_arg(3, &c_list[t + 1]).unwrap();
                 self.k_lstm_fwd.set_arg(4, &(H as i32)).unwrap();
                 self.k_lstm_fwd.cmd().global_work_size([batch, H]).enq().unwrap();
             }
-
-            // h_list stores GPU buffers for BPTT; we'll bulk-read them after forward pass.
-            h_list.push(h_new);
-            c_list.push(c_new);
-            xs_list.push(x);
-            gates_list.push(gates);
-        }
-
-        // ---- OPT: ONE bulk GPU→CPU read for all hidden states ----
-        // Read all h_list[1..=steps] in a single flat Vec instead of steps calls.
-        let mut h_all_cpu = vec![0.0f32; (steps + 1) * batch * H];
-        // h_list[0] is zeros (initial state), skip it
-        for t in 0..=steps {
-            let slice = &mut h_all_cpu[t * batch * H .. (t + 1) * batch * H];
-            h_list[t].read(slice).enq().unwrap();
         }
 
         // ---- LOSS + OUTPUT GRAD (AdaptiveSoftmax on GPU) ----
@@ -1011,8 +1111,13 @@ impl LSTMModelCuda {
                 self.k_asm_ce_grad.set_arg(3, &(ts2 as i32)).unwrap();
                 self.k_asm_ce_grad.cmd().global_work_size([batch]).enq().unwrap();
             }
-            let loss_cpu_v = buf_to_vec(&loss_buf);
-            total_loss += loss_cpu_v.iter().sum::<f32>() / batch as f32;
+            // Accumulate loss on GPU — no CPU stall per step
+            unsafe {
+                self.k_accum_mean.set_arg(0, &loss_buf).unwrap();
+                self.k_accum_mean.set_arg(1, &gpu_total_loss).unwrap();
+                self.k_accum_mean.set_arg(2, &(batch as i32)).unwrap();
+                self.k_accum_mean.cmd().global_work_size([batch]).enq().unwrap();
+            }
 
             unsafe {
                 // weight grads head
@@ -1107,6 +1212,7 @@ impl LSTMModelCuda {
         let mut d_c_next     = gpu_zeros(&self.queue, batch * H);
         let mut d_gates_bwd  = gpu_zeros(&self.queue, batch * fh);
         let mut d_c_prev_bwd = gpu_zeros(&self.queue, batch * H);
+        let d_x_buf          = gpu_zeros(&self.queue, batch * E);
 
         for t in (0..steps).rev() {
             unsafe {
@@ -1137,13 +1243,13 @@ impl LSTMModelCuda {
                 self.k_reduce_sum.cmd().global_work_size([fh]).enq().unwrap();
             }
 
-            unsafe { x_buf.cmd().fill(0.0f32, None).enq().unwrap(); }
-            self.gemm_nt(&d_gates_bwd, &self.w_x, &x_buf, batch, E, fh, 1.0, 0.0);
+            unsafe { d_x_buf.cmd().fill(0.0f32, None).enq().unwrap(); }
+            self.gemm_nt(&d_gates_bwd, &self.w_x, &d_x_buf, batch, E, fh, 1.0, 0.0);
 
             let tok_step = &tok_all_cpu[t * batch .. (t + 1) * batch];
             tok_step_buf.write(tok_step).enq().unwrap();
             unsafe {
-                self.k_embed_bwd.set_arg(0, &x_buf).unwrap();
+                self.k_embed_bwd.set_arg(0, &d_x_buf).unwrap();
                 self.k_embed_bwd.set_arg(1, &tok_step_buf).unwrap();
                 self.k_embed_bwd.set_arg(2, &d_embed).unwrap();
                 self.k_embed_bwd.set_arg(3, &(E as i32)).unwrap();
@@ -1162,7 +1268,9 @@ impl LSTMModelCuda {
 
         let grads = [&d_embed, &d_w_x, &d_w_h, &d_b];
 
-        let mut norm_sq_buf = gpu_zeros(&self.queue, 1);
+        // GPU-only gradient clipping: norm_reduce -> clip_if_needed, no CPU readback
+        let max_partial = 1024usize; // enough for any grad size / 256
+        let partial_buf = gpu_zeros(&self.queue, max_partial);
         for (i, (n, param, m_buf, v_buf)) in [
             (self.vocab_size * E, &mut self.embed, &mut self.m_embed, &mut self.v_embed),
             (E * fh,  &mut self.w_x,   &mut self.m_w_x,   &mut self.v_w_x),
@@ -1170,23 +1278,24 @@ impl LSTMModelCuda {
             (fh,      &mut self.b,     &mut self.m_b,     &mut self.v_b),
         ].iter_mut().enumerate() {
             let grad = grads[i];
-            unsafe { norm_sq_buf.cmd().fill(0.0f32, None).enq().unwrap(); }
+            let wg = 256usize;
+            let global_r = (*n + wg - 1) / wg * wg;
+            let ngroups = global_r / wg;
             unsafe {
-                self.k_grad_norm_sq.set_arg(0, grad).unwrap();
-                self.k_grad_norm_sq.set_arg(1, &norm_sq_buf).unwrap();
-                self.k_grad_norm_sq.set_arg(2, &(*n as i32)).unwrap();
-                self.k_grad_norm_sq.cmd().global_work_size([*n]).enq().unwrap();
-            }
-            let norm = buf_to_vec(&norm_sq_buf)[0].sqrt();
-            if norm > 5.0 {
-                let scale = 5.0f32 / norm;
-                unsafe {
-                    self.k_grad_scale.set_arg(0, grad).unwrap();
-                    self.k_grad_scale.set_arg(1, &scale).unwrap();
-                    self.k_grad_scale.cmd().global_work_size([*n]).enq().unwrap();
-                }
-            }
-            unsafe {
+                self.k_norm_reduce.set_arg(0, grad).unwrap();
+                self.k_norm_reduce.set_arg(1, &partial_buf).unwrap();
+                self.k_norm_reduce.set_arg(2, &(*n as i32)).unwrap();
+                self.k_norm_reduce.cmd().global_work_size([global_r]).local_work_size([wg]).enq().unwrap();
+
+                self.k_clip_if_needed.set_arg(0, &partial_buf).unwrap();
+                self.k_clip_if_needed.set_arg(1, grad).unwrap();
+                self.k_clip_if_needed.set_arg(2, &(ngroups as i32)).unwrap();
+                self.k_clip_if_needed.set_arg(3, &(*n as i32)).unwrap();
+                self.k_clip_if_needed.set_arg(4, &5.0f32).unwrap();
+                // single work-group, 256 threads
+                let pg = (ngroups + 255) / 256 * 256;
+                self.k_clip_if_needed.cmd().global_work_size([pg.max(256)]).local_work_size([256usize]).enq().unwrap();
+
                 self.k_adam.set_arg(0, &**param).unwrap();
                 self.k_adam.set_arg(1, &**m_buf).unwrap();
                 self.k_adam.set_arg(2, &**v_buf).unwrap();
@@ -1232,7 +1341,8 @@ impl LSTMModelCuda {
             }
         }
 
-        total_loss / steps as f32
+        // Single GPU→CPU readback for the entire batch loss
+        buf_to_vec(&gpu_total_loss)[0] / steps as f32
     }
 
     pub fn backward_step(&mut self, tokens: &[usize], learning_rate: f64) -> f32 {
@@ -1349,8 +1459,46 @@ impl LSTMModelCuda {
 const LEARNING_RATE:       f64   = 0.0003;
 const MAX_TOKENS_PER_SEQ:  usize = 80;
 const MIN_TOKENS_PER_SEQ:  usize = 4;
-const PRETRAIN_EPOCHS:     usize = 5;
-const PRETRAIN_BATCH_SIZE: usize = 32;
+const PRETRAIN_EPOCHS:     usize = 10;
+const PRETRAIN_BATCH_SIZE: usize = 1024;
+
+fn save_seq_cache(path: &str, seqs: &[Vec<usize>]) {
+    use std::io::Write;
+    let mut buf: Vec<u8> = Vec::with_capacity(seqs.len() * 20 * 2);
+    // format: [u32 count] [u16 len, u16... tokens]*
+    let count = seqs.len() as u32;
+    buf.extend_from_slice(&count.to_le_bytes());
+    for seq in seqs {
+        let len = seq.len() as u16;
+        buf.extend_from_slice(&len.to_le_bytes());
+        for &tok in seq {
+            buf.extend_from_slice(&(tok as u16).to_le_bytes());
+        }
+    }
+    if let Ok(mut f) = fs::File::create(path) {
+        f.write_all(&buf).ok();
+    }
+}
+
+fn load_seq_cache(path: &str) -> Option<Vec<Vec<usize>>> {
+    let data = fs::read(path).ok()?;
+    if data.len() < 4 { return None; }
+    let count = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
+    let mut seqs = Vec::with_capacity(count);
+    let mut i = 4usize;
+    for _ in 0..count {
+        if i + 2 > data.len() { return None; }
+        let len = u16::from_le_bytes(data[i..i+2].try_into().ok()?) as usize;
+        i += 2;
+        if i + len * 2 > data.len() { return None; }
+        let seq: Vec<usize> = (0..len)
+            .map(|k| u16::from_le_bytes(data[i + k*2 .. i + k*2 + 2].try_into().unwrap()) as usize)
+            .collect();
+        i += len * 2;
+        seqs.push(seq);
+    }
+    Some(seqs)
+}
 
 pub fn pretrain_from_files(
     model: &mut LSTMModelCuda,
@@ -1372,34 +1520,45 @@ pub fn pretrain_from_files(
 
     rayon::ThreadPoolBuilder::new().num_threads(num_cpus).build_global().ok();
 
-    let files: Vec<String> = fs::read_dir(path)?
-        .par_bridge()
-        .filter_map(|e| {
-            let e = e.ok()?;
-            let p = e.path();
-            if p.extension().map_or(false, |x| x == "txt") {
-                let c = fs::read_to_string(&p).ok()?;
-                if !c.trim().is_empty() { return Some(c); }
-            }
-            None
-        })
-        .collect();
+    // Try binary sequence cache to skip re-tokenization of 1.1 GB
+    let cache_path = format!("{}/sequences_cache.bin", data_dir);
+    let mut all_seqs: Vec<Vec<usize>> = if let Some(cached) = load_seq_cache(&cache_path) {
+        println!("Loaded {} sequences from cache (skipped tokenization)\n", cached.len());
+        cached
+    } else {
+        let files: Vec<String> = fs::read_dir(path)?
+            .par_bridge()
+            .filter_map(|e| {
+                let e = e.ok()?;
+                let p = e.path();
+                if p.extension().map_or(false, |x| x == "txt") {
+                    let c = fs::read_to_string(&p).ok()?;
+                    if !c.trim().is_empty() { return Some(c); }
+                }
+                None
+            })
+            .collect();
 
-    println!("Loaded {} files", files.len());
-    if files.is_empty() { println!("No text files."); return Ok(()); }
+        println!("Loaded {} files", files.len());
+        if files.is_empty() { println!("No text files."); return Ok(()); }
 
-    let mut all_seqs: Vec<Vec<usize>> = files.iter()
-        .flat_map(|c| {
-            c.split(|ch| ch == '.' || ch == '\n' || ch == '!' || ch == '?')
-             .map(|s| s.trim().to_string())
-             .filter(|s| s.len() > 5)
-             .collect::<Vec<_>>()
-        })
-        .filter_map(|s| {
-            let t = tokenizer.encode(&s);
-            if t.len() >= MIN_TOKENS_PER_SEQ && t.len() <= MAX_TOKENS_PER_SEQ { Some(t) } else { None }
-        })
-        .collect();
+        let seqs: Vec<Vec<usize>> = files.iter()
+            .flat_map(|c| {
+                c.split(|ch| ch == '.' || ch == '\n' || ch == '!' || ch == '?')
+                 .map(|s| s.trim().to_string())
+                 .filter(|s| s.len() > 5)
+                 .collect::<Vec<_>>()
+            })
+            .filter_map(|s| {
+                let t = tokenizer.encode(&s);
+                if t.len() >= MIN_TOKENS_PER_SEQ && t.len() <= MAX_TOKENS_PER_SEQ { Some(t) } else { None }
+            })
+            .collect();
+
+        println!("Saving sequence cache...");
+        save_seq_cache(&cache_path, &seqs);
+        seqs
+    };
 
     println!("{} sequences\n", all_seqs.len());
     if all_seqs.is_empty() { println!("No usable sequences."); return Ok(()); }
