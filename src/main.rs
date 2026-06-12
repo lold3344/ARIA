@@ -1,4 +1,5 @@
 mod model_cuda;
+mod adaptive_softmax;
 mod tokenizer;
 mod storage;
 mod db;
@@ -54,8 +55,8 @@ fn main() -> anyhow::Result<()> {
     let session_id = Uuid::new_v4().to_string();
     println!("Session ID: {}\n", session_id);
 
-    let embed_dim = 500;
-    let hidden_dim = 1200;
+    let embed_dim = 128;
+    let hidden_dim = 64;
 
     let model_path = "aria_model.json";
     let tokenizer_path = "aria_tokenizer.json";
@@ -256,17 +257,22 @@ fn main() -> anyhow::Result<()> {
             db::update_dialog_reward(db_path, &aria_entry_id, reward)?;
             println!("Reward: {}", if reward > 0.0 { "+1" } else { "-1" });
 
-            if reward > 0.0 {
-                let mut combined: Vec<usize> = input_no_end.to_vec();
-                combined.extend(generated_tokens.iter().copied());
-                combined.push(3);
-                if combined.len() >= 3 {
+            let mut combined: Vec<usize> = input_no_end.to_vec();
+            combined.extend(generated_tokens.iter().copied());
+            combined.push(3);
+
+            if combined.len() >= 3 {
+                if reward > 0.0 {
+                    // Reinforce: gradient descent, make this response more likely.
                     let loss = model.backward_step(&combined, 0.0005);
                     stats.total_loss += loss;
                     println!("Reinforced (loss = {:.4})\n", loss);
+                } else {
+                    // Punish: gradient ascent, make this response less likely.
+                    let loss = model.backward_step(&combined, -0.0002);
+                    stats.total_loss += loss.abs();
+                    println!("Penalized (loss = {:.4})\n", loss);
                 }
-            } else {
-                println!("Noted (negative reward logged)\n");
             }
         }
     }
@@ -292,9 +298,9 @@ fn train_fresh(tokenizer: &mut Tokenizer, data_dir: &str, embed_dim: usize, hidd
     }
 
     let _ = tokenizer.encode(&all_text);
+    tokenizer.freeze();
     let actual_vocab = tokenizer.vocab_size();
     println!("Vocabulary built: {} words", actual_vocab);
-    tokenizer.freeze();
 
     let mut model = LSTMModelCuda::new(actual_vocab, embed_dim, hidden_dim);
 

@@ -9,8 +9,8 @@ use rand::seq::SliceRandom;
 const LEARNING_RATE: f32 = 0.001;
 const MAX_TOKENS_PER_SEQ: usize = 80;
 const MIN_TOKENS_PER_SEQ: usize = 4;
-const EPOCHS: usize = 5;
-const BATCH_SIZE: usize = 32;
+const EPOCHS: usize = 10;
+const BATCH_SIZE: usize = 64;
 
 pub fn pretrain_from_files(
     model: &mut LSTMModel,
