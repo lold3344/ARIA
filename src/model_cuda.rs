@@ -1346,11 +1346,11 @@ impl LSTMModelCuda {
 // PRETRAINING
 // =============================================================================
 
-const LEARNING_RATE:       f64   = 0.0005;
+const LEARNING_RATE:       f64   = 0.0003;
 const MAX_TOKENS_PER_SEQ:  usize = 80;
 const MIN_TOKENS_PER_SEQ:  usize = 4;
-const PRETRAIN_EPOCHS:     usize = 10;
-const PRETRAIN_BATCH_SIZE: usize = 64;
+const PRETRAIN_EPOCHS:     usize = 5;
+const PRETRAIN_BATCH_SIZE: usize = 32;
 
 pub fn pretrain_from_files(
     model: &mut LSTMModelCuda,
@@ -1406,6 +1406,7 @@ pub fn pretrain_from_files(
 
     let total_batches = (all_seqs.len() + PRETRAIN_BATCH_SIZE - 1) / PRETRAIN_BATCH_SIZE;
 
+    let mut current_lr = LEARNING_RATE;
     for epoch in 0..PRETRAIN_EPOCHS {
         let ep = Instant::now();
         let mut last_report = Instant::now();
@@ -1415,7 +1416,7 @@ pub fn pretrain_from_files(
         let mut seqs_done = 0usize;
 
         for chunk in all_seqs.chunks(PRETRAIN_BATCH_SIZE) {
-            let loss = model.train_batch(chunk, LEARNING_RATE);
+            let loss = model.train_batch(chunk, current_lr);
             if loss.is_finite() { total_loss += loss; batches += 1; }
             seqs_done += chunk.len();
 
@@ -1436,8 +1437,9 @@ pub fn pretrain_from_files(
         let avg = total_loss / batches.max(1) as f32;
         let et = ep.elapsed();
         let seq_s = all_seqs.len() as f32 / et.as_secs_f32();
-        println!("Epoch {}/{} done  |  loss={:.6}  |  {:.1}s  |  {:.0} seq/s",
-                 epoch+1, PRETRAIN_EPOCHS, avg, et.as_secs_f32(), seq_s);
+        println!("Epoch {}/{} done  |  loss={:.6}  |  {:.1}s  |  {:.0} seq/s  |  lr={:.6}",
+                 epoch+1, PRETRAIN_EPOCHS, avg, et.as_secs_f32(), seq_s, current_lr);
+        current_lr *= 0.85;
     }
 
     println!("\nTotal: {:.1}s", start.elapsed().as_secs_f32());
