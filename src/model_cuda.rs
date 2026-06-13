@@ -716,33 +716,48 @@ impl LSTMModelCuda {
         let bc2 = 1.0 - b2.powi(t);
         let lr  = learning_rate as f32;
 
-        let f_norm  = self.module.load_function("norm_reduce").unwrap();
-        let f_clip  = self.module.load_function("clip_if_needed").unwrap();
-        let f_adam  = self.module.load_function("adam_update").unwrap();
+        let f_norm = self.module.load_function("norm_reduce").unwrap();
+        let f_adam = self.module.load_function("adam_update").unwrap();
 
         let wg: usize = 256;
-        let mut partial_buf = stream.alloc_zeros::<f32>(1024).unwrap();
-        let five = 5.0f32;
+        let clip_val = 5.0f32;
+
+        // Max ngroups across all LSTM params (w_h = H*4H is largest)
+        let max_n = [self.vocab_size * E, E * fh, H * fh, fh].iter().copied().max().unwrap();
+        let max_ngroups = (max_n + wg - 1) / wg;
+        let mut partial_buf = stream.alloc_zeros::<f32>(max_ngroups).unwrap();
 
         macro_rules! lstm_adam {
             ($param:expr, $m:expr, $v:expr, $grad:expr, $n:expr) => {{
                 let nn: usize = $n;
-                let n_i  = nn as i32;
+                let n_i = nn as i32;
                 let ngroups = (nn + wg - 1) / wg;
-                let ng_i = ngroups as i32;
-                let pg   = ngroups.max(256);
+
+                // GPU norm reduction → CPU finish → GPU scale if needed
                 stream.memset_zeros(&mut partial_buf).unwrap();
                 unsafe {
                     stream.launch_builder(&f_norm)
                         .arg(&$grad)
                         .arg(&mut partial_buf)
                         .arg(&n_i)
-                        .launch(LaunchConfig { grid_dim: (ngroups as u32,1,1), block_dim: (wg as u32,1,1), shared_mem_bytes: (wg*4) as u32 }).unwrap();
-                    stream.launch_builder(&f_clip)
-                        .arg(&partial_buf)
-                        .arg(&mut $param)
-                        .arg(&ng_i).arg(&n_i).arg(&five)
-                        .launch(LaunchConfig { grid_dim:(1,1,1), block_dim:(pg as u32,1,1), shared_mem_bytes:(pg*4) as u32 }).unwrap();
+                        .launch(LaunchConfig {
+                            grid_dim: (ngroups as u32, 1, 1),
+                            block_dim: (wg as u32, 1, 1),
+                            shared_mem_bytes: (wg * 4) as u32,
+                        }).unwrap();
+                }
+                let partial_cpu = download(&stream, &partial_buf);
+                let norm = partial_cpu[..ngroups].iter().sum::<f32>().sqrt();
+                if norm > clip_val {
+                    let scale = clip_val / norm;
+                    // scale gradient in-place using adam_update trick: just pre-scale grad
+                    // We do this with a single kernel launch using elem-wise multiply
+                    // For simplicity: download, scale, re-upload (only when clipping fires)
+                    let mut g_cpu = download(&stream, &$grad);
+                    for v in &mut g_cpu { *v *= scale; }
+                    $grad = upload(&stream, &g_cpu);
+                }
+                unsafe {
                     stream.launch_builder(&f_adam)
                         .arg(&mut $param).arg(&mut $m).arg(&mut $v).arg(&$grad)
                         .arg(&lr).arg(&b1).arg(&b2).arg(&eps).arg(&bc1).arg(&bc2).arg(&n_i)
@@ -936,7 +951,7 @@ const LEARNING_RATE:       f64   = 0.0003;
 const MAX_TOKENS_PER_SEQ:  usize = 80;
 const MIN_TOKENS_PER_SEQ:  usize = 4;
 const PRETRAIN_EPOCHS:     usize = 5;
-const PRETRAIN_BATCH_SIZE: usize = 1024;
+const PRETRAIN_BATCH_SIZE: usize = 512;
 
 pub fn pretrain_from_files(
     model: &mut LSTMModelCuda,
