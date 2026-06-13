@@ -1,17 +1,19 @@
-use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, LaunchAsync, LaunchConfig};
-use cudarc::cublas::{CudaBlas, Gemm};
+use cudarc::driver::{CudaContext, CudaStream};
+use cudarc::cublas::CudaBlas;
 use std::sync::Arc;
 
 pub struct GpuContext {
-    pub device: Arc<CudaDevice>,
+    pub ctx:    Arc<CudaContext>,
+    pub stream: Arc<CudaStream>,
     pub blas:   CudaBlas,
 }
 
 impl GpuContext {
     pub fn try_init() -> Option<Self> {
-        let device = CudaDevice::new(0).ok()?;
-        println!("[GPU] CUDA device 0 initialised");
-        let blas = CudaBlas::new(device.clone()).ok()?;
-        Some(GpuContext { device, blas })
+        let ctx    = CudaContext::new(0).ok()?;
+        let stream = ctx.default_stream();
+        println!("[GPU] CUDA device 0 — cuBLAS ready");
+        let blas = CudaBlas::new(stream.clone()).ok()?;
+        Some(GpuContext { ctx, stream, blas })
     }
 }

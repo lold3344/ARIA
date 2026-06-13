@@ -5,7 +5,8 @@ edition = "2021"
 
 [dependencies]
 rayon = "1.10"
-cudarc = { version = "0.12", features = ["cublas", "driver"] }
+cudarc = { version = "0.19", features = ["cublas", "driver", "nvrtc", "cuda-12090", "dynamic-linking"] }
+ocl = "0.19"
 rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
