@@ -970,7 +970,11 @@ pub fn pretrain_from_files(
     println!("LR: {}  Epochs: {}  Batch: {}", LEARNING_RATE, PRETRAIN_EPOCHS, PRETRAIN_BATCH_SIZE);
     println!("===============================================\n");
 
-    let cache_path = format!("{}/sequences_cache.bin", data_dir);
+    // Cache name includes vocab_size — stale caches from old tokenizers are ignored automatically
+    let cache_path = format!("{}/sequences_cache_v{}.bin", data_dir, tokenizer.vocab_size());
+    // Delete any old-style cache that might exist
+    let _ = fs::remove_file(format!("{}/sequences_cache.bin", data_dir));
+
     let mut all_seqs: Vec<Vec<usize>> = if let Some(cached) = load_seq_cache(&cache_path) {
         println!("Loaded {} sequences from cache\n", cached.len());
         cached

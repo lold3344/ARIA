@@ -548,5 +548,49 @@
     "role": "aria",
     "session_id": "64268113-d562-4bd9-9cd4-d56ca16d7e3d",
     "timestamp": 1781326426
+  },
+  {
+    "encrypted_message": {
+      "ciphertext_b64": "cdSSUSP6UGizErmz2baLnfLZEYpsoSjkWTaRJQ==",
+      "nonce_b64": "AOyGO8+a2sZmhopt2G8cWWc74dMKgeL/"
+    },
+    "id": "5c542cf7-212e-4b08-ada3-8b50d02bc7aa",
+    "reward": null,
+    "role": "user",
+    "session_id": "26c8f860-60ac-49c3-9142-6d1c759beb8a",
+    "timestamp": 1781333753
+  },
+  {
+    "encrypted_message": {
+      "ciphertext_b64": "3zzRXA97+2iQMHoV4V1IPlBGoZPao8WyzgSZidr/xZtDpiL6UAk84G0i8fj0X6Lt/tIdd8ARGnW640OU+ftvLAsR0thYTv6eHk3lzIJ8LDWZPYOL/mJaN2yYr+3d4KPgevJuR0vV7w0hW2qHnkQifkfXBi/HpFY/CW+M3tMDXGi5TB+9w8EnHDuiYUaKMuVh1297tkYZxWqMDa5P0pmvYPLkiseoagpN/5T60bpveosj7SGga3NDk9o9Ax5wr+X6tfwxzPe/",
+      "nonce_b64": "HTnERNMRnxh+I02Gaj9dWStybhDADuKJ"
+    },
+    "id": "ebeb9d59-ab9c-4faa-8ed2-1cf1ee279d91",
+    "reward": -1.0,
+    "role": "aria",
+    "session_id": "26c8f860-60ac-49c3-9142-6d1c759beb8a",
+    "timestamp": 1781333754
+  },
+  {
+    "encrypted_message": {
+      "ciphertext_b64": "ftK8+DCjCxEG2vliOUnoqtWoQ0Uo9W/0ycspHQ==",
+      "nonce_b64": "BBbCDlLa0EmCf6jh7kfIkR2tmPNMDbpk"
+    },
+    "id": "5280ee9b-a622-482e-ab3b-cfc75df73a2b",
+    "reward": null,
+    "role": "user",
+    "session_id": "26c8f860-60ac-49c3-9142-6d1c759beb8a",
+    "timestamp": 1781333760
+  },
+  {
+    "encrypted_message": {
+      "ciphertext_b64": "AyaCIVu/HIy8FkPYT3wHLF6JHsFzguhVR7Pqh8Xe5ykOJpcUt8WPp0jbFHTM6XUXXNx3n5AOlWZh1q3kb6nvrtRnD4bH5xQUtA0OyCYGKHLv0pzH+b8IkBSv5/gTKmyoecxQau/J2l/NowryOfkciiCavrM7DAfH5NmX7GX2+V51YN/nqXoc0OPx3O6ZZhKUTBkdINW+jMf4RnuDLtkOwR23LQeezA5lH9cYitqth5kep8Z2gPCjFRS/p0jiHaHRVug=",
+      "nonce_b64": "7NUZOeX+Ctav0E7WNg0lmkDy4taJu6EY"
+    },
+    "id": "3a534f62-a761-4b72-85de-a5203022462a",
+    "reward": -1.0,
+    "role": "aria",
+    "session_id": "26c8f860-60ac-49c3-9142-6d1c759beb8a",
+    "timestamp": 1781333761
   }
 ]

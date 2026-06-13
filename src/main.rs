@@ -4,6 +4,7 @@ mod tokenizer;
 mod storage;
 mod db;
 mod lstm_cuda;
+mod math_train;
 
 use std::io::{self, Write};
 use std::fs;
@@ -306,6 +307,9 @@ fn train_fresh(tokenizer: &mut Tokenizer, data_dir: &str, embed_dim: usize, hidd
 
     println!("Pre-training...");
     model_cuda::pretrain_from_files(&mut model, tokenizer, data_dir).ok();
+
+    println!("Math curriculum...");
+    math_train::train_math_curriculum(&mut model, tokenizer, "Math_Learn", 0.0003).ok();
 
     println!("Training complete.\n");
     Ok(model)
