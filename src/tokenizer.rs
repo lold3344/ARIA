@@ -367,7 +367,7 @@ fn train_bpe_cpu(word_freq: &HashMap<String, usize>, num_merges: usize) -> Vec<(
         .filter(|(_, &f)| f > 0)
         .map(|(w, &f)| (w.chars()
             .filter(|c| is_cyrillic(*c) || c.is_ascii_digit())
-            .map(|c| c.to_string()).collect(), f))
+            .map(|c| c.to_string()).collect::<Vec<_>>(), f))
         .filter(|(v, _)| !v.is_empty())
         .collect();
 

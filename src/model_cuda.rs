@@ -40,16 +40,128 @@ pub struct LSTMState {
 // ─────────────────────────────────────────────────────────────
 //  Model
 // ─────────────────────────────────────────────────────────────
+//  Pre-cached CUDA functions (loaded once at model init)
+// ─────────────────────────────────────────────────────────────
+struct CudaFns {
+    emb_fwd:  cudarc::driver::CudaFunction,
+    emb_bwd:  cudarc::driver::CudaFunction,
+    bias:     cudarc::driver::CudaFunction,
+    lstm_fwd: cudarc::driver::CudaFunction,
+    lstm_bwd: cudarc::driver::CudaFunction,
+    red_sum:  cudarc::driver::CudaFunction,
+    asm_lin:  cudarc::driver::CudaFunction,
+    asm_sm:   cudarc::driver::CudaFunction,
+    asm_ce:   cudarc::driver::CudaFunction,
+    asm_wg:   cudarc::driver::CudaFunction,
+    asm_bg:   cudarc::driver::CudaFunction,
+    asm_ig:   cudarc::driver::CudaFunction,
+    norm_red: cudarc::driver::CudaFunction,
+    adam:     cudarc::driver::CudaFunction,
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Per-batch reusable GPU buffers (allocated once, reused)
+// ─────────────────────────────────────────────────────────────
+struct BatchBufs {
+    batch:  usize,
+    steps:  usize,
+    // forward buffers
+    xs:          Vec<CudaSlice<f32>>,
+    gates:       Vec<CudaSlice<f32>>,
+    h:           Vec<CudaSlice<f32>>,
+    c:           Vec<CudaSlice<f32>>,
+    // ASM per-step buffers
+    head_logits: Vec<CudaSlice<f32>>,
+    proj1:       Vec<CudaSlice<f32>>,
+    tail1_log:   Vec<CudaSlice<f32>>,
+    proj2:       Vec<CudaSlice<f32>>,
+    tail2_log:   Vec<CudaSlice<f32>>,
+    d_proj1:     Vec<CudaSlice<f32>>,
+    d_proj2:     Vec<CudaSlice<f32>>,
+    d_h:         Vec<CudaSlice<f32>>,
+    // backward buffers
+    d_embed:     CudaSlice<f32>,
+    d_w_x:       CudaSlice<f32>,
+    d_w_h:       CudaSlice<f32>,
+    d_b:         CudaSlice<f32>,
+    d_gates:     CudaSlice<f32>,
+    d_c_next:    CudaSlice<f32>,
+    d_c_prev:    CudaSlice<f32>,
+    d_x:         CudaSlice<f32>,
+    // ASM grad accumulators
+    dg_w_head:   CudaSlice<f32>,
+    dg_b_head:   CudaSlice<f32>,
+    dg_w_proj1:  CudaSlice<f32>,
+    dg_w_tail1:  CudaSlice<f32>,
+    dg_b_tail1:  CudaSlice<f32>,
+    dg_w_proj2:  CudaSlice<f32>,
+    dg_w_tail2:  CudaSlice<f32>,
+    dg_b_tail2:  CudaSlice<f32>,
+    // misc
+    gpu_loss:    CudaSlice<f32>,
+    partial:     CudaSlice<f32>,
+    zero_d1:     CudaSlice<f32>,
+    zero_d2:     CudaSlice<f32>,
+    // per-step token upload buffers
+    tok_bufs:    Vec<CudaSlice<i32>>,
+    head_tgt:    Vec<CudaSlice<i32>>,
+    tail1_tgt:   Vec<CudaSlice<i32>>,
+    tail2_tgt:   Vec<CudaSlice<i32>>,
+}
+
+impl BatchBufs {
+    fn alloc(stream: &Arc<CudaStream>, batch: usize, steps: usize,
+             E: usize, H: usize, fh: usize,
+             hs: usize, d1: usize, d2: usize, ts1: usize, ts2: usize,
+             vocab: usize, max_ngroups: usize) -> Self {
+        let az  = |n| stream.alloc_zeros::<f32>(n).unwrap();
+        let azi = |n| stream.alloc_zeros::<i32>(n).unwrap();
+        Self {
+            batch, steps,
+            xs:          (0..steps).map(|_| az(batch*E)).collect(),
+            gates:       (0..steps).map(|_| az(batch*fh)).collect(),
+            h:           (0..=steps).map(|_| az(batch*H)).collect(),
+            c:           (0..=steps).map(|_| az(batch*H)).collect(),
+            head_logits: (0..steps).map(|_| az(batch*hs)).collect(),
+            proj1:       (0..steps).map(|_| az(batch*d1)).collect(),
+            tail1_log:   (0..steps).map(|_| az(batch*ts1)).collect(),
+            proj2:       (0..steps).map(|_| az(batch*d2)).collect(),
+            tail2_log:   (0..steps).map(|_| az(batch*ts2)).collect(),
+            d_proj1:     (0..steps).map(|_| az(batch*d1)).collect(),
+            d_proj2:     (0..steps).map(|_| az(batch*d2)).collect(),
+            d_h:         (0..steps).map(|_| az(batch*H)).collect(),
+            d_embed: az(vocab*E), d_w_x: az(E*fh), d_w_h: az(H*fh), d_b: az(fh),
+            d_gates: az(batch*fh), d_c_next: az(batch*H), d_c_prev: az(batch*H), d_x: az(batch*E),
+            dg_w_head: az(hs*H), dg_b_head: az(hs),
+            dg_w_proj1: az(d1*H), dg_w_tail1: az(ts1*d1), dg_b_tail1: az(ts1),
+            dg_w_proj2: az(d2*H), dg_w_tail2: az(ts2*d2), dg_b_tail2: az(ts2),
+            gpu_loss: az(1), partial: az(max_ngroups),
+            zero_d1: az(d1), zero_d2: az(d2),
+            tok_bufs:  (0..steps).map(|_| azi(batch)).collect(),
+            head_tgt:  (0..steps).map(|_| azi(batch)).collect(),
+            tail1_tgt: (0..steps).map(|_| azi(batch)).collect(),
+            tail2_tgt: (0..steps).map(|_| azi(batch)).collect(),
+        }
+    }
+
+    fn fits(&self, batch: usize, steps: usize) -> bool {
+        self.batch >= batch && self.steps >= steps
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
 pub struct LSTMModelCuda {
     stream: Arc<CudaStream>,
     module: Arc<CudaModule>,
     blas:   CudaBlas,
+    fns:    CudaFns,
+    bufs:   Option<BatchBufs>,  // lazily allocated, reused across batches
 
     // LSTM weights (VRAM)
     pub embed: CudaSlice<f32>,
-    pub w_x:   CudaSlice<f32>,   // [E, 4H]  row-major
-    pub w_h:   CudaSlice<f32>,   // [H, 4H]
-    pub b:     CudaSlice<f32>,   // [4H]
+    pub w_x:   CudaSlice<f32>,
+    pub w_h:   CudaSlice<f32>,
+    pub b:     CudaSlice<f32>,
 
     // Adam moments
     m_embed: CudaSlice<f32>, v_embed: CudaSlice<f32>,
@@ -57,10 +169,8 @@ pub struct LSTMModelCuda {
     m_w_h:   CudaSlice<f32>, v_w_h:   CudaSlice<f32>,
     m_b:     CudaSlice<f32>, v_b:     CudaSlice<f32>,
 
-    // AdaptiveSoftmax (CPU weights, GPU buffers managed per-batch)
     pub adaptive_sm: AdaptiveSoftmax,
 
-    // ASM GPU weights + Adam moments
     g_w_head:  CudaSlice<f32>, g_b_head:  CudaSlice<f32>,
     g_w_proj1: CudaSlice<f32>,
     g_w_tail1: CudaSlice<f32>, g_b_tail1: CudaSlice<f32>,
@@ -221,6 +331,24 @@ impl LSTMModelCuda {
                  asm_head_size, asm_tail1_size, asm_tail2_size);
         println!("================================\n");
 
+        // Load all CUDA functions once — never again in hot path
+        let fns = CudaFns {
+            emb_fwd:  module.load_function("embedding_fwd").unwrap(),
+            emb_bwd:  module.load_function("embedding_bwd").unwrap(),
+            bias:     module.load_function("add_bias").unwrap(),
+            lstm_fwd: module.load_function("fused_lstm_fwd").unwrap(),
+            lstm_bwd: module.load_function("fused_lstm_bwd").unwrap(),
+            red_sum:  module.load_function("reduce_sum_batch").unwrap(),
+            asm_lin:  module.load_function("asm_linear").unwrap(),
+            asm_sm:   module.load_function("asm_softmax").unwrap(),
+            asm_ce:   module.load_function("asm_ce_grad").unwrap(),
+            asm_wg:   module.load_function("asm_wgrad").unwrap(),
+            asm_bg:   module.load_function("asm_bgrad").unwrap(),
+            asm_ig:   module.load_function("asm_igrad").unwrap(),
+            norm_red: module.load_function("norm_reduce").unwrap(),
+            adam:     module.load_function("adam_update").unwrap(),
+        };
+
         LSTMModelCuda {
             embed: upload(&stream, &embed_data),
             w_x:   upload(&stream, &w_x_data),
@@ -261,7 +389,7 @@ impl LSTMModelCuda {
             gm_b_tail2: zeros_gpu(&stream, asm_tail2_size),
             gv_b_tail2: zeros_gpu(&stream, asm_tail2_size),
 
-            stream, module, blas,
+            stream, module, blas, fns, bufs: None,
             adaptive_sm,
             vocab_size, embed_dim, hidden_dim,
             adam_step: 0, asm_adam_step: 0,
@@ -294,41 +422,20 @@ impl LSTMModelCuda {
         let mut h_out = stream.alloc_zeros::<f32>(H).unwrap();
         let mut c_out = stream.alloc_zeros::<f32>(H).unwrap();
 
-        let f_emb_fwd = self.module.load_function("embedding_fwd").unwrap();
-        let e_i = E as i32;
+        let e_i = E as i32; let fh_i = fh as i32; let h_i = H as i32; let one_i = 1i32;
         unsafe {
-            stream.launch_builder(&f_emb_fwd)
-                .arg(&self.embed)
-                .arg(&ids)
-                .arg(&mut x)
-                .arg(&e_i)
+            stream.launch_builder(&self.fns.emb_fwd)
+                .arg(&self.embed).arg(&ids).arg(&mut x).arg(&e_i)
                 .launch(cfg2d(1, E)).unwrap();
         }
-
         sgemm(&self.blas, false, false, 1, fh, E, 1.0, 0.0, &x, &self.w_x, &mut gates);
         sgemm(&self.blas, false, false, 1, fh, H, 1.0, 1.0, &h_gpu, &self.w_h, &mut gates);
-
-        let f_bias = self.module.load_function("add_bias").unwrap();
-        let one_i = 1i32;
-        let fh_i  = fh as i32;
         unsafe {
-            stream.launch_builder(&f_bias)
-                .arg(&mut gates)
-                .arg(&self.b)
-                .arg(&one_i)
-                .arg(&fh_i)
+            stream.launch_builder(&self.fns.bias)
+                .arg(&mut gates).arg(&self.b).arg(&one_i).arg(&fh_i)
                 .launch(cfg1d(fh)).unwrap();
-        }
-
-        let f_lstm = self.module.load_function("fused_lstm_fwd").unwrap();
-        let h_i = H as i32;
-        unsafe {
-            stream.launch_builder(&f_lstm)
-                .arg(&gates)
-                .arg(&c_gpu)
-                .arg(&mut h_out)
-                .arg(&mut c_out)
-                .arg(&h_i)
+            stream.launch_builder(&self.fns.lstm_fwd)
+                .arg(&gates).arg(&c_gpu).arg(&mut h_out).arg(&mut c_out).arg(&h_i)
                 .launch(cfg2d(1, H)).unwrap();
         }
 
@@ -393,105 +500,58 @@ impl LSTMModelCuda {
         }
 
         let stream = Arc::clone(&self.stream);
-
-        // ── Gradient accumulators ──
-        let mut d_embed = stream.alloc_zeros::<f32>(self.vocab_size * E).unwrap();
-        let mut d_w_x   = stream.alloc_zeros::<f32>(E  * fh).unwrap();
-        let mut d_w_h   = stream.alloc_zeros::<f32>(H  * fh).unwrap();
-        let mut d_b     = stream.alloc_zeros::<f32>(fh).unwrap();
-
-        // ── Pre-allocate ALL step buffers ──
-        let mut xs_list:    Vec<CudaSlice<f32>> = (0..steps).map(|_| stream.alloc_zeros::<f32>(batch * E).unwrap()).collect();
-        let mut gates_list: Vec<CudaSlice<f32>> = (0..steps).map(|_| stream.alloc_zeros::<f32>(batch * fh).unwrap()).collect();
-        let mut h_list:     Vec<CudaSlice<f32>> = (0..=steps).map(|_| stream.alloc_zeros::<f32>(batch * H).unwrap()).collect();
-        let mut c_list:     Vec<CudaSlice<f32>> = (0..=steps).map(|_| stream.alloc_zeros::<f32>(batch * H).unwrap()).collect();
-
-        // GPU total loss (single float, no CPU sync per step)
-        let mut gpu_total_loss: CudaSlice<f32> = stream.alloc_zeros::<f32>(1).unwrap();
-
-        let f_emb_fwd  = self.module.load_function("embedding_fwd").unwrap();
-        let f_bias     = self.module.load_function("add_bias").unwrap();
-        let f_lstm_fwd = self.module.load_function("fused_lstm_fwd").unwrap();
-
-        // ── FORWARD ──────────────────────────────────────────
-        for t in 0..steps {
-            let tok_step = &tok_all_cpu[t * batch .. (t + 1) * batch];
-            let tok_buf  = stream.clone_htod(tok_step).unwrap();
-
-            let batch_i = batch as i32;
-            let e_i     = E as i32;
-            let fh_i    = fh as i32;
-            let h_i     = H as i32;
-            unsafe {
-                stream.launch_builder(&f_emb_fwd)
-                    .arg(&self.embed)
-                    .arg(&tok_buf)
-                    .arg(&mut xs_list[t])
-                    .arg(&e_i)
-                    .launch(cfg2d(batch, E)).unwrap();
-            }
-
-            sgemm(&self.blas, false, false, batch, fh, E, 1.0, 0.0,
-                  &xs_list[t], &self.w_x, &mut gates_list[t]);
-            sgemm(&self.blas, false, false, batch, fh, H, 1.0, 1.0,
-                  &h_list[t], &self.w_h, &mut gates_list[t]);
-
-            unsafe {
-                stream.launch_builder(&f_bias)
-                    .arg(&mut gates_list[t])
-                    .arg(&self.b)
-                    .arg(&batch_i)
-                    .arg(&fh_i)
-                    .launch(cfg1d(batch * fh)).unwrap();
-                let (c_prev, c_next) = c_list.split_at_mut(t + 1);
-                stream.launch_builder(&f_lstm_fwd)
-                    .arg(&gates_list[t])
-                    .arg(&c_prev[t])
-                    .arg(&mut h_list[t+1])
-                    .arg(&mut c_next[0])
-                    .arg(&h_i)
-                    .launch(cfg2d(batch, H)).unwrap();
-            }
-        }
-
-        // ── ASM forward + backward (loss + d_h per step) ─────
         let hs  = self.asm_head_size + 2;
         let d1  = self.asm_dim1;
         let d2  = self.asm_dim2;
         let ts1 = self.asm_tail1_size;
         let ts2 = self.asm_tail2_size;
+        let wg  = 256usize;
+        let max_n      = [self.vocab_size * E, E * fh, H * fh, fh].iter().copied().max().unwrap();
+        let max_ngroups = (max_n + wg - 1) / wg;
 
-        let zero_d1 = stream.alloc_zeros::<f32>(d1).unwrap();
-        let zero_d2 = stream.alloc_zeros::<f32>(d2).unwrap();
+        // ── Allocate / reuse persistent GPU buffers ───────────
+        if self.bufs.as_ref().map_or(true, |b| !b.fits(batch, steps)) {
+            self.bufs = Some(BatchBufs::alloc(
+                &stream, batch, steps, E, H, fh, hs, d1, d2, ts1, ts2,
+                self.vocab_size, max_ngroups,
+            ));
+        }
+        let bk = self.bufs.as_mut().unwrap();
 
-        let mut dg_w_head  = stream.alloc_zeros::<f32>(hs  * H).unwrap();
-        let mut dg_b_head  = stream.alloc_zeros::<f32>(hs).unwrap();
-        let mut dg_w_proj1 = stream.alloc_zeros::<f32>(d1  * H).unwrap();
-        let mut dg_w_tail1 = stream.alloc_zeros::<f32>(ts1 * d1).unwrap();
-        let mut dg_b_tail1 = stream.alloc_zeros::<f32>(ts1).unwrap();
-        let mut dg_w_proj2 = stream.alloc_zeros::<f32>(d2  * H).unwrap();
-        let mut dg_w_tail2 = stream.alloc_zeros::<f32>(ts2 * d2).unwrap();
-        let mut dg_b_tail2 = stream.alloc_zeros::<f32>(ts2).unwrap();
+        // Zero accumulators (memset, no realloc)
+        stream.memset_zeros(&mut bk.d_embed).unwrap();
+        stream.memset_zeros(&mut bk.d_w_x).unwrap();
+        stream.memset_zeros(&mut bk.d_w_h).unwrap();
+        stream.memset_zeros(&mut bk.d_b).unwrap();
+        stream.memset_zeros(&mut bk.dg_w_head).unwrap();
+        stream.memset_zeros(&mut bk.dg_b_head).unwrap();
+        stream.memset_zeros(&mut bk.dg_w_proj1).unwrap();
+        stream.memset_zeros(&mut bk.dg_w_tail1).unwrap();
+        stream.memset_zeros(&mut bk.dg_b_tail1).unwrap();
+        stream.memset_zeros(&mut bk.dg_w_proj2).unwrap();
+        stream.memset_zeros(&mut bk.dg_w_tail2).unwrap();
+        stream.memset_zeros(&mut bk.dg_b_tail2).unwrap();
+        stream.memset_zeros(&mut bk.gpu_loss).unwrap();
+        // Zero h[0] and c[0]
+        stream.memset_zeros(&mut bk.h[0]).unwrap();
+        stream.memset_zeros(&mut bk.c[0]).unwrap();
+        // Zero d_h steps
+        for t in 0..steps { stream.memset_zeros(&mut bk.d_h[t]).unwrap(); }
 
-        let mut d_h_steps: Vec<CudaSlice<f32>> = (0..steps).map(|_| stream.alloc_zeros::<f32>(batch * H).unwrap()).collect();
+        // Upload token buffers (small, batch-sized)
+        for t in 0..steps {
+            let tok_step = &tok_all_cpu[t * batch .. (t+1) * batch];
+            stream.memcpy_htod(tok_step, &mut bk.tok_bufs[t]).unwrap();
+        }
 
-        let f_asm_lin = self.module.load_function("asm_linear").unwrap();
-        let f_asm_sm  = self.module.load_function("asm_softmax").unwrap();
-        let f_asm_ce  = self.module.load_function("asm_ce_grad").unwrap();
-        let f_asm_wg  = self.module.load_function("asm_wgrad").unwrap();
-        let f_asm_bg  = self.module.load_function("asm_bgrad").unwrap();
-        let f_asm_ig  = self.module.load_function("asm_igrad").unwrap();
-
-        let mut tgt_cpu       = vec![0i32; batch];
+        // Upload per-step target buffers
         let mut head_tgt_cpu  = vec![0i32; batch];
         let mut tail1_tgt_cpu = vec![0i32; batch];
         let mut tail2_tgt_cpu = vec![0i32; batch];
-
         for t in 0..steps {
             for b in 0..batch {
                 let tk = if mask_flat[b * max_len + t] < 0.5 { -1i32 }
                          else { target_flat[b * max_len + t] };
-                tgt_cpu[b] = tk;
                 head_tgt_cpu[b] = if tk < 0 { -1 }
                     else if (tk as usize) < self.asm_head_size { tk }
                     else if (tk as usize) < self.asm_head_size + ts1 { self.asm_head_size as i32 }
@@ -502,276 +562,225 @@ impl LSTMModelCuda {
                 tail2_tgt_cpu[b] = if tk < 0 || (tk as usize) < self.asm_head_size + ts1 { -1 }
                     else { tk - (self.asm_head_size + ts1) as i32 };
             }
+            stream.memcpy_htod(&head_tgt_cpu,  &mut bk.head_tgt[t]).unwrap();
+            stream.memcpy_htod(&tail1_tgt_cpu, &mut bk.tail1_tgt[t]).unwrap();
+            stream.memcpy_htod(&tail2_tgt_cpu, &mut bk.tail2_tgt[t]).unwrap();
+        }
 
-            let head_tgt_gpu  = stream.clone_htod(&head_tgt_cpu).unwrap();
-            let tail1_tgt_gpu = stream.clone_htod(&tail1_tgt_cpu).unwrap();
-            let tail2_tgt_gpu = stream.clone_htod(&tail2_tgt_cpu).unwrap();
+        let batch_i = batch as i32;
+        let e_i     = E   as i32;
+        let fh_i    = fh  as i32;
+        let h_i     = H   as i32;
+        let hs_i    = hs  as i32;
+        let d1_i    = d1  as i32;
+        let d2_i    = d2  as i32;
+        let ts1_i   = ts1 as i32;
+        let ts2_i   = ts2 as i32;
+        let zero_i  = 0i32;
+        let asm_head_i  = self.asm_head_size as i32;
+        let asm_htail_i = (self.asm_head_size + ts1) as i32;
 
-            let h_gpu = &h_list[t + 1];
-
-            let mut head_logits  = stream.alloc_zeros::<f32>(batch * hs).unwrap();
-            let mut proj1        = stream.alloc_zeros::<f32>(batch * d1).unwrap();
-            let mut tail1_logits = stream.alloc_zeros::<f32>(batch * ts1).unwrap();
-            let mut proj2        = stream.alloc_zeros::<f32>(batch * d2).unwrap();
-            let mut tail2_logits = stream.alloc_zeros::<f32>(batch * ts2).unwrap();
-            let mut d_proj1_buf  = stream.alloc_zeros::<f32>(batch * d1).unwrap();
-            let mut d_proj2_buf  = stream.alloc_zeros::<f32>(batch * d2).unwrap();
-
-            let batch_i = batch as i32;
-            let h_i  = H   as i32;
-            let hs_i = hs  as i32;
-            let d1_i = d1  as i32;
-            let d2_i = d2  as i32;
-            let ts1_i = ts1 as i32;
-            let ts2_i = ts2 as i32;
-            let asm_head_i  = self.asm_head_size as i32;
-            let asm_htail_i = (self.asm_head_size + ts1) as i32;
-            let zero_i = 0i32;
-
+        // ── FORWARD ──────────────────────────────────────────
+        for t in 0..steps {
+            stream.memset_zeros(&mut bk.gates[t]).unwrap();
             unsafe {
-                // head
-                stream.launch_builder(&f_asm_lin)
-                    .arg(h_gpu).arg(&self.g_w_head).arg(&self.g_b_head)
-                    .arg(&mut head_logits).arg(&h_i).arg(&hs_i).arg(&batch_i)
-                    .launch(cfg2d(batch, hs)).unwrap();
-                stream.launch_builder(&f_asm_sm)
-                    .arg(&mut head_logits).arg(&hs_i).arg(&batch_i)
-                    .launch(cfg1d(batch)).unwrap();
-
-                // proj1 -> tail1
-                stream.launch_builder(&f_asm_lin)
-                    .arg(h_gpu).arg(&self.g_w_proj1).arg(&zero_d1)
-                    .arg(&mut proj1).arg(&h_i).arg(&d1_i).arg(&batch_i)
-                    .launch(cfg2d(batch, d1)).unwrap();
-                stream.launch_builder(&f_asm_lin)
-                    .arg(&proj1).arg(&self.g_w_tail1).arg(&self.g_b_tail1)
-                    .arg(&mut tail1_logits).arg(&d1_i).arg(&ts1_i).arg(&batch_i)
-                    .launch(cfg2d(batch, ts1)).unwrap();
-                stream.launch_builder(&f_asm_sm)
-                    .arg(&mut tail1_logits).arg(&ts1_i).arg(&batch_i)
-                    .launch(cfg1d(batch)).unwrap();
-
-                // proj2 -> tail2
-                stream.launch_builder(&f_asm_lin)
-                    .arg(h_gpu).arg(&self.g_w_proj2).arg(&zero_d2)
-                    .arg(&mut proj2).arg(&h_i).arg(&d2_i).arg(&batch_i)
-                    .launch(cfg2d(batch, d2)).unwrap();
-                stream.launch_builder(&f_asm_lin)
-                    .arg(&proj2).arg(&self.g_w_tail2).arg(&self.g_b_tail2)
-                    .arg(&mut tail2_logits).arg(&d2_i).arg(&ts2_i).arg(&batch_i)
-                    .launch(cfg2d(batch, ts2)).unwrap();
-                stream.launch_builder(&f_asm_sm)
-                    .arg(&mut tail2_logits).arg(&ts2_i).arg(&batch_i)
-                    .launch(cfg1d(batch)).unwrap();
-
-                // CE grad + loss accumulation
-                stream.launch_builder(&f_asm_ce)
-                    .arg(&mut head_logits).arg(&head_tgt_gpu).arg(&mut gpu_total_loss)
-                    .arg(&hs_i).arg(&zero_i).arg(&batch_i)
-                    .launch(cfg1d(batch)).unwrap();
-                stream.launch_builder(&f_asm_ce)
-                    .arg(&mut tail1_logits).arg(&tail1_tgt_gpu).arg(&mut gpu_total_loss)
-                    .arg(&ts1_i).arg(&asm_head_i).arg(&batch_i)
-                    .launch(cfg1d(batch)).unwrap();
-                stream.launch_builder(&f_asm_ce)
-                    .arg(&mut tail2_logits).arg(&tail2_tgt_gpu).arg(&mut gpu_total_loss)
-                    .arg(&ts2_i).arg(&asm_htail_i).arg(&batch_i)
-                    .launch(cfg1d(batch)).unwrap();
-
-                // Weight grads — head
-                stream.launch_builder(&f_asm_wg)
-                    .arg(&head_logits).arg(h_gpu).arg(&mut dg_w_head)
-                    .arg(&batch_i).arg(&h_i).arg(&hs_i)
-                    .launch(LaunchConfig { grid_dim: (hs as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }).unwrap();
-                stream.launch_builder(&f_asm_bg)
-                    .arg(&head_logits).arg(&mut dg_b_head).arg(&batch_i).arg(&hs_i)
-                    .launch(cfg1d(hs)).unwrap();
-
-                // tail1
-                stream.launch_builder(&f_asm_wg)
-                    .arg(&tail1_logits).arg(&proj1).arg(&mut dg_w_tail1)
-                    .arg(&batch_i).arg(&d1_i).arg(&ts1_i)
-                    .launch(LaunchConfig { grid_dim: (ts1 as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }).unwrap();
-                stream.launch_builder(&f_asm_bg)
-                    .arg(&tail1_logits).arg(&mut dg_b_tail1).arg(&batch_i).arg(&ts1_i)
-                    .launch(cfg1d(ts1)).unwrap();
-
-                // tail2
-                stream.launch_builder(&f_asm_wg)
-                    .arg(&tail2_logits).arg(&proj2).arg(&mut dg_w_tail2)
-                    .arg(&batch_i).arg(&d2_i).arg(&ts2_i)
-                    .launch(LaunchConfig { grid_dim: (ts2 as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }).unwrap();
-                stream.launch_builder(&f_asm_bg)
-                    .arg(&tail2_logits).arg(&mut dg_b_tail2).arg(&batch_i).arg(&ts2_i)
-                    .launch(cfg1d(ts2)).unwrap();
-
-                // d_proj1
-                stream.launch_builder(&f_asm_ig)
-                    .arg(&tail1_logits).arg(&self.g_w_tail1).arg(&mut d_proj1_buf)
-                    .arg(&batch_i).arg(&d1_i).arg(&ts1_i)
-                    .launch(cfg2d(batch, d1)).unwrap();
-                stream.launch_builder(&f_asm_wg)
-                    .arg(&d_proj1_buf).arg(h_gpu).arg(&mut dg_w_proj1)
-                    .arg(&batch_i).arg(&h_i).arg(&d1_i)
-                    .launch(LaunchConfig { grid_dim: (d1 as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }).unwrap();
-
-                // d_proj2
-                stream.launch_builder(&f_asm_ig)
-                    .arg(&tail2_logits).arg(&self.g_w_tail2).arg(&mut d_proj2_buf)
-                    .arg(&batch_i).arg(&d2_i).arg(&ts2_i)
-                    .launch(cfg2d(batch, d2)).unwrap();
-                stream.launch_builder(&f_asm_wg)
-                    .arg(&d_proj2_buf).arg(h_gpu).arg(&mut dg_w_proj2)
-                    .arg(&batch_i).arg(&h_i).arg(&d2_i)
-                    .launch(LaunchConfig { grid_dim: (d2 as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }).unwrap();
-
-                // d_h[t]
-                let d_h = &mut d_h_steps[t];
-                stream.launch_builder(&f_asm_ig)
-                    .arg(&head_logits).arg(&self.g_w_head).arg(&mut *d_h)
-                    .arg(&batch_i).arg(&h_i).arg(&hs_i)
-                    .launch(cfg2d(batch, H)).unwrap();
-                stream.launch_builder(&f_asm_ig)
-                    .arg(&d_proj1_buf).arg(&self.g_w_proj1).arg(&mut *d_h)
-                    .arg(&batch_i).arg(&h_i).arg(&d1_i)
-                    .launch(cfg2d(batch, H)).unwrap();
-                stream.launch_builder(&f_asm_ig)
-                    .arg(&d_proj2_buf).arg(&self.g_w_proj2).arg(&mut *d_h)
-                    .arg(&batch_i).arg(&h_i).arg(&d2_i)
+                stream.launch_builder(&self.fns.emb_fwd)
+                    .arg(&self.embed).arg(&bk.tok_bufs[t])
+                    .arg(&mut bk.xs[t]).arg(&e_i)
+                    .launch(cfg2d(batch, E)).unwrap();
+            }
+            sgemm(&self.blas, false, false, batch, fh, E, 1.0, 0.0, &bk.xs[t],  &self.w_x, &mut bk.gates[t]);
+            sgemm(&self.blas, false, false, batch, fh, H, 1.0, 1.0, &bk.h[t],   &self.w_h, &mut bk.gates[t]);
+            unsafe {
+                stream.launch_builder(&self.fns.bias)
+                    .arg(&mut bk.gates[t]).arg(&self.b).arg(&batch_i).arg(&fh_i)
+                    .launch(cfg1d(batch * fh)).unwrap();
+                let (c_prev, c_next) = bk.c.split_at_mut(t + 1);
+                stream.launch_builder(&self.fns.lstm_fwd)
+                    .arg(&bk.gates[t]).arg(&c_prev[t])
+                    .arg(&mut bk.h[t+1]).arg(&mut c_next[0]).arg(&h_i)
                     .launch(cfg2d(batch, H)).unwrap();
             }
         }
 
-        // ── BACKWARD THROUGH LSTM ─────────────────────────────
-        let f_lstm_bwd = self.module.load_function("fused_lstm_bwd").unwrap();
-        let f_red      = self.module.load_function("reduce_sum_batch").unwrap();
-
-        let mut d_c_next     = stream.alloc_zeros::<f32>(batch * H).unwrap();
-        let mut d_gates_bwd  = stream.alloc_zeros::<f32>(batch * fh).unwrap();
-        let mut d_c_prev_bwd = stream.alloc_zeros::<f32>(batch * H).unwrap();
-        let mut d_x_buf      = stream.alloc_zeros::<f32>(batch * E).unwrap();
-
-        let f_emb_bwd = self.module.load_function("embedding_bwd").unwrap();
-
-        for t in (0..steps).rev() {
-            stream.memset_zeros(&mut d_gates_bwd).unwrap();
-            stream.memset_zeros(&mut d_c_prev_bwd).unwrap();
-
-            let batch_i = batch as i32;
-            let h_i     = H  as i32;
-            let fh_i    = fh as i32;
-            let e_i     = E  as i32;
+        // ── ASM fwd + bwd ─────────────────────────────────────
+        for t in 0..steps {
+            stream.memset_zeros(&mut bk.head_logits[t]).unwrap();
+            stream.memset_zeros(&mut bk.proj1[t]).unwrap();
+            stream.memset_zeros(&mut bk.tail1_log[t]).unwrap();
+            stream.memset_zeros(&mut bk.proj2[t]).unwrap();
+            stream.memset_zeros(&mut bk.tail2_log[t]).unwrap();
+            stream.memset_zeros(&mut bk.d_proj1[t]).unwrap();
+            stream.memset_zeros(&mut bk.d_proj2[t]).unwrap();
             unsafe {
-                stream.launch_builder(&f_lstm_bwd)
-                    .arg(&gates_list[t])
-                    .arg(&c_list[t])
-                    .arg(&c_list[t+1])
-                    .arg(&d_h_steps[t])
-                    .arg(&d_c_next)
-                    .arg(&mut d_gates_bwd)
-                    .arg(&mut d_c_prev_bwd)
-                    .arg(&h_i)
+                stream.launch_builder(&self.fns.asm_lin)
+                    .arg(&bk.h[t+1]).arg(&self.g_w_head).arg(&self.g_b_head)
+                    .arg(&mut bk.head_logits[t]).arg(&h_i).arg(&hs_i).arg(&batch_i)
+                    .launch(cfg2d(batch, hs)).unwrap();
+                stream.launch_builder(&self.fns.asm_sm)
+                    .arg(&mut bk.head_logits[t]).arg(&hs_i).arg(&batch_i)
+                    .launch(cfg1d(batch)).unwrap();
+
+                stream.launch_builder(&self.fns.asm_lin)
+                    .arg(&bk.h[t+1]).arg(&self.g_w_proj1).arg(&bk.zero_d1)
+                    .arg(&mut bk.proj1[t]).arg(&h_i).arg(&d1_i).arg(&batch_i)
+                    .launch(cfg2d(batch, d1)).unwrap();
+                stream.launch_builder(&self.fns.asm_lin)
+                    .arg(&bk.proj1[t]).arg(&self.g_w_tail1).arg(&self.g_b_tail1)
+                    .arg(&mut bk.tail1_log[t]).arg(&d1_i).arg(&ts1_i).arg(&batch_i)
+                    .launch(cfg2d(batch, ts1)).unwrap();
+                stream.launch_builder(&self.fns.asm_sm)
+                    .arg(&mut bk.tail1_log[t]).arg(&ts1_i).arg(&batch_i)
+                    .launch(cfg1d(batch)).unwrap();
+
+                stream.launch_builder(&self.fns.asm_lin)
+                    .arg(&bk.h[t+1]).arg(&self.g_w_proj2).arg(&bk.zero_d2)
+                    .arg(&mut bk.proj2[t]).arg(&h_i).arg(&d2_i).arg(&batch_i)
+                    .launch(cfg2d(batch, d2)).unwrap();
+                stream.launch_builder(&self.fns.asm_lin)
+                    .arg(&bk.proj2[t]).arg(&self.g_w_tail2).arg(&self.g_b_tail2)
+                    .arg(&mut bk.tail2_log[t]).arg(&d2_i).arg(&ts2_i).arg(&batch_i)
+                    .launch(cfg2d(batch, ts2)).unwrap();
+                stream.launch_builder(&self.fns.asm_sm)
+                    .arg(&mut bk.tail2_log[t]).arg(&ts2_i).arg(&batch_i)
+                    .launch(cfg1d(batch)).unwrap();
+
+                stream.launch_builder(&self.fns.asm_ce)
+                    .arg(&mut bk.head_logits[t]).arg(&bk.head_tgt[t]).arg(&mut bk.gpu_loss)
+                    .arg(&hs_i).arg(&zero_i).arg(&batch_i).launch(cfg1d(batch)).unwrap();
+                stream.launch_builder(&self.fns.asm_ce)
+                    .arg(&mut bk.tail1_log[t]).arg(&bk.tail1_tgt[t]).arg(&mut bk.gpu_loss)
+                    .arg(&ts1_i).arg(&asm_head_i).arg(&batch_i).launch(cfg1d(batch)).unwrap();
+                stream.launch_builder(&self.fns.asm_ce)
+                    .arg(&mut bk.tail2_log[t]).arg(&bk.tail2_tgt[t]).arg(&mut bk.gpu_loss)
+                    .arg(&ts2_i).arg(&asm_htail_i).arg(&batch_i).launch(cfg1d(batch)).unwrap();
+
+                stream.launch_builder(&self.fns.asm_wg)
+                    .arg(&bk.head_logits[t]).arg(&bk.h[t+1]).arg(&mut bk.dg_w_head)
+                    .arg(&batch_i).arg(&h_i).arg(&hs_i)
+                    .launch(LaunchConfig { grid_dim: (hs as u32,1,1), block_dim: (256,1,1), shared_mem_bytes: 0 }).unwrap();
+                stream.launch_builder(&self.fns.asm_bg)
+                    .arg(&bk.head_logits[t]).arg(&mut bk.dg_b_head).arg(&batch_i).arg(&hs_i)
+                    .launch(cfg1d(hs)).unwrap();
+
+                stream.launch_builder(&self.fns.asm_wg)
+                    .arg(&bk.tail1_log[t]).arg(&bk.proj1[t]).arg(&mut bk.dg_w_tail1)
+                    .arg(&batch_i).arg(&d1_i).arg(&ts1_i)
+                    .launch(LaunchConfig { grid_dim: (ts1 as u32,1,1), block_dim: (256,1,1), shared_mem_bytes: 0 }).unwrap();
+                stream.launch_builder(&self.fns.asm_bg)
+                    .arg(&bk.tail1_log[t]).arg(&mut bk.dg_b_tail1).arg(&batch_i).arg(&ts1_i)
+                    .launch(cfg1d(ts1)).unwrap();
+
+                stream.launch_builder(&self.fns.asm_wg)
+                    .arg(&bk.tail2_log[t]).arg(&bk.proj2[t]).arg(&mut bk.dg_w_tail2)
+                    .arg(&batch_i).arg(&d2_i).arg(&ts2_i)
+                    .launch(LaunchConfig { grid_dim: (ts2 as u32,1,1), block_dim: (256,1,1), shared_mem_bytes: 0 }).unwrap();
+                stream.launch_builder(&self.fns.asm_bg)
+                    .arg(&bk.tail2_log[t]).arg(&mut bk.dg_b_tail2).arg(&batch_i).arg(&ts2_i)
+                    .launch(cfg1d(ts2)).unwrap();
+
+                stream.launch_builder(&self.fns.asm_ig)
+                    .arg(&bk.tail1_log[t]).arg(&self.g_w_tail1).arg(&mut bk.d_proj1[t])
+                    .arg(&batch_i).arg(&d1_i).arg(&ts1_i).launch(cfg2d(batch, d1)).unwrap();
+                stream.launch_builder(&self.fns.asm_wg)
+                    .arg(&bk.d_proj1[t]).arg(&bk.h[t+1]).arg(&mut bk.dg_w_proj1)
+                    .arg(&batch_i).arg(&h_i).arg(&d1_i)
+                    .launch(LaunchConfig { grid_dim: (d1 as u32,1,1), block_dim: (256,1,1), shared_mem_bytes: 0 }).unwrap();
+
+                stream.launch_builder(&self.fns.asm_ig)
+                    .arg(&bk.tail2_log[t]).arg(&self.g_w_tail2).arg(&mut bk.d_proj2[t])
+                    .arg(&batch_i).arg(&d2_i).arg(&ts2_i).launch(cfg2d(batch, d2)).unwrap();
+                stream.launch_builder(&self.fns.asm_wg)
+                    .arg(&bk.d_proj2[t]).arg(&bk.h[t+1]).arg(&mut bk.dg_w_proj2)
+                    .arg(&batch_i).arg(&h_i).arg(&d2_i)
+                    .launch(LaunchConfig { grid_dim: (d2 as u32,1,1), block_dim: (256,1,1), shared_mem_bytes: 0 }).unwrap();
+
+                let dh = &mut bk.d_h[t];
+                stream.launch_builder(&self.fns.asm_ig)
+                    .arg(&bk.head_logits[t]).arg(&self.g_w_head).arg(&mut *dh)
+                    .arg(&batch_i).arg(&h_i).arg(&hs_i).launch(cfg2d(batch, H)).unwrap();
+                stream.launch_builder(&self.fns.asm_ig)
+                    .arg(&bk.d_proj1[t]).arg(&self.g_w_proj1).arg(&mut *dh)
+                    .arg(&batch_i).arg(&h_i).arg(&d1_i).launch(cfg2d(batch, H)).unwrap();
+                stream.launch_builder(&self.fns.asm_ig)
+                    .arg(&bk.d_proj2[t]).arg(&self.g_w_proj2).arg(&mut *dh)
+                    .arg(&batch_i).arg(&h_i).arg(&d2_i).launch(cfg2d(batch, H)).unwrap();
+            }
+        }
+
+        // ── BACKWARD THROUGH LSTM ─────────────────────────────
+        stream.memset_zeros(&mut bk.d_c_next).unwrap();
+        for t in (0..steps).rev() {
+            stream.memset_zeros(&mut bk.d_gates).unwrap();
+            stream.memset_zeros(&mut bk.d_c_prev).unwrap();
+            unsafe {
+                let (c_prev_sl, c_next_sl) = bk.c.split_at(t + 1);
+                stream.launch_builder(&self.fns.lstm_bwd)
+                    .arg(&bk.gates[t]).arg(&c_prev_sl[t]).arg(&c_next_sl[0])
+                    .arg(&bk.d_h[t]).arg(&bk.d_c_next)
+                    .arg(&mut bk.d_gates).arg(&mut bk.d_c_prev).arg(&h_i)
                     .launch(cfg2d(batch, H)).unwrap();
             }
-            std::mem::swap(&mut d_c_next, &mut d_c_prev_bwd);
+            std::mem::swap(&mut bk.d_c_next, &mut bk.d_c_prev);
 
-            // d_w_h += h[t]^T @ d_gates   [H, fh]
-            sgemm(&self.blas, true, false, H, fh, batch, 1.0, 1.0,
-                  &h_list[t], &d_gates_bwd, &mut d_w_h);
-            // d_w_x += x[t]^T @ d_gates   [E, fh]
-            sgemm(&self.blas, true, false, E, fh, batch, 1.0, 1.0,
-                  &xs_list[t], &d_gates_bwd, &mut d_w_x);
-
+            sgemm(&self.blas, true, false, H, fh, batch, 1.0, 1.0, &bk.h[t],    &bk.d_gates, &mut bk.d_w_h);
+            sgemm(&self.blas, true, false, E, fh, batch, 1.0, 1.0, &bk.xs[t],   &bk.d_gates, &mut bk.d_w_x);
             unsafe {
-                stream.launch_builder(&f_red)
-                    .arg(&d_gates_bwd)
-                    .arg(&mut d_b)
-                    .arg(&batch_i)
-                    .arg(&fh_i)
+                stream.launch_builder(&self.fns.red_sum)
+                    .arg(&bk.d_gates).arg(&mut bk.d_b).arg(&batch_i).arg(&fh_i)
                     .launch(cfg1d(fh)).unwrap();
             }
-
-            // d_x = d_gates @ w_x^T   [batch, E]
-            stream.memset_zeros(&mut d_x_buf).unwrap();
-            sgemm(&self.blas, false, true, batch, E, fh, 1.0, 0.0,
-                  &d_gates_bwd, &self.w_x, &mut d_x_buf);
-
-            let tok_step = &tok_all_cpu[t * batch .. (t + 1) * batch];
-            let tok_gpu  = stream.clone_htod(tok_step).unwrap();
+            stream.memset_zeros(&mut bk.d_x).unwrap();
+            sgemm(&self.blas, false, true, batch, E, fh, 1.0, 0.0, &bk.d_gates, &self.w_x, &mut bk.d_x);
             unsafe {
-                stream.launch_builder(&f_emb_bwd)
-                    .arg(&d_x_buf)
-                    .arg(&tok_gpu)
-                    .arg(&mut d_embed)
-                    .arg(&e_i)
+                stream.launch_builder(&self.fns.emb_bwd)
+                    .arg(&bk.d_x).arg(&bk.tok_bufs[t]).arg(&mut bk.d_embed).arg(&e_i)
                     .launch(cfg2d(batch, E)).unwrap();
             }
         }
 
         // ── ADAM UPDATE ───────────────────────────────────────
         self.adam_step += 1;
-        let t   = self.adam_step;
-        let b1  = 0.9f32; let b2 = 0.999f32; let eps = 1e-8f32;
-        let bc1 = 1.0 - b1.powi(t);
-        let bc2 = 1.0 - b2.powi(t);
+        let t_adam = self.adam_step;
+        let b1  = 0.9f32; let b2 = 0.999f32; let eps_adam = 1e-8f32;
+        let bc1 = 1.0 - b1.powi(t_adam);
+        let bc2 = 1.0 - b2.powi(t_adam);
         let lr  = learning_rate as f32;
-
-        let f_norm = self.module.load_function("norm_reduce").unwrap();
-        let f_adam = self.module.load_function("adam_update").unwrap();
-
-        let wg: usize = 256;
         let clip_val = 5.0f32;
-
-        // Max ngroups across all LSTM params (w_h = H*4H is largest)
-        let max_n = [self.vocab_size * E, E * fh, H * fh, fh].iter().copied().max().unwrap();
-        let max_ngroups = (max_n + wg - 1) / wg;
-        let mut partial_buf = stream.alloc_zeros::<f32>(max_ngroups).unwrap();
 
         macro_rules! lstm_adam {
             ($param:expr, $m:expr, $v:expr, $grad:expr, $n:expr) => {{
                 let nn: usize = $n;
                 let n_i = nn as i32;
                 let ngroups = (nn + wg - 1) / wg;
-
-                // GPU norm reduction → CPU finish → GPU scale if needed
-                stream.memset_zeros(&mut partial_buf).unwrap();
+                stream.memset_zeros(&mut bk.partial).unwrap();
                 unsafe {
-                    stream.launch_builder(&f_norm)
-                        .arg(&$grad)
-                        .arg(&mut partial_buf)
-                        .arg(&n_i)
-                        .launch(LaunchConfig {
-                            grid_dim: (ngroups as u32, 1, 1),
-                            block_dim: (wg as u32, 1, 1),
-                            shared_mem_bytes: (wg * 4) as u32,
-                        }).unwrap();
+                    stream.launch_builder(&self.fns.norm_red)
+                        .arg(&$grad).arg(&mut bk.partial).arg(&n_i)
+                        .launch(LaunchConfig { grid_dim: (ngroups as u32,1,1), block_dim: (wg as u32,1,1), shared_mem_bytes: (wg*4) as u32 }).unwrap();
                 }
-                let partial_cpu = download(&stream, &partial_buf);
+                let partial_cpu = download(&stream, &bk.partial);
                 let norm = partial_cpu[..ngroups].iter().sum::<f32>().sqrt();
                 if norm > clip_val {
                     let scale = clip_val / norm;
-                    // scale gradient in-place using adam_update trick: just pre-scale grad
-                    // We do this with a single kernel launch using elem-wise multiply
-                    // For simplicity: download, scale, re-upload (only when clipping fires)
                     let mut g_cpu = download(&stream, &$grad);
                     for v in &mut g_cpu { *v *= scale; }
                     $grad = upload(&stream, &g_cpu);
                 }
                 unsafe {
-                    stream.launch_builder(&f_adam)
+                    stream.launch_builder(&self.fns.adam)
                         .arg(&mut $param).arg(&mut $m).arg(&mut $v).arg(&$grad)
-                        .arg(&lr).arg(&b1).arg(&b2).arg(&eps).arg(&bc1).arg(&bc2).arg(&n_i)
+                        .arg(&lr).arg(&b1).arg(&b2).arg(&eps_adam).arg(&bc1).arg(&bc2).arg(&n_i)
                         .launch(cfg1d(nn)).unwrap();
                 }
             }};
         }
 
-        lstm_adam!(self.embed,  self.m_embed, self.v_embed, d_embed, self.vocab_size * E);
-        lstm_adam!(self.w_x,    self.m_w_x,   self.v_w_x,   d_w_x,  E * fh);
-        lstm_adam!(self.w_h,    self.m_w_h,   self.v_w_h,   d_w_h,  H * fh);
-        lstm_adam!(self.b,      self.m_b,     self.v_b,     d_b,    fh);
+        lstm_adam!(self.embed, self.m_embed, self.v_embed, bk.d_embed, self.vocab_size * E);
+        lstm_adam!(self.w_x,   self.m_w_x,  self.v_w_x,   bk.d_w_x,  E * fh);
+        lstm_adam!(self.w_h,   self.m_w_h,  self.v_w_h,   bk.d_w_h,  H * fh);
+        lstm_adam!(self.b,     self.m_b,    self.v_b,     bk.d_b,    fh);
 
-        // ASM Adam
         self.asm_adam_step += 1;
         let at   = self.asm_adam_step;
         let abc1 = 1.0 - 0.9f32.powi(at);
@@ -779,29 +788,27 @@ impl LSTMModelCuda {
 
         macro_rules! asm_adam {
             ($grad:expr, $param:expr, $m:expr, $v:expr, $n:expr) => {{
-                let nn: usize = $n;
-                let n_i = nn as i32;
-                let b1_a = 0.9f32; let b2_a = 0.999f32; let eps_a = 1e-8f32;
+                let nn: usize = $n; let n_i = nn as i32;
                 unsafe {
-                    stream.launch_builder(&f_adam)
+                    stream.launch_builder(&self.fns.adam)
                         .arg(&mut $param).arg(&mut $m).arg(&mut $v).arg(&$grad)
-                        .arg(&lr).arg(&b1_a).arg(&b2_a).arg(&eps_a).arg(&abc1).arg(&abc2).arg(&n_i)
+                        .arg(&lr).arg(&b1).arg(&b2).arg(&eps_adam).arg(&abc1).arg(&abc2).arg(&n_i)
                         .launch(cfg1d(nn)).unwrap();
                 }
             }};
         }
 
-        asm_adam!(dg_w_head,  self.g_w_head,  self.gm_w_head,  self.gv_w_head,  hs * H);
-        asm_adam!(dg_b_head,  self.g_b_head,  self.gm_b_head,  self.gv_b_head,  hs);
-        asm_adam!(dg_w_proj1, self.g_w_proj1, self.gm_w_proj1, self.gv_w_proj1, d1 * H);
-        asm_adam!(dg_w_tail1, self.g_w_tail1, self.gm_w_tail1, self.gv_w_tail1, ts1 * d1);
-        asm_adam!(dg_b_tail1, self.g_b_tail1, self.gm_b_tail1, self.gv_b_tail1, ts1);
-        asm_adam!(dg_w_proj2, self.g_w_proj2, self.gm_w_proj2, self.gv_w_proj2, d2 * H);
-        asm_adam!(dg_w_tail2, self.g_w_tail2, self.gm_w_tail2, self.gv_w_tail2, ts2 * d2);
-        asm_adam!(dg_b_tail2, self.g_b_tail2, self.gm_b_tail2, self.gv_b_tail2, ts2);
+        asm_adam!(bk.dg_w_head,  self.g_w_head,  self.gm_w_head,  self.gv_w_head,  hs * H);
+        asm_adam!(bk.dg_b_head,  self.g_b_head,  self.gm_b_head,  self.gv_b_head,  hs);
+        asm_adam!(bk.dg_w_proj1, self.g_w_proj1, self.gm_w_proj1, self.gv_w_proj1, d1 * H);
+        asm_adam!(bk.dg_w_tail1, self.g_w_tail1, self.gm_w_tail1, self.gv_w_tail1, ts1 * d1);
+        asm_adam!(bk.dg_b_tail1, self.g_b_tail1, self.gm_b_tail1, self.gv_b_tail1, ts1);
+        asm_adam!(bk.dg_w_proj2, self.g_w_proj2, self.gm_w_proj2, self.gv_w_proj2, d2 * H);
+        asm_adam!(bk.dg_w_tail2, self.g_w_tail2, self.gm_w_tail2, self.gv_w_tail2, ts2 * d2);
+        asm_adam!(bk.dg_b_tail2, self.g_b_tail2, self.gm_b_tail2, self.gv_b_tail2, ts2);
 
         // Single GPU→CPU readback for loss
-        let loss_val = download(&self.stream, &gpu_total_loss)[0];
+        let loss_val = download(&self.stream, &bk.gpu_loss)[0];
         loss_val / (steps * batch) as f32
     }
 
@@ -950,8 +957,11 @@ fn load_seq_cache(path: &str) -> Option<Vec<Vec<usize>>> {
 const LEARNING_RATE:       f64   = 0.0003;
 const MAX_TOKENS_PER_SEQ:  usize = 80;
 const MIN_TOKENS_PER_SEQ:  usize = 4;
-const PRETRAIN_EPOCHS:     usize = 5;
-const PRETRAIN_BATCH_SIZE: usize = 512;
+const PRETRAIN_EPOCHS:     usize = 3;
+const PRETRAIN_BATCH_SIZE: usize = 1024;
+// Max sequences to train on per epoch — keeps training under ~2 hours
+// At 600 seq/s with batch=1024: 2_000_000 / 600 ≈ 55 min per epoch
+const MAX_SEQS_PER_EPOCH:  usize = 2_000_000;
 
 pub fn pretrain_from_files(
     model: &mut LSTMModelCuda,
@@ -1014,21 +1024,30 @@ pub fn pretrain_from_files(
         seqs
     };
 
-    println!("{} sequences\n", all_seqs.len());
+    println!("{} sequences total\n", all_seqs.len());
     if all_seqs.is_empty() { return Ok(()); }
 
-    let total_batches = (all_seqs.len() + PRETRAIN_BATCH_SIZE - 1) / PRETRAIN_BATCH_SIZE;
+    // Cap per epoch to MAX_SEQS_PER_EPOCH — shuffle first so each epoch sees different slice
+    let use_count = all_seqs.len().min(MAX_SEQS_PER_EPOCH);
+    let total_batches = (use_count + PRETRAIN_BATCH_SIZE - 1) / PRETRAIN_BATCH_SIZE;
+
+    let epoch_hours = use_count as f32 / (600.0 * 3600.0);
+    println!("Using {} / {} sequences per epoch  (~{:.1}h at 600 seq/s)",
+             use_count, all_seqs.len(), epoch_hours);
+    println!("Total training time estimate: ~{:.1}h\n", epoch_hours * PRETRAIN_EPOCHS as f32);
+
     let mut current_lr = LEARNING_RATE;
 
     for epoch in 0..PRETRAIN_EPOCHS {
         let ep = Instant::now();
         let mut last_report = Instant::now();
         all_seqs.shuffle(&mut rand::thread_rng());
+        let epoch_seqs = &all_seqs[..use_count];
         let mut total_loss = 0.0f32;
         let mut batches    = 0usize;
         let mut seqs_done  = 0usize;
 
-        for chunk in all_seqs.chunks(PRETRAIN_BATCH_SIZE) {
+        for chunk in epoch_seqs.chunks(PRETRAIN_BATCH_SIZE) {
             let loss = model.train_batch(chunk, current_lr);
             if loss.is_finite() { total_loss += loss; batches += 1; }
             seqs_done += chunk.len();
@@ -1047,7 +1066,7 @@ pub fn pretrain_from_files(
 
         let avg   = total_loss / batches.max(1) as f32;
         let et    = ep.elapsed();
-        let seq_s = all_seqs.len() as f32 / et.as_secs_f32();
+        let seq_s = seqs_done as f32 / et.as_secs_f32();
         println!("Epoch {}/{} done  |  loss={:.6}  |  {:.1}s  |  {:.0} seq/s  |  lr={:.6}",
                  epoch+1, PRETRAIN_EPOCHS, avg, et.as_secs_f32(), seq_s, current_lr);
         current_lr *= 0.85;

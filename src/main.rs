@@ -198,6 +198,9 @@ fn main() -> anyhow::Result<()> {
         let mut generated_tokens: Vec<usize> = Vec::new();
 
         for _ in 0..50 {
+            // Constrained decoding: block non-Cyrillic tokens
+            tokenizer.mask_logits(&mut current_logits);
+
             let action = match mode {
                 SamplingMode::Greedy => model.sample_greedy(&current_logits),
                 SamplingMode::TopK { k, temperature } => model.sample_top_k(&current_logits, temperature, k),
