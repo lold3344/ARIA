@@ -12,3 +12,4 @@ Math_Learn/phase2_test.jsonl
 Math_Learn/phase1_train.jsonl
 Math_Learn/phase1_test.jsonl
 Math_Learn/phase2_train.jsonl
+*.log

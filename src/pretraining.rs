@@ -1,19 +1,21 @@
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
-use crate::model::LSTMModel;
+use crate::model_cuda::LSTMModelCuda;
 use crate::tokenizer::Tokenizer;
 use rayon::prelude::*;
 use rand::seq::SliceRandom;
 
-const LEARNING_RATE: f32 = 0.001;
+const LEARNING_RATE: f64 = 0.0003;
 const MAX_TOKENS_PER_SEQ: usize = 80;
 const MIN_TOKENS_PER_SEQ: usize = 4;
-const EPOCHS: usize = 10;
-const BATCH_SIZE: usize = 64;
+const EPOCHS: usize = 3;
+const BATCH_SIZE: usize = 1024;
+// Cap sequences per epoch to keep runtime bounded
+const MAX_SEQS_PER_EPOCH: usize = 2_000_000;
 
 pub fn pretrain_from_files(
-    model: &mut LSTMModel,
+    model: &mut LSTMModelCuda,
     tokenizer: &mut Tokenizer,
     data_dir: &str,
 ) -> anyhow::Result<()> {

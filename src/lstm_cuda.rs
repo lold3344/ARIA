@@ -11,8 +11,10 @@ pub struct GpuContext {
 impl GpuContext {
     pub fn try_init() -> Option<Self> {
         let ctx    = CudaContext::new(0).ok()?;
-        let stream = ctx.default_stream();
-        println!("[GPU] CUDA device 0 — cuBLAS ready");
+        // Non-blocking stream is critical for performance. The legacy default stream
+        // synchronizes the host after every operation, which kills throughput.
+        let stream = ctx.new_stream().ok()?;
+        println!("[GPU] CUDA device 0 — non-blocking stream — cuBLAS ready");
         let blas = CudaBlas::new(stream.clone()).ok()?;
         Some(GpuContext { ctx, stream, blas })
     }
