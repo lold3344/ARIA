@@ -270,7 +270,7 @@ pub fn train_math_curriculum(
             let mut shuffled = seqs.clone();
             shuffled.shuffle(&mut rng);
 
-            let total_batches = (shuffled.len() + batch_size - 1) / batch_size;
+            let _total_batches = (shuffled.len() + batch_size - 1) / batch_size;
             let mut total_loss = 0.0f32;
             let mut batches = 0usize;
             let t0 = std::time::Instant::now();

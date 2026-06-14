@@ -666,13 +666,13 @@ impl LSTMModelCuda {
         let fh_i    = fh  as i32;
         let h_i     = H   as i32;
         let hs_i    = hs  as i32;
-        let d1_i    = d1  as i32;
-        let d2_i    = d2  as i32;
+        let _d1_i    = d1  as i32;
+        let _d2_i    = d2  as i32;
         let ts1_i   = ts1 as i32;
         let ts2_i   = ts2 as i32;
         let zero_i  = 0i32;
-        let asm_head_i  = self.asm_head_size as i32;
-        let asm_htail_i = (self.asm_head_size + ts1) as i32;
+        let _asm_head_i  = self.asm_head_size as i32;
+        let _asm_htail_i = (self.asm_head_size + ts1) as i32;
         let a1 = hf(1.0);
         let a0 = hf(0.0);
 
@@ -810,7 +810,7 @@ impl LSTMModelCuda {
             gemm(&self.blas, false, false, batch, H, d2, a1, a1, &bk.d_proj2[t], &self.g_w_proj2, &mut *dh);
         }
         unsafe {
-            let n_i = (part_total as i32);
+            let n_i = part_total as i32 ;
             stream.launch_builder(&self.fns.red_one)
                 .arg(&bk.loss_part).arg(&mut bk.gpu_loss[li]).arg(&n_i)
                 .launch(cfg_reduce(part_total)).unwrap();
@@ -905,7 +905,7 @@ impl LSTMModelCuda {
             self.adam_step += 1;
             let t_adam_i = self.adam_step;
             let bc1 = 1.0 - b1.powi(t_adam_i);
-            let bc2 = 1.0 - b2.powi(t_adam_i);
+            let _bc2 = 1.0 - b2.powi(t_adam_i);
             opt_f16!(self.embed, self.m_embed, self.v_embed, bk.d_embed, self.vocab_size * E, bc1, !no_clip);
             opt_f16!(self.w_x,   self.m_w_x,  self.v_w_x,   bk.d_w_x,  E * fh, bc1, !no_clip);
             opt_f16!(self.w_h,   self.m_w_h,  self.v_w_h,   bk.d_w_h,  H * fh, bc1, !no_clip);
@@ -1373,7 +1373,7 @@ const PRETRAIN_BATCH_SIZE: usize = 1024;
 const MAX_SEQS_PER_EPOCH:  usize = 500_000;
 
 pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str) -> anyhow::Result<()> {
-    let max_seqs: usize = std::env::var("ARIA_MAX_SEQS")
+    let _max_seqs: usize = std::env::var("ARIA_MAX_SEQS")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(MAX_SEQS_PER_EPOCH);
 
     let path = Path::new(data_dir);
