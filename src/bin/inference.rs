@@ -12,7 +12,7 @@ fn main() -> anyhow::Result<()> {
     let tokenizer_path = "aria_tokenizer.json";
 
     println!("Loading tokenizer from {}...", tokenizer_path);
-    let tokenizer = Tokenizer::load(tokenizer_path)?;
+    let mut tokenizer = Tokenizer::load(tokenizer_path)?;
     let vocab = tokenizer.vocab_size();
 
     println!("Loading checkpoint from {}...", model_path);

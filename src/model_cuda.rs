@@ -1366,13 +1366,13 @@ fn load_seq_cache(path: &str) -> Option<Vec<Vec<usize>>> {
 //  Pre-training entry point
 // ──────────────────────────────────────────────────────────────
 const LEARNING_RATE:       f64   = 0.0003;
-const MAX_TOKENS_PER_SEQ:  usize = 64;
+const MAX_TOKENS_PER_SEQ:  usize = 80;
 const MIN_TOKENS_PER_SEQ:  usize = 6;
-const PRETRAIN_EPOCHS:     usize = 2;
+const PRETRAIN_EPOCHS:     usize = 5;
 const PRETRAIN_BATCH_SIZE: usize = 1024;
 const MAX_SEQS_PER_EPOCH:  usize = 500_000;
 
-pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str) -> anyhow::Result<()> {
+pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str, tokenizer_path: &str) -> anyhow::Result<()> {
     let _max_seqs: usize = std::env::var("ARIA_MAX_SEQS")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(MAX_SEQS_PER_EPOCH);
 
@@ -1450,23 +1450,29 @@ pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer,
     let use_count = all_seqs.len().min(MAX_SEQS_PER_EPOCH);
     let total_batches = (use_count + PRETRAIN_BATCH_SIZE - 1) / PRETRAIN_BATCH_SIZE;
 
-    println!("Using {} / {} sequences per epoch\n", use_count, all_seqs.len());
+    // Train / validation split: keep last 5% as eval, never shuffled into train
+    let val_count = (use_count / 20).max(1).min(use_count / 10);
+    let train_count = use_count - val_count;
+    let (train_seqs, val_seqs) = all_seqs.split_at(train_count);
+    println!("Using {} train + {} val sequences per epoch\n", train_count, val_count);
 
     let mut current_lr: f64 = std::env::var("ARIA_LR")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(LEARNING_RATE);
     let fixed_len = MAX_TOKENS_PER_SEQ;
+    let train_batches = (train_count + PRETRAIN_BATCH_SIZE - 1) / PRETRAIN_BATCH_SIZE;
+    let val_batches   = (val_count + PRETRAIN_BATCH_SIZE - 1) / PRETRAIN_BATCH_SIZE;
 
     for epoch in 0..PRETRAIN_EPOCHS {
         let ep = Instant::now();
         let mut last_report = Instant::now();
-        all_seqs.shuffle(&mut rand::thread_rng());
-        let epoch_seqs = &all_seqs[..use_count];
+        let mut epoch_train = train_seqs.to_vec();
+        epoch_train.shuffle(&mut rand::thread_rng());
         let mut total_loss = 0.0f32;
         let mut batches    = 0usize;
         let mut seqs_done  = 0usize;
 
         let mut batch_buf: Vec<Vec<usize>> = Vec::with_capacity(PRETRAIN_BATCH_SIZE);
-        for chunk in epoch_seqs.chunks(PRETRAIN_BATCH_SIZE) {
+        for chunk in epoch_train.chunks(PRETRAIN_BATCH_SIZE) {
             batch_buf.clear();
             batch_buf.extend(chunk.iter().cloned());
             let loss = model.train_batch(&batch_buf, current_lr);
@@ -1480,24 +1486,39 @@ pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer,
                 let avg       = total_loss / batches.max(1) as f32;
                 let elapsed   = ep.elapsed().as_secs_f32();
                 let seq_s     = seqs_done as f32 / elapsed;
-                let remaining = total_batches.saturating_sub(batches);
+                let remaining = train_batches.saturating_sub(batches);
                 let tokens_s  = seq_s * fixed_len as f32;
                 println!("  Epoch {}/{}  |  batch {}/{}  ({} remaining)  |  loss={:.4}  |  {:.0} seq/s  ({:.0} tok/s)",
-                         epoch+1, PRETRAIN_EPOCHS, batches, total_batches, remaining, avg, seq_s, tokens_s);
+                         epoch+1, PRETRAIN_EPOCHS, batches, train_batches, remaining, avg, seq_s, tokens_s);
                 std::io::stdout().flush().ok();
                 last_report = Instant::now();
             }
         }
 
+        // Validation pass (no gradient update)
+        let mut val_loss = 0.0f32;
+        let mut val_batches_done = 0usize;
+        for chunk in val_seqs.chunks(PRETRAIN_BATCH_SIZE) {
+            batch_buf.clear();
+            batch_buf.extend(chunk.iter().cloned());
+            let loss = model.train_batch(&batch_buf, 0.0);
+            if loss.is_finite() { val_loss += loss; val_batches_done += 1; }
+        }
+        let val_avg = val_loss / val_batches_done.max(1) as f32;
+
         let avg   = total_loss / batches.max(1) as f32;
         let et    = ep.elapsed();
         let seq_s = seqs_done as f32 / et.as_secs_f32();
         let tok_s = seq_s * fixed_len as f32;
-        println!("Epoch {}/{} done  |  loss={:.6}  |  {:.1}s  |  {:.0} seq/s  ({:.0} tok/s)  |  lr={:.6}",
-                 epoch+1, PRETRAIN_EPOCHS, avg, et.as_secs_f32(), seq_s, tok_s, current_lr);
+        println!("Epoch {}/{} done  |  train_loss={:.6}  |  val_loss={:.6}  |  {:.1}s  |  {:.0} seq/s  ({:.0} tok/s)  |  lr={:.6}",
+                 epoch+1, PRETRAIN_EPOCHS, avg, val_avg, et.as_secs_f32(), seq_s, tok_s, current_lr);
         if !checkpoint_path.is_empty() {
             println!("  Saving checkpoint to {} ...", checkpoint_path);
             model.save_checkpoint(checkpoint_path).ok();
+        }
+        if !tokenizer_path.is_empty() {
+            println!("  Saving tokenizer to {} ...", tokenizer_path);
+            tokenizer.save(tokenizer_path).ok();
         }
         current_lr *= 0.85;
     }

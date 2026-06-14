@@ -79,13 +79,13 @@ fn main() -> anyhow::Result<()> {
         let mut t = Tokenizer::load(tokenizer_path)?;
         let mut m = LSTMModelCuda::load_checkpoint(checkpoint_path)?;
         println!("Checkpoint loaded. Continuing training...\n");
-        model_cuda::pretrain_from_files(&mut m, &mut t, data_dir, checkpoint_path).ok();
+        model_cuda::pretrain_from_files(&mut m, &mut t, data_dir, checkpoint_path, tokenizer_path).ok();
         m.save_checkpoint(checkpoint_path).ok();
         t.save(tokenizer_path).ok();
         (m, t)
     } else {
         let mut t = Tokenizer::new();
-        let m = train_fresh(&mut t, data_dir, checkpoint_path, embed_dim, hidden_dim)?;
+        let m = train_fresh(&mut t, data_dir, checkpoint_path, tokenizer_path, embed_dim, hidden_dim)?;
         m.save_checkpoint(checkpoint_path).ok();
         t.save(tokenizer_path).ok();
         (m, t)
@@ -269,7 +269,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn train_fresh(tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str, embed_dim: usize, hidden_dim: usize) -> anyhow::Result<LSTMModelCuda> {
+fn train_fresh(tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str, tokenizer_path: &str, embed_dim: usize, hidden_dim: usize) -> anyhow::Result<LSTMModelCuda> {
     println!("Building vocabulary from data...\n");
 
     let path = std::path::Path::new(data_dir);
@@ -294,7 +294,7 @@ fn train_fresh(tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str,
     let mut model = LSTMModelCuda::new(actual_vocab, embed_dim, hidden_dim);
 
     println!("Pre-training...");
-    model_cuda::pretrain_from_files(&mut model, tokenizer, data_dir, checkpoint_path).ok();
+    model_cuda::pretrain_from_files(&mut model, tokenizer, data_dir, checkpoint_path, tokenizer_path).ok();
 
     println!("Math curriculum...");
     math_train::train_math_curriculum(&mut model, tokenizer, "Math_Learn", 0.0003).ok();

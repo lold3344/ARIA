@@ -500,13 +500,13 @@ impl Tokenizer {
     pub fn freeze(&mut self) {
         let num_merges = self.target_vocab.saturating_sub(4 + 512);
 
-        // Only keep words with ≥90% Cyrillic content
+        // Only keep words with ≥90% Cyrillic content and min_freq >= 5
         let filtered: HashMap<String, usize> = self.word_freq.iter()
-            .filter(|(w, &f)| f >= 2 && cyrillic_ratio(w))
+            .filter(|(w, &f)| f >= 5 && cyrillic_ratio(w) && !is_bad_word(w))
             .map(|(w, &f)| (w.clone(), f))
             .collect();
 
-        println!("BPE: training {} merges on {} unique words (min_freq=2, cyrillic≥90%)...",
+        println!("BPE: training {} merges on {} unique words (min_freq=5, cyrillic≥90%)...",
                  num_merges, filtered.len());
 
         let merges = train_bpe(&filtered, num_merges);
@@ -516,9 +516,9 @@ impl Tokenizer {
             .collect();
         self.merges = merges;
 
-        // Build vocab: only Cyrillic chars from corpus
+        // Build vocab: only Cyrillic chars from filtered words
         let mut chars: HashSet<String> = HashSet::new();
-        for word in self.word_freq.keys() {
+        for word in filtered.keys() {
             for c in word.chars() {
                 if is_cyrillic(c) || c.is_ascii_digit() {
                     chars.insert(c.to_string());
