@@ -194,7 +194,6 @@ fn main() -> anyhow::Result<()> {
 
         let input_no_end = &tokens[..tokens.len() - 1];
         let (mut current_logits, mut current_state) = model.forward_seq(input_no_end);
-        let mut response_words: Vec<String> = Vec::new();
         let mut generated_tokens: Vec<usize> = Vec::new();
 
         for _ in 0..50 {
@@ -210,31 +209,17 @@ fn main() -> anyhow::Result<()> {
             if action >= tokenizer.vocab_size() { break; }
             if action == 3 { break; }
             if action == 0 { break; }
+            if action == 1 { continue; }
 
-            if action == 1 {
-                let (nl, ns) = model.step(action, &current_state);
-                current_state = ns; current_logits = nl;
-                continue;
-            }
-
-            if let Some(word) = tokenizer.id_to_word(action) {
-                if word == "<END>" || word == "<PAD>" { break; }
-                if !word.starts_with('<') {
-                    print!("{} ", word);
-                    io::stdout().flush()?;
-                    response_words.push(word);
-                    generated_tokens.push(action);
-                }
-            }
+            generated_tokens.push(action);
 
             let (nl, ns) = model.step(action, &current_state);
             current_state = ns;
             current_logits = nl;
         }
 
-        println!("\n");
-
-        let response_text = response_words.join(" ");
+        let response_text = tokenizer.decode(&generated_tokens);
+        println!("{}\n", response_text);
         let aria_entry_id = Uuid::new_v4().to_string();
         let aria_encrypted = encryptor.encrypt(&response_text)?;
         let aria_entry = DialogEntry {

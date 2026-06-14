@@ -9,6 +9,34 @@ const UNK:   usize = 1;
 const START: usize = 2;
 const END:   usize = 3;
 
+// Profanity / vulgar language roots used to filter vocabulary and generation.
+const BAD_ROOTS: &[&str] = &[
+    "хуй", "хуе", "хуя", "хуи", "хул",
+    "пизд", "пидор", "пидар", "пидр",
+    "еба", "ебу", "ебе", "ебо", "еби", "ебл", "ебн", "ебя",
+    "бля", "сук", "жоп", "муд", "говн", "дерьм", "уеб", "выеб", "заеб",
+    "долбоеб", "пиздабол", "охуе", "ахуе", "наху",
+];
+
+fn is_bad_token(tok: &str) -> bool {
+    if tok.starts_with('<') { return false; }
+    let t = tok.to_lowercase();
+    BAD_ROOTS.iter().any(|&r| t.contains(r))
+}
+
+fn is_bad_word(word: &str) -> bool {
+    let w = word.to_lowercase();
+    for &r in BAD_ROOTS {
+        if let Some(pos) = w.find(r) {
+            let left = pos.checked_sub(1).and_then(|i| w.chars().nth(i)).map(|c| c.is_alphabetic()).unwrap_or(false);
+            let right = w[pos + r.len()..].chars().next().map(|c| c.is_alphabetic()).unwrap_or(false);
+            // Block root if it touches a word boundary (prefix or suffix)
+            if !left || !right { return true; }
+        }
+    }
+    false
+}
+
 // ─────────────────────────────────────────────────────────────
 //  Unicode whitelist: кириллица + базовая пунктуация + цифры
 // ─────────────────────────────────────────────────────────────
@@ -255,6 +283,8 @@ pub struct Tokenizer {
     id_to_token:  HashMap<usize, String>,
     // Set of token IDs that pass the Cyrillic whitelist (for constrained decoding)
     allowed_ids:  HashSet<usize>,
+    // Set of token IDs that contain profanity / vulgar substrings
+    bad_ids:      HashSet<usize>,
     target_vocab: usize,
     frozen:       bool,
     word_freq:    HashMap<String, usize>,
@@ -449,6 +479,7 @@ impl Tokenizer {
             token_to_id:  HashMap::new(),
             id_to_token:  HashMap::new(),
             allowed_ids:  HashSet::new(),
+            bad_ids:      HashSet::new(),
             target_vocab: target,
             frozen:       false,
             word_freq:    HashMap::new(),
@@ -523,7 +554,15 @@ impl Tokenizer {
             .map(|(_, &id)| id)
             .collect();
 
-        println!("BPE: vocab size = {}  allowed_ids = {}", self.token_to_id.len(), self.allowed_ids.len());
+        // Build bad_ids: profanity / vulgar tokens that must not be generated
+        self.bad_ids = self.token_to_id.iter()
+            .filter(|(tok, _)| is_bad_token(tok))
+            .map(|(_, &id)| id)
+            .collect();
+        self.allowed_ids.retain(|id| !self.bad_ids.contains(id));
+
+        println!("BPE: vocab size = {}  allowed_ids = {}  bad_ids = {}",
+                 self.token_to_id.len(), self.allowed_ids.len(), self.bad_ids.len());
         self.frozen = true;
     }
 
@@ -534,7 +573,7 @@ impl Tokenizer {
             for word in cleaned.split_whitespace() {
                 let w = clean_word(word);
                 // UNK not counted in statistics — skip unknown/short/non-Cyrillic
-                if w.len() >= 2 && cyrillic_ratio(&w) {
+                if w.len() >= 2 && cyrillic_ratio(&w) && !is_bad_word(&w) {
                     *self.word_freq.entry(w).or_insert(0) += 1;
                 }
             }
@@ -565,10 +604,23 @@ impl Tokenizer {
         self.id_to_token.get(&id).cloned()
     }
 
-    // Constrained decoding: mask logits of non-Cyrillic tokens to -inf
+    // Decode a sequence of token IDs back into a string.
+    // BPE subwords are concatenated directly; special tokens are ignored.
+    pub fn decode(&self, ids: &[usize]) -> String {
+        let mut out = String::new();
+        for &id in ids {
+            if let Some(word) = self.id_to_token.get(&id) {
+                if word.starts_with('<') { continue; }
+                out.push_str(word);
+            }
+        }
+        out
+    }
+
+    // Constrained decoding: mask logits of non-Cyrillic and profanity tokens to -inf
     pub fn mask_logits(&self, logits: &mut Vec<f32>) {
         for (id, v) in logits.iter_mut().enumerate() {
-            if !self.allowed_ids.contains(&id) {
+            if !self.allowed_ids.contains(&id) || self.bad_ids.contains(&id) {
                 *v = f32::NEG_INFINITY;
             }
         }
@@ -577,11 +629,7 @@ impl Tokenizer {
     // Sanity check: encode → decode roundtrip
     pub fn roundtrip_check(&mut self, text: &str) -> bool {
         let ids = self.encode(text);
-        let decoded: String = ids.iter()
-            .filter_map(|&id| self.id_to_word(id))
-            .filter(|t| !t.starts_with('<'))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let decoded = self.decode(&ids);
         // Check decoded contains only allowed chars
         decoded.chars().all(|c| is_allowed_char(c) || c == ' ')
     }
@@ -647,11 +695,16 @@ impl Tokenizer {
         t.merge_rank  = t.merges.iter().enumerate()
             .map(|(i, (a, b))| ((a.clone(), b.clone()), i)).collect();
 
-        // Rebuild allowed_ids
+        // Rebuild allowed_ids and bad_ids
         t.allowed_ids = t.token_to_id.iter()
             .filter(|(tok, _)| tok.starts_with('<') || tok.chars().all(|c| is_cyrillic(c) || c.is_ascii_digit()))
             .map(|(_, &id)| id)
             .collect();
+        t.bad_ids = t.token_to_id.iter()
+            .filter(|(tok, _)| is_bad_token(tok))
+            .map(|(_, &id)| id)
+            .collect();
+        t.allowed_ids.retain(|id| !t.bad_ids.contains(id));
 
         t.frozen = true;
         Ok(t)

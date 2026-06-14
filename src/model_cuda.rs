@@ -1048,11 +1048,7 @@ impl LSTMModelCuda {
             if id == 0 || id == 3 || id >= tokenizer.vocab_size() { break; }
             generated.push(id);
         }
-        let words: Vec<String> = generated.iter()
-            .filter_map(|&id| tokenizer.id_to_word(id))
-            .filter(|w| !w.starts_with('<'))
-            .collect();
-        words.join(" ")
+        tokenizer.decode(&generated)
     }
 
     pub fn decode_top_k(&self, tokenizer: &mut Tokenizer, prompt: &str, max_tokens: usize,
@@ -1079,11 +1075,7 @@ impl LSTMModelCuda {
             if id == 0 || id == 3 || id >= tokenizer.vocab_size() { break; }
             generated.push(id);
         }
-        let words: Vec<String> = generated.iter()
-            .filter_map(|&id| tokenizer.id_to_word(id))
-            .filter(|w| !w.starts_with('<'))
-            .collect();
-        words.join(" ")
+        tokenizer.decode(&generated)
     }
 
     // ── Save / Load (legacy JSON, weights only) ──────────────────────────────
@@ -1374,11 +1366,11 @@ fn load_seq_cache(path: &str) -> Option<Vec<Vec<usize>>> {
 //  Pre-training entry point
 // ──────────────────────────────────────────────────────────────
 const LEARNING_RATE:       f64   = 0.0003;
-const MAX_TOKENS_PER_SEQ:  usize = 80;
-const MIN_TOKENS_PER_SEQ:  usize = 4;
-const PRETRAIN_EPOCHS:     usize = 3;
+const MAX_TOKENS_PER_SEQ:  usize = 64;
+const MIN_TOKENS_PER_SEQ:  usize = 6;
+const PRETRAIN_EPOCHS:     usize = 2;
 const PRETRAIN_BATCH_SIZE: usize = 1024;
-const MAX_SEQS_PER_EPOCH:  usize = 2_000_000;
+const MAX_SEQS_PER_EPOCH:  usize = 500_000;
 
 pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str) -> anyhow::Result<()> {
     let max_seqs: usize = std::env::var("ARIA_MAX_SEQS")
