@@ -111,6 +111,7 @@ struct BatchBufs {
     zero_d2:     CudaSlice<f16>,
     tok_bufs:    Vec<CudaSlice<i32>>,
     head_tgt:    Vec<CudaSlice<i32>>,
+    simple_tgt:  Vec<CudaSlice<i32>>,
     tail1_tgt:   Vec<CudaSlice<i32>>,
     tail2_tgt:   Vec<CudaSlice<i32>>,
     loss_part:   CudaSlice<f32>,
@@ -150,6 +151,7 @@ impl BatchBufs {
             zero_d1: az(d1), zero_d2: az(d2),
             tok_bufs:  (0..steps).map(|_| azi(batch)).collect(),
             head_tgt:  (0..steps).map(|_| azi(batch)).collect(),
+            simple_tgt: (0..steps).map(|_| azi(batch)).collect(),
             tail1_tgt: (0..steps).map(|_| azi(batch)).collect(),
             tail2_tgt: (0..steps).map(|_| azi(batch)).collect(),
             loss_part: az_f32(3 * ((batch + 31) / 32) * steps),
@@ -461,6 +463,7 @@ impl LSTMModelCuda {
             vocab_size, embed_dim, hidden_dim,
             adam_step: 0, asm_adam_step: 0, loss_idx: 0,
             asm_head_size, asm_tail1_size, asm_tail2_size, asm_dim1, asm_dim2,
+            use_simple_softmax,
             profile_step: Cell::new(0),
             host_loss: [
                 unsafe { ctx.alloc_pinned::<f32>(1).unwrap() },
@@ -535,6 +538,17 @@ impl LSTMModelCuda {
     //  train_batch
     // ──────────────────────────────────────────────────────────────
     pub fn train_batch(&mut self, sequences: &[Vec<usize>], learning_rate: f64) -> f32 {
+        let stream = Arc::clone(&self.stream);
+        let li = self.loss_idx;
+        let prev_li = 1 - li;
+        // Wait for the previous async loss copy to finish, then read it.
+        stream.synchronize().unwrap();
+        let prev_loss = if self.profile_step.get() > 0 {
+            self.host_loss[prev_li].as_slice().unwrap()[0]
+        } else {
+            0.0
+        };
+
         let valid: Vec<&Vec<usize>> = sequences.iter().filter(|s| s.len() >= 2).collect();
         if valid.is_empty() { return 0.0; }
 
@@ -567,14 +581,17 @@ impl LSTMModelCuda {
         }
         let t_prep = t0.map(|t| t.elapsed().as_secs_f32());
 
-        let stream = Arc::clone(&self.stream);
         let hs  = self.asm_head_size + 2;
         let d1  = self.asm_dim1;
         let d2  = self.asm_dim2;
         let ts1 = self.asm_tail1_size;
         let ts2 = self.asm_tail2_size;
         let wg  = 256usize;
-        let max_n = [self.vocab_size * E, E * fh, H * fh, fh].iter().copied().max().unwrap();
+        let max_n = [
+            self.vocab_size * E, E * fh, H * fh, fh,
+            if self.use_simple_softmax { self.vocab_size * H } else { 0 },
+            if self.use_simple_softmax { self.vocab_size } else { 0 },
+        ].iter().copied().max().unwrap();
         let max_ngroups = (max_n + wg - 1) / wg;
 
         if self.bufs.as_ref().map_or(true, |b| !b.fits(batch, steps)) {
@@ -591,6 +608,10 @@ impl LSTMModelCuda {
         stream.memset_zeros(&mut bk.d_b).unwrap();
         stream.memset_zeros(&mut bk.dg_w_head).unwrap();
         stream.memset_zeros(&mut bk.dg_b_head).unwrap();
+        if self.use_simple_softmax {
+            stream.memset_zeros(&mut bk.dg_w_simple).unwrap();
+            stream.memset_zeros(&mut bk.dg_b_simple).unwrap();
+        }
         stream.memset_zeros(&mut bk.dg_w_proj1).unwrap();
         stream.memset_zeros(&mut bk.dg_w_tail1).unwrap();
         stream.memset_zeros(&mut bk.dg_b_tail1).unwrap();
@@ -611,11 +632,13 @@ impl LSTMModelCuda {
         }
 
         let mut head_tgt_cpu  = vec![0i32; batch * steps];
+        let mut simple_tgt_cpu = vec![0i32; batch * steps];
         let mut tail1_tgt_cpu = vec![0i32; batch * steps];
         let mut tail2_tgt_cpu = vec![0i32; batch * steps];
         for t in 0..steps {
             for b in 0..batch {
                 let tk = if mask_flat[b * max_len + t] < 0.5 { -1i32 } else { target_flat[b * max_len + t] };
+                simple_tgt_cpu[t * batch + b] = tk;
                 head_tgt_cpu[t * batch + b] = if tk < 0 { -1 }
                     else if (tk as usize) < self.asm_head_size { tk }
                     else if (tk as usize) < self.asm_head_size + ts1 { self.asm_head_size as i32 }
@@ -628,6 +651,9 @@ impl LSTMModelCuda {
             }
             let off = t * batch;
             stream.memcpy_htod(&head_tgt_cpu[off..off+batch],  &mut bk.head_tgt[t]).unwrap();
+            if self.use_simple_softmax {
+                stream.memcpy_htod(&simple_tgt_cpu[off..off+batch], &mut bk.simple_tgt[t]).unwrap();
+            }
             stream.memcpy_htod(&tail1_tgt_cpu[off..off+batch], &mut bk.tail1_tgt[t]).unwrap();
             stream.memcpy_htod(&tail2_tgt_cpu[off..off+batch], &mut bk.tail2_tgt[t]).unwrap();
         }
@@ -681,7 +707,34 @@ impl LSTMModelCuda {
         let part_stride = 3 * blocks_per_batch;
         let part_total = part_stride * steps;
 
+        let vocab_i = self.vocab_size as i32;
         for t in 0..steps {
+            if self.use_simple_softmax {
+                gemm(&self.blas, false, true, batch, self.vocab_size, H, a1, a0, &bk.h[t+1], &self.w_simple, &mut bk.simple_logits[t]);
+                unsafe {
+                    stream.launch_builder(&self.fns.bias)
+                        .arg(&mut bk.simple_logits[t]).arg(&self.b_simple).arg(&batch_i).arg(&vocab_i)
+                        .launch(cfg1d(batch * self.vocab_size)).unwrap();
+                    stream.launch_builder(&self.fns.asm_sm)
+                        .arg(&mut bk.simple_logits[t]).arg(&vocab_i).arg(&batch_i)
+                        .launch(cfg_warp_per_row(batch)).unwrap();
+                    let loss_off = (t * part_stride) as i32;
+                    stream.launch_builder(&self.fns.asm_ce)
+                        .arg(&mut bk.simple_logits[t]).arg(&bk.simple_tgt[t]).arg(&mut bk.loss_part)
+                        .arg(&vocab_i).arg(&zero_i).arg(&batch_i).arg(&loss_off)
+                        .launch(cfg_warp_per_row(batch)).unwrap();
+                }
+                gemm(&self.blas, true, false, self.vocab_size, H, batch, a1, a1, &bk.simple_logits[t], &bk.h[t+1], &mut bk.dg_w_simple);
+                unsafe {
+                    stream.launch_builder(&self.fns.red_sum)
+                        .arg(&bk.simple_logits[t]).arg(&mut bk.dg_b_simple).arg(&batch_i).arg(&vocab_i)
+                        .launch(cfg1d(self.vocab_size)).unwrap();
+                }
+                let dh = &mut bk.d_h[t];
+                gemm(&self.blas, false, false, batch, H, self.vocab_size, a1, a1, &bk.simple_logits[t], &self.w_simple, &mut *dh);
+                continue;
+            }
+
             gemm(&self.blas, false, true, batch, hs, H, a1, a0, &bk.h[t+1], &self.g_w_head, &mut bk.head_logits[t]);
             unsafe {
                 stream.launch_builder(&self.fns.bias)
@@ -860,41 +913,46 @@ impl LSTMModelCuda {
         }
 
         if opt_asm {
-            self.asm_adam_step += 1;
-            let at   = self.asm_adam_step;
-            let abc1 = 1.0 - 0.9f32.powi(at);
-            let abc2 = 1.0 - 0.999f32.powi(at);
-            opt_f16!(self.g_w_head,  self.gm_w_head,  self.gv_w_head,  bk.dg_w_head,  hs * H, abc1, !no_clip);
-            opt_f16!(self.g_b_head,  self.gm_b_head,  self.gv_b_head,  bk.dg_b_head,  hs, abc1, !no_clip);
-            opt_f16!(self.g_w_proj1, self.gm_w_proj1, self.gv_w_proj1, bk.dg_w_proj1, d1 * H, abc1, !no_clip);
-            opt_f16!(self.g_w_tail1, self.gm_w_tail1, self.gv_w_tail1, bk.dg_w_tail1, ts1 * d1, abc1, !no_clip);
-            opt_f16!(self.g_b_tail1, self.gm_b_tail1, self.gv_b_tail1, bk.dg_b_tail1, ts1, abc1, !no_clip);
-            opt_f16!(self.g_w_proj2, self.gm_w_proj2, self.gv_w_proj2, bk.dg_w_proj2, d2 * H, abc1, !no_clip);
-            opt_f16!(self.g_w_tail2, self.gm_w_tail2, self.gv_w_tail2, bk.dg_w_tail2, ts2 * d2, abc1, !no_clip);
-            opt_f16!(self.g_b_tail2, self.gm_b_tail2, self.gv_b_tail2, bk.dg_b_tail2, ts2, abc1, !no_clip);
+            if self.use_simple_softmax {
+                self.simple_adam_step += 1;
+                let at = self.simple_adam_step;
+                let abc1 = 1.0 - 0.9f32.powi(at);
+                opt_f16!(self.w_simple, self.m_w_simple, self.v_w_simple, bk.dg_w_simple, self.vocab_size * H, abc1, !no_clip);
+                opt_f16!(self.b_simple, self.m_b_simple, self.v_b_simple, bk.dg_b_simple, self.vocab_size, abc1, !no_clip);
+            } else {
+                self.asm_adam_step += 1;
+                let at   = self.asm_adam_step;
+                let abc1 = 1.0 - 0.9f32.powi(at);
+                opt_f16!(self.g_w_head,  self.gm_w_head,  self.gv_w_head,  bk.dg_w_head,  hs * H, abc1, !no_clip);
+                opt_f16!(self.g_b_head,  self.gm_b_head,  self.gv_b_head,  bk.dg_b_head,  hs, abc1, !no_clip);
+                opt_f16!(self.g_w_proj1, self.gm_w_proj1, self.gv_w_proj1, bk.dg_w_proj1, d1 * H, abc1, !no_clip);
+                opt_f16!(self.g_w_tail1, self.gm_w_tail1, self.gv_w_tail1, bk.dg_w_tail1, ts1 * d1, abc1, !no_clip);
+                opt_f16!(self.g_b_tail1, self.gm_b_tail1, self.gv_b_tail1, bk.dg_b_tail1, ts1, abc1, !no_clip);
+                opt_f16!(self.g_w_proj2, self.gm_w_proj2, self.gv_w_proj2, bk.dg_w_proj2, d2 * H, abc1, !no_clip);
+                opt_f16!(self.g_w_tail2, self.gm_w_tail2, self.gv_w_tail2, bk.dg_w_tail2, ts2 * d2, abc1, !no_clip);
+                opt_f16!(self.g_b_tail2, self.gm_b_tail2, self.gv_b_tail2, bk.dg_b_tail2, ts2, abc1, !no_clip);
+            }
         }
 
         } // end if !skip_adam
 
         let t_adam = t_adam_opt.map(|t| t.elapsed().as_secs_f32());
-        let t_loss_start = if do_profile { Some(Instant::now()) } else { None };
 
+        // Enqueue async loss copy for the next call to read; no CPU sync here.
         stream.memcpy_dtoh(&bk.gpu_loss[li], &mut self.host_loss[li]).unwrap();
-        stream.synchronize().unwrap();
-        let loss_val = self.host_loss[li].as_slice().unwrap()[0];
-        let t_loss = t_loss_start.map(|t| t.elapsed().as_secs_f32());
         self.loss_idx = prev_li;
 
         if do_profile {
             self.profile_step.set(self.profile_step.get() + 1);
             println!(
-                "    [profile] prep={:.3}s upload={:.3}s fwd={:.3}s asm={:.3}s bwd={:.3}s adam={:.3}s loss={:.3}s",
+                "    [profile] prep={:.3}s upload={:.3}s fwd={:.3}s asm={:.3}s bwd={:.3}s adam={:.3}s",
                 t_prep.unwrap_or(0.0), t_upload.unwrap_or(0.0), t_fwd.unwrap_or(0.0),
-                t_asm.unwrap_or(0.0), t_bwd.unwrap_or(0.0), t_adam.unwrap_or(0.0), t_loss.unwrap_or(0.0)
+                t_asm.unwrap_or(0.0), t_bwd.unwrap_or(0.0), t_adam.unwrap_or(0.0)
             );
         }
 
-        loss_val / (steps * batch) as f32
+        // Return loss from the previous batch (already synchronized at the top).
+        prev_loss / (steps * batch).max(1) as f32
     }
 
     pub fn backward_step(&mut self, tokens: &[usize], learning_rate: f64) -> f32 {
@@ -929,6 +987,7 @@ impl LSTMModelCuda {
     }
 
     pub fn sample_top_p(&self, logits: &[f32], temperature: f32, top_p: f32) -> usize {
+
         let temp = temperature.max(0.05);
         let scaled: Vec<f32> = logits.iter().map(|x| x / temp).collect();
         let mut indexed: Vec<(usize, f32)> = scaled.iter().copied().enumerate().collect();
@@ -956,7 +1015,78 @@ impl LSTMModelCuda {
         candidates.last().map(|(i, _)| *i).unwrap_or(0)
     }
 
-    // ── Save / Load ──────────────────────────────────────────────────────────
+    // ── Decoding ──────────────────────────────────────────────────────────
+    fn apply_repetition_penalty(logits: &mut [f32], history: &[usize], penalty: f32) {
+        if penalty <= 1.0 { return; }
+        for &id in history {
+            if id < logits.len() && logits[id] > 0.0 {
+                logits[id] /= penalty;
+            } else if id < logits.len() {
+                logits[id] *= penalty;
+            }
+        }
+    }
+
+    pub fn decode_greedy(&self, tokenizer: &mut Tokenizer, prompt: &str, max_tokens: usize) -> String {
+        let mut tokens = tokenizer.encode(prompt);
+        if tokens.len() < 2 { tokens.push(3); }
+        let input = &tokens[..tokens.len().saturating_sub(1)];
+        let (_, mut state) = self.forward_seq(input);
+        let mut generated: Vec<usize> = Vec::new();
+        let mut last_logits = vec![0.0f32; self.vocab_size];
+        for _ in 0..max_tokens {
+            let (logits, new_state) = if generated.is_empty() {
+                self.forward_seq(&tokens)
+            } else {
+                self.step(*generated.last().unwrap(), &state)
+            };
+            last_logits = logits;
+            state = new_state;
+            let mut masked = last_logits.clone();
+            tokenizer.mask_logits(&mut masked);
+            let id = self.sample_greedy(&masked);
+            if id == 0 || id == 3 || id >= tokenizer.vocab_size() { break; }
+            generated.push(id);
+        }
+        let words: Vec<String> = generated.iter()
+            .filter_map(|&id| tokenizer.id_to_word(id))
+            .filter(|w| !w.starts_with('<'))
+            .collect();
+        words.join(" ")
+    }
+
+    pub fn decode_top_k(&self, tokenizer: &mut Tokenizer, prompt: &str, max_tokens: usize,
+                        k: usize, temperature: f32, repetition_penalty: f32) -> String
+    {
+        let mut tokens = tokenizer.encode(prompt);
+        if tokens.len() < 2 { tokens.push(3); }
+        let input = &tokens[..tokens.len().saturating_sub(1)];
+        let (_, mut state) = self.forward_seq(input);
+        let mut generated: Vec<usize> = Vec::new();
+        let mut last_logits = vec![0.0f32; self.vocab_size];
+        for _ in 0..max_tokens {
+            let (logits, new_state) = if generated.is_empty() {
+                self.forward_seq(&tokens)
+            } else {
+                self.step(*generated.last().unwrap(), &state)
+            };
+            last_logits = logits;
+            state = new_state;
+            let mut masked = last_logits.clone();
+            tokenizer.mask_logits(&mut masked);
+            Self::apply_repetition_penalty(&mut masked, &generated, repetition_penalty);
+            let id = self.sample_top_k(&masked, temperature, k);
+            if id == 0 || id == 3 || id >= tokenizer.vocab_size() { break; }
+            generated.push(id);
+        }
+        let words: Vec<String> = generated.iter()
+            .filter_map(|&id| tokenizer.id_to_word(id))
+            .filter(|w| !w.starts_with('<'))
+            .collect();
+        words.join(" ")
+    }
+
+    // ── Save / Load (legacy JSON, weights only) ──────────────────────────────
     pub fn save(&self, path: &str) -> anyhow::Result<()> {
         let data = serde_json::json!({
             "vocab_size": self.vocab_size,
@@ -998,21 +1128,185 @@ impl LSTMModelCuda {
         }
         Ok(model)
     }
+
+    // ── Full checkpoint (weights + optimizer + config) ─────────────────────────
+    pub fn save_checkpoint(&self, path: &str) -> anyhow::Result<()> {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+
+        fn f16_b64(stream: &Arc<CudaStream>, buf: &CudaSlice<f16>) -> String {
+            stream.synchronize().unwrap();
+            let h: Vec<f16> = stream.clone_dtoh(buf).unwrap();
+            let bytes: Vec<u8> = h.iter().flat_map(|x| x.to_bits().to_le_bytes()).collect();
+            B64.encode(&bytes)
+        }
+        fn f32_b64(stream: &Arc<CudaStream>, buf: &CudaSlice<f32>) -> String {
+            stream.synchronize().unwrap();
+            let h: Vec<f32> = stream.clone_dtoh(buf).unwrap();
+            let bytes: Vec<u8> = h.iter().flat_map(|x| x.to_le_bytes()).collect();
+            B64.encode(&bytes)
+        }
+
+        let (w_simple_b64, b_simple_b64) = if self.use_simple_softmax {
+            (f16_b64(&self.stream, &self.w_simple), f16_b64(&self.stream, &self.b_simple))
+        } else {
+            (String::new(), String::new())
+        };
+        let (m_w_simple_b64, v_w_simple_b64, m_b_simple_b64, v_b_simple_b64) = if self.use_simple_softmax {
+            (f32_b64(&self.stream, &self.m_w_simple), f32_b64(&self.stream, &self.v_w_simple),
+             f32_b64(&self.stream, &self.m_b_simple), f32_b64(&self.stream, &self.v_b_simple))
+        } else {
+            (String::new(), String::new(), String::new(), String::new())
+        };
+
+        let data = serde_json::json!({
+            "format": "aria_checkpoint_v1",
+            "vocab_size": self.vocab_size,
+            "embed_dim":  self.embed_dim,
+            "hidden_dim": self.hidden_dim,
+            "asm_head_size": self.asm_head_size,
+            "asm_tail1_size": self.asm_tail1_size,
+            "asm_tail2_size": self.asm_tail2_size,
+            "asm_dim1": self.asm_dim1,
+            "asm_dim2": self.asm_dim2,
+            "use_simple_softmax": self.use_simple_softmax,
+            "adam_step": self.adam_step,
+            "asm_adam_step": self.asm_adam_step,
+            "simple_adam_step": self.simple_adam_step,
+            "weights": {
+                "embed": f16_b64(&self.stream, &self.embed),
+                "w_x":   f16_b64(&self.stream, &self.w_x),
+                "w_h":   f16_b64(&self.stream, &self.w_h),
+                "b":     f16_b64(&self.stream, &self.b),
+                "g_w_head":  f16_b64(&self.stream, &self.g_w_head),
+                "g_b_head":  f16_b64(&self.stream, &self.g_b_head),
+                "g_w_proj1": f16_b64(&self.stream, &self.g_w_proj1),
+                "g_w_tail1": f16_b64(&self.stream, &self.g_w_tail1),
+                "g_b_tail1": f16_b64(&self.stream, &self.g_b_tail1),
+                "g_w_proj2": f16_b64(&self.stream, &self.g_w_proj2),
+                "g_w_tail2": f16_b64(&self.stream, &self.g_w_tail2),
+                "g_b_tail2": f16_b64(&self.stream, &self.g_b_tail2),
+                "w_simple": w_simple_b64,
+                "b_simple": b_simple_b64,
+            },
+            "adam": {
+                "m_embed": f32_b64(&self.stream, &self.m_embed), "v_embed": f32_b64(&self.stream, &self.v_embed),
+                "m_w_x":   f32_b64(&self.stream, &self.m_w_x),   "v_w_x":   f32_b64(&self.stream, &self.v_w_x),
+                "m_w_h":   f32_b64(&self.stream, &self.m_w_h),   "v_w_h":   f32_b64(&self.stream, &self.v_w_h),
+                "m_b":     f32_b64(&self.stream, &self.m_b),     "v_b":     f32_b64(&self.stream, &self.v_b),
+                "m_w_simple": m_w_simple_b64,
+                "v_w_simple": v_w_simple_b64,
+                "m_b_simple": m_b_simple_b64,
+                "v_b_simple": v_b_simple_b64,
+                "gm_w_head":  f32_b64(&self.stream, &self.gm_w_head),  "gv_w_head":  f32_b64(&self.stream, &self.gv_w_head),
+                "gm_b_head":  f32_b64(&self.stream, &self.gm_b_head),  "gv_b_head":  f32_b64(&self.stream, &self.gv_b_head),
+                "gm_w_proj1": f32_b64(&self.stream, &self.gm_w_proj1), "gv_w_proj1": f32_b64(&self.stream, &self.gv_w_proj1),
+                "gm_w_tail1": f32_b64(&self.stream, &self.gm_w_tail1), "gv_w_tail1": f32_b64(&self.stream, &self.gv_w_tail1),
+                "gm_b_tail1": f32_b64(&self.stream, &self.gm_b_tail1), "gv_b_tail1": f32_b64(&self.stream, &self.gv_b_tail1),
+                "gm_w_proj2": f32_b64(&self.stream, &self.gm_w_proj2), "gv_w_proj2": f32_b64(&self.stream, &self.gv_w_proj2),
+                "gm_w_tail2": f32_b64(&self.stream, &self.gm_w_tail2), "gv_w_tail2": f32_b64(&self.stream, &self.gv_w_tail2),
+                "gm_b_tail2": f32_b64(&self.stream, &self.gm_b_tail2), "gv_b_tail2": f32_b64(&self.stream, &self.gv_b_tail2),
+            },
+            "adaptive_sm": self.adaptive_sm.to_json(),
+        });
+        fs::write(path, serde_json::to_string(&data)?)?;
+        Ok(())
+    }
+
+    pub fn load_checkpoint(path: &str) -> anyhow::Result<Self> {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+
+        let data: serde_json::Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+        let vocab_size = data["vocab_size"].as_u64().unwrap_or(0) as usize;
+        let embed_dim  = data["embed_dim"].as_u64().unwrap_or(0) as usize;
+        let hidden_dim = data["hidden_dim"].as_u64().unwrap_or(0) as usize;
+        if vocab_size == 0 || embed_dim == 0 || hidden_dim == 0 {
+            anyhow::bail!("checkpoint missing dims");
+        }
+
+        let mut model = LSTMModelCuda::new(vocab_size, embed_dim, hidden_dim);
+
+        fn decode_f16(s: &str) -> Vec<f32> {
+            if s.is_empty() { return vec![]; }
+            let bytes = B64.decode(s).unwrap_or_default();
+            bytes.chunks_exact(2)
+                .map(|b| f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32())
+                .collect()
+        }
+        fn decode_f32(s: &str) -> Vec<f32> {
+            if s.is_empty() { return vec![]; }
+            let bytes = B64.decode(s).unwrap_or_default();
+            bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+        }
+        macro_rules! load16 {
+            ($field:ident, $key:expr) => {
+                if let Some(s) = data["weights"][$key].as_str() {
+                    let v = decode_f16(s);
+                    model.$field = upload_f16(&model.stream, &v);
+                }
+            };
+        }
+        macro_rules! load32 {
+            ($field:ident, $key:expr) => {
+                if let Some(s) = data["adam"][$key].as_str() {
+                    let v = decode_f32(s);
+                    let n = v.len();
+                    let mut slice = model.stream.alloc_zeros::<f32>(n).unwrap();
+                    model.stream.memcpy_htod(&v, &mut slice).unwrap();
+                    model.$field = slice;
+                }
+            };
+        }
+
+        load16!(embed, "embed"); load16!(w_x, "w_x"); load16!(w_h, "w_h"); load16!(b, "b");
+        load16!(g_w_head, "g_w_head"); load16!(g_b_head, "g_b_head");
+        load16!(g_w_proj1, "g_w_proj1");
+        load16!(g_w_tail1, "g_w_tail1"); load16!(g_b_tail1, "g_b_tail1");
+        load16!(g_w_proj2, "g_w_proj2");
+        load16!(g_w_tail2, "g_w_tail2"); load16!(g_b_tail2, "g_b_tail2");
+        if model.use_simple_softmax {
+            load16!(w_simple, "w_simple"); load16!(b_simple, "b_simple");
+        }
+
+        load32!(m_embed, "m_embed"); load32!(v_embed, "v_embed");
+        load32!(m_w_x, "m_w_x");     load32!(v_w_x, "v_w_x");
+        load32!(m_w_h, "m_w_h");     load32!(v_w_h, "v_w_h");
+        load32!(m_b, "m_b");         load32!(v_b, "v_b");
+        if model.use_simple_softmax {
+            load32!(m_w_simple, "m_w_simple"); load32!(v_w_simple, "v_w_simple");
+            load32!(m_b_simple, "m_b_simple"); load32!(v_b_simple, "v_b_simple");
+        }
+        load32!(gm_w_head, "gm_w_head");  load32!(gv_w_head, "gv_w_head");
+        load32!(gm_b_head, "gm_b_head");  load32!(gv_b_head, "gv_b_head");
+        load32!(gm_w_proj1, "gm_w_proj1");load32!(gv_w_proj1, "gv_w_proj1");
+        load32!(gm_w_tail1, "gm_w_tail1");load32!(gv_w_tail1, "gv_w_tail1");
+        load32!(gm_b_tail1, "gm_b_tail1");load32!(gv_b_tail1, "gv_b_tail1");
+        load32!(gm_w_proj2, "gm_w_proj2");load32!(gv_w_proj2, "gv_w_proj2");
+        load32!(gm_w_tail2, "gm_w_tail2");load32!(gv_w_tail2, "gv_w_tail2");
+        load32!(gm_b_tail2, "gm_b_tail2");load32!(gv_b_tail2, "gv_b_tail2");
+
+        if let Some(asm) = AdaptiveSoftmax::from_json(&data["adaptive_sm"]) {
+            model.adaptive_sm = asm;
+        }
+        if let Some(v) = data["adam_step"].as_i64() { model.adam_step = v as i32; }
+        if let Some(v) = data["asm_adam_step"].as_i64() { model.asm_adam_step = v as i32; }
+        if let Some(v) = data["simple_adam_step"].as_i64() { model.simple_adam_step = v as i32; }
+        Ok(model)
+    }
 }
 
 // ──────────────────────────────────────────────────────────────
 //  Sequence cache helpers
 // ──────────────────────────────────────────────────────────────
+// Packed cache v2: header count, then each seq = real_len (u32) + tokens[real_len]
 fn save_seq_cache_packed(path: &str, seqs: &[Vec<usize>], fixed_len: usize) {
     let file = match fs::File::create(path) { Ok(f) => f, Err(_) => return };
     let mut w = BufWriter::new(file);
     let count = seqs.len().min(u32::MAX as usize) as u32;
     w.write_all(&count.to_le_bytes()).ok();
-    let mut step_buf = vec![0u32; fixed_len];
     for seq in seqs.iter().take(count as usize) {
-        let len = seq.len().min(fixed_len);
-        for t in 0..fixed_len { step_buf[t] = if t < len { seq[t] as u32 } else { 0u32 }; }
-        for &tok in &step_buf { w.write_all(&tok.to_le_bytes()).ok(); }
+        let len = seq.len().min(fixed_len).min(u32::MAX as usize) as u32;
+        w.write_all(&len.to_le_bytes()).ok();
+        for &tok in &seq[..len as usize] { w.write_all(&(tok as u32).to_le_bytes()).ok(); }
     }
     w.flush().ok();
 }
@@ -1023,12 +1317,15 @@ fn load_seq_cache_packed_chunked(path: &str, fixed_len: usize, max_seqs: usize) 
     file.read_exact(&mut header).ok()?;
     let file_count = u32::from_le_bytes(header) as usize;
     let count = file_count.min(max_seqs);
-    let seq_bytes = fixed_len * 4;
     let mut seqs = Vec::with_capacity(count);
-    let mut buf = vec![0u8; seq_bytes];
     for _ in 0..count {
+        let mut len_buf = [0u8; 4];
+        file.read_exact(&mut len_buf).ok()?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+        let len = len.min(fixed_len);
+        let mut buf = vec![0u8; len * 4];
         file.read_exact(&mut buf).ok()?;
-        let seq: Vec<usize> = (0..fixed_len)
+        let seq: Vec<usize> = (0..len)
             .map(|k| u32::from_le_bytes(buf[k*4..k*4+4].try_into().unwrap()) as usize)
             .collect();
         seqs.push(seq);
@@ -1083,7 +1380,10 @@ const PRETRAIN_EPOCHS:     usize = 3;
 const PRETRAIN_BATCH_SIZE: usize = 1024;
 const MAX_SEQS_PER_EPOCH:  usize = 2_000_000;
 
-pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer, data_dir: &str) -> anyhow::Result<()> {
+pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str) -> anyhow::Result<()> {
+    let max_seqs: usize = std::env::var("ARIA_MAX_SEQS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(MAX_SEQS_PER_EPOCH);
+
     let path = Path::new(data_dir);
     if !path.exists() { println!("Data dir not found."); return Ok(()); }
 
@@ -1126,7 +1426,6 @@ pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer,
         w.write_all(&0u32.to_le_bytes())?;
 
         let mut count: u32 = 0;
-        let mut step_buf = vec![0u32; MAX_TOKENS_PER_SEQ];
         for c in &files {
             for s in c.split(|ch| ch == '.' || ch == '\n' || ch == '!' || ch == '?') {
                 let s = s.trim();
@@ -1134,9 +1433,9 @@ pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer,
                 let mut t = tokenizer.encode(s);
                 if t.len() < MIN_TOKENS_PER_SEQ { continue; }
                 if t.len() > MAX_TOKENS_PER_SEQ { t.truncate(MAX_TOKENS_PER_SEQ); }
-                else if t.len() < MAX_TOKENS_PER_SEQ { t.resize(MAX_TOKENS_PER_SEQ, 0); }
-                for (i, &tok) in t.iter().enumerate() { step_buf[i] = tok as u32; }
-                for &tok in &step_buf { w.write_all(&tok.to_le_bytes())?; }
+                let len = t.len().min(u32::MAX as usize) as u32;
+                w.write_all(&len.to_le_bytes())?;
+                for &tok in &t { w.write_all(&(tok as u32).to_le_bytes())?; }
                 count = count.saturating_add(1);
                 if count >= MAX_SEQS_PER_EPOCH as u32 { break; }
             }
@@ -1204,6 +1503,10 @@ pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer,
         let tok_s = seq_s * fixed_len as f32;
         println!("Epoch {}/{} done  |  loss={:.6}  |  {:.1}s  |  {:.0} seq/s  ({:.0} tok/s)  |  lr={:.6}",
                  epoch+1, PRETRAIN_EPOCHS, avg, et.as_secs_f32(), seq_s, tok_s, current_lr);
+        if !checkpoint_path.is_empty() {
+            println!("  Saving checkpoint to {} ...", checkpoint_path);
+            model.save_checkpoint(checkpoint_path).ok();
+        }
         current_lr *= 0.85;
     }
 

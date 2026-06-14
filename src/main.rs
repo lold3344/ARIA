@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod model_cuda;
 mod adaptive_softmax;
 mod tokenizer;
@@ -59,34 +61,32 @@ fn main() -> anyhow::Result<()> {
     let embed_dim = 1024;
     let hidden_dim = 2048;
 
-    let model_path = "aria_model.json";
+    let checkpoint_path = "aria_checkpoint.json";
     let tokenizer_path = "aria_tokenizer.json";
 
-    let model_exists = std::path::Path::new(model_path).exists();
+    let checkpoint_exists = std::path::Path::new(checkpoint_path).exists();
     let tokenizer_exists = std::path::Path::new(tokenizer_path).exists();
+    let continue_train = std::env::var("ARIA_CONTINUE_TRAIN").is_ok();
 
-    let (mut model, mut tokenizer) = if model_exists && tokenizer_exists {
-        println!("Loading pre-trained model and tokenizer...");
+    let (mut model, mut tokenizer) = if checkpoint_exists && tokenizer_exists && !continue_train {
+        println!("Loading checkpoint and tokenizer...");
         let t = Tokenizer::load(tokenizer_path)?;
-        let actual_vocab = t.vocab_size();
-        match LSTMModelCuda::load(model_path, actual_vocab, embed_dim, hidden_dim) {
-            Ok(m) => {
-                println!("Model loaded. Vocabulary: {}\n", actual_vocab);
-                (m, t)
-            },
-            _ => {
-                println!("Failed to load model. Training from scratch.\n");
-                let mut t = Tokenizer::new();
-                let m = train_fresh(&mut t, data_dir, embed_dim, hidden_dim)?;
-                m.save(model_path).ok();
-                t.save(tokenizer_path).ok();
-                (m, t)
-            }
-        }
+        let m = LSTMModelCuda::load_checkpoint(checkpoint_path)?;
+        println!("Checkpoint loaded. Vocabulary: {}\n", t.vocab_size());
+        (m, t)
+    } else if checkpoint_exists && tokenizer_exists && continue_train {
+        println!("Loading checkpoint and tokenizer for continued training...");
+        let mut t = Tokenizer::load(tokenizer_path)?;
+        let mut m = LSTMModelCuda::load_checkpoint(checkpoint_path)?;
+        println!("Checkpoint loaded. Continuing training...\n");
+        model_cuda::pretrain_from_files(&mut m, &mut t, data_dir, checkpoint_path).ok();
+        m.save_checkpoint(checkpoint_path).ok();
+        t.save(tokenizer_path).ok();
+        (m, t)
     } else {
         let mut t = Tokenizer::new();
-        let m = train_fresh(&mut t, data_dir, embed_dim, hidden_dim)?;
-        m.save(model_path).ok();
+        let m = train_fresh(&mut t, data_dir, checkpoint_path, embed_dim, hidden_dim)?;
+        m.save_checkpoint(checkpoint_path).ok();
         t.save(tokenizer_path).ok();
         (m, t)
     };
@@ -284,7 +284,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn train_fresh(tokenizer: &mut Tokenizer, data_dir: &str, embed_dim: usize, hidden_dim: usize) -> anyhow::Result<LSTMModelCuda> {
+fn train_fresh(tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str, embed_dim: usize, hidden_dim: usize) -> anyhow::Result<LSTMModelCuda> {
     println!("Building vocabulary from data...\n");
 
     let path = std::path::Path::new(data_dir);
@@ -309,7 +309,7 @@ fn train_fresh(tokenizer: &mut Tokenizer, data_dir: &str, embed_dim: usize, hidd
     let mut model = LSTMModelCuda::new(actual_vocab, embed_dim, hidden_dim);
 
     println!("Pre-training...");
-    model_cuda::pretrain_from_files(&mut model, tokenizer, data_dir).ok();
+    model_cuda::pretrain_from_files(&mut model, tokenizer, data_dir, checkpoint_path).ok();
 
     println!("Math curriculum...");
     math_train::train_math_curriculum(&mut model, tokenizer, "Math_Learn", 0.0003).ok();

@@ -158,12 +158,14 @@ extern "C" __global__ void asm_softmax(__half* x, int n, int batch)
 
     float s = 0.0f;
     for (int i = tid; i < n; i += 32) {
-        float e = __expf(__half2float(r[i]) - mx);
+        float v = __half2float(r[i]) - mx;
+        if (v < -30.0f) v = -30.0f;  // prevent underflow to zero
+        float e = __expf(v);
         r[i] = __float2half(e);
         s += e;
     }
     for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffff, s, off);
-    float inv = __frcp_rn(s);
+    float inv = s > 0.0f ? __frcp_rn(s) : 0.0f;
     for (int i = tid; i < n; i += 32) r[i] = __float2half(__half2float(r[i]) * inv);
 }
 
@@ -183,13 +185,15 @@ extern "C" __global__ void asm_ce_grad(
     __syncthreads();
 
     float local_loss = 0.0f;
-    if (row < batch && tid == 0) {
+    if (row < batch) {
         int t = targets[row];
-        if (t >= 0) {
+        if (t >= 0 && tid == 0) {
             int ti = t - offset;
             float p = __half2float(probs[row * n + ti]);
             local_loss = -(p > 1e-30f ? __logf(p) : -30.0f);
             probs[row * n + ti] = __float2half(__half2float(probs[row * n + ti]) - 1.0f);
+        } else if (t < 0) {
+            for (int i = tid; i < n; i += 32) probs[row * n + i] = __float2half(0.0f);
         }
     }
     if (tid == 0) atomicAdd(&shmem[0], local_loss);
