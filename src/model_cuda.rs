@@ -538,6 +538,11 @@ impl LSTMModelCuda {
     //  train_batch
     // ──────────────────────────────────────────────────────────────
     pub fn train_batch(&mut self, sequences: &[Vec<usize>], learning_rate: f64) -> f32 {
+        let masks: Vec<Vec<f32>> = sequences.iter().map(|s| vec![1.0f32; s.len().saturating_sub(1)]).collect();
+        self.train_batch_masked(sequences, &masks, learning_rate)
+    }
+
+    pub fn train_batch_masked(&mut self, sequences: &[Vec<usize>], masks: &[Vec<f32>], learning_rate: f64) -> f32 {
         let stream = Arc::clone(&self.stream);
         let li = self.loss_idx;
         let prev_li = 1 - li;
@@ -549,11 +554,13 @@ impl LSTMModelCuda {
             0.0
         };
 
-        let valid: Vec<&Vec<usize>> = sequences.iter().filter(|s| s.len() >= 2).collect();
+        let valid: Vec<(&Vec<usize>, &Vec<f32>)> = sequences.iter().zip(masks.iter())
+            .filter(|(s, _)| s.len() >= 2)
+            .collect();
         if valid.is_empty() { return 0.0; }
 
         let batch   = valid.len();
-        let max_len = valid.iter().map(|s| s.len()).max().unwrap();
+        let max_len = valid.iter().map(|(s, _)| s.len()).max().unwrap();
         let steps   = max_len.saturating_sub(1);
         let E  = self.embed_dim;
         let H  = self.hidden_dim;
@@ -565,12 +572,12 @@ impl LSTMModelCuda {
         let mut input_flat  = vec![0i32; batch * max_len];
         let mut target_flat = vec![0i32; batch * max_len];
         let mut mask_flat   = vec![0.0f32; batch * max_len];
-        for (b, seq) in valid.iter().enumerate() {
+        for (b, (seq, mask)) in valid.iter().enumerate() {
             for (t, &tk) in seq.iter().enumerate() {
                 if t + 1 < seq.len() {
                     input_flat [b * max_len + t] = tk as i32;
                     target_flat[b * max_len + t] = seq[t+1] as i32;
-                    mask_flat  [b * max_len + t] = 1.0;
+                    mask_flat  [b * max_len + t] = *mask.get(t).unwrap_or(&0.0f32);
                 }
             }
         }
@@ -1325,6 +1332,57 @@ fn load_seq_cache_packed_chunked(path: &str, fixed_len: usize, max_seqs: usize) 
     Some(seqs)
 }
 
+// Packed cache v3: header count, then each record = seq_len (u32) + tokens[seq_len] + mask_len (u32) + f32[mask_len]
+fn save_seq_cache_masked(path: &str, seqs: &[Vec<usize>], masks: &[Vec<f32>], fixed_len: usize) {
+    let file = match fs::File::create(path) { Ok(f) => f, Err(_) => return };
+    let mut w = BufWriter::new(file);
+    let count = seqs.len().min(masks.len()).min(u32::MAX as usize) as u32;
+    w.write_all(&count.to_le_bytes()).ok();
+    for (seq, mask) in seqs.iter().zip(masks.iter()).take(count as usize) {
+        let len = seq.len().min(fixed_len).min(u32::MAX as usize) as u32;
+        w.write_all(&len.to_le_bytes()).ok();
+        for &tok in &seq[..len as usize] { w.write_all(&(tok as u32).to_le_bytes()).ok(); }
+        let mlen = mask.len().min(len as usize).min(u32::MAX as usize) as u32;
+        w.write_all(&mlen.to_le_bytes()).ok();
+        for &v in &mask[..mlen as usize] { w.write_all(&v.to_le_bytes()).ok(); }
+    }
+    w.flush().ok();
+}
+
+fn load_seq_cache_masked_chunked(path: &str, fixed_len: usize, max_seqs: usize) -> Option<(Vec<Vec<usize>>, Vec<Vec<f32>>)> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut header = [0u8; 4];
+    file.read_exact(&mut header).ok()?;
+    let file_count = u32::from_le_bytes(header) as usize;
+    let count = file_count.min(max_seqs);
+    let mut seqs = Vec::with_capacity(count);
+    let mut masks = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut len_buf = [0u8; 4];
+        file.read_exact(&mut len_buf).ok()?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+        let len = len.min(fixed_len);
+        let mut buf = vec![0u8; len * 4];
+        file.read_exact(&mut buf).ok()?;
+        let seq: Vec<usize> = (0..len)
+            .map(|k| u32::from_le_bytes(buf[k*4..k*4+4].try_into().unwrap()) as usize)
+            .collect();
+
+        let mut mlen_buf = [0u8; 4];
+        file.read_exact(&mut mlen_buf).ok()?;
+        let mlen = u32::from_le_bytes(mlen_buf) as usize;
+        let mlen = mlen.min(len);
+        let mut mbuf = vec![0u8; mlen * 4];
+        file.read_exact(&mut mbuf).ok()?;
+        let mask: Vec<f32> = (0..mlen)
+            .map(|k| f32::from_le_bytes(mbuf[k*4..k*4+4].try_into().unwrap()))
+            .collect();
+        seqs.push(seq);
+        masks.push(mask);
+    }
+    Some((seqs, masks))
+}
+
 #[allow(dead_code)]
 fn load_seq_cache_packed(path: &str, fixed_len: usize) -> Option<Vec<Vec<usize>>> {
     load_seq_cache_packed_chunked(path, fixed_len, usize::MAX)
@@ -1371,9 +1429,10 @@ const MIN_TOKENS_PER_SEQ:  usize = 6;
 const PRETRAIN_EPOCHS:     usize = 5;
 const PRETRAIN_BATCH_SIZE: usize = 1024;
 const MAX_SEQS_PER_EPOCH:  usize = 500_000;
+const DIALOG_FILE:         &str  = "DataBase_roles.jsonl";
 
 pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str, tokenizer_path: &str) -> anyhow::Result<()> {
-    let _max_seqs: usize = std::env::var("ARIA_MAX_SEQS")
+    let max_seqs: usize = std::env::var("ARIA_MAX_SEQS")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(MAX_SEQS_PER_EPOCH);
 
     let path = Path::new(data_dir);
@@ -1382,154 +1441,143 @@ pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer,
     let start = Instant::now();
 
     println!("\n===============================================");
-    println!("       ARIA - CUDA FP16 TRAINING              ");
+    println!("       ARIA - DIALOG SFT (CUDA FP16)           ");
     println!("===============================================");
     println!("LR: {}  Epochs: {}  Batch: {}  SeqLen: {}", LEARNING_RATE, PRETRAIN_EPOCHS, PRETRAIN_BATCH_SIZE, MAX_TOKENS_PER_SEQ);
     println!("===============================================\n");
 
-    let cache_path = format!("{}/sequences_cache_v{}_len{}.bin", data_dir, tokenizer.vocab_size(), MAX_TOKENS_PER_SEQ);
+    // Use only the dialog JSONL; cache holds seq+mask pairs.
+    let data_path = path.join(DIALOG_FILE);
+    if !data_path.exists() {
+        println!("Dialog file not found: {:?}", data_path);
+        return Ok(());
+    }
+    let cache_path = format!("{}/sequences_cache_masked_v{}_len{}.bin", data_dir, tokenizer.vocab_size(), MAX_TOKENS_PER_SEQ);
     let _ = fs::remove_file(format!("{}/sequences_cache.bin", data_dir));
     let _ = fs::remove_file(format!("{}/sequences_cache_v{}.bin", data_dir, tokenizer.vocab_size()));
+    let _ = fs::remove_file(format!("{}/sequences_cache_v{}_len{}.bin", data_dir, tokenizer.vocab_size(), MAX_TOKENS_PER_SEQ));
 
-    let mut all_seqs: Vec<Vec<usize>> = if let Some(cached) = load_seq_cache_packed_chunked(&cache_path, MAX_TOKENS_PER_SEQ, MAX_SEQS_PER_EPOCH) {
-        println!("Loaded {} sequences from packed cache\n", cached.len());
+    let (mut all_seqs, mut all_masks) = if let Some(cached) = load_seq_cache_masked_chunked(&cache_path, MAX_TOKENS_PER_SEQ, max_seqs) {
+        println!("Loaded {} masked sequences from cache\n", cached.0.len());
         cached
     } else {
-        use rayon::prelude::*;
         #[derive(serde::Deserialize)]
         struct DialogRecord { text: String }
 
-        let entries: Vec<(std::path::PathBuf, String)> = fs::read_dir(path)?
-            .par_bridge()
-            .filter_map(|e| {
-                let e = e.ok()?;
-                let p = e.path();
-                let ext = p.extension().and_then(|x| x.to_str())?;
-                if ext == "txt" {
-                    let c = fs::read_to_string(&p).ok()?;
-                    if !c.trim().is_empty() { return Some((p, c)); }
-                } else if ext == "jsonl" {
-                    let c = fs::read_to_string(&p).ok()?;
-                    if !c.trim().is_empty() { return Some((p, c)); }
-                }
-                None
-            })
-            .collect();
-
-        println!("Loaded {} files", entries.len());
-        if entries.is_empty() { return Ok(()); }
-
-        println!("Streaming tokenized sequences to cache...");
+        let text = fs::read_to_string(&data_path)?;
+        println!("Streaming dialog sequences to masked cache...");
         let cache_file = fs::File::create(&cache_path)?;
         let mut w = BufWriter::new(cache_file);
         w.write_all(&0u32.to_le_bytes())?;
 
         let mut count: u32 = 0;
-        for (p, c) in &entries {
-            let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
-            if ext == "jsonl" {
-                for line in c.lines() {
-                    let line = line.trim();
-                    if line.is_empty() { continue; }
-                    let text: String = match serde_json::from_str::<DialogRecord>(line) {
-                        Ok(rec) => rec.text,
-                        Err(_) => continue,
-                    };
-                    if text.trim().len() <= 5 { continue; }
-                    let mut t = tokenizer.encode(&text);
-                    if t.len() < MIN_TOKENS_PER_SEQ { continue; }
-                    if t.len() > MAX_TOKENS_PER_SEQ { t.truncate(MAX_TOKENS_PER_SEQ); }
-                    let len = t.len().min(u32::MAX as usize) as u32;
-                    w.write_all(&len.to_le_bytes())?;
-                    for &tok in &t { w.write_all(&(tok as u32).to_le_bytes())?; }
-                    count = count.saturating_add(1);
-                    if count >= MAX_SEQS_PER_EPOCH as u32 { break; }
-                }
-            } else {
-                for s in c.split(|ch| ch == '.' || ch == '\n' || ch == '!' || ch == '?') {
-                    let s = s.trim();
-                    if s.len() <= 5 { continue; }
-                    let mut t = tokenizer.encode(s);
-                    if t.len() < MIN_TOKENS_PER_SEQ { continue; }
-                    if t.len() > MAX_TOKENS_PER_SEQ { t.truncate(MAX_TOKENS_PER_SEQ); }
-                    let len = t.len().min(u32::MAX as usize) as u32;
-                    w.write_all(&len.to_le_bytes())?;
-                    for &tok in &t { w.write_all(&(tok as u32).to_le_bytes())?; }
-                    count = count.saturating_add(1);
-                    if count >= MAX_SEQS_PER_EPOCH as u32 { break; }
-                }
-            }
-            if count >= MAX_SEQS_PER_EPOCH as u32 { break; }
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() { continue; }
+            let rec: DialogRecord = match serde_json::from_str(line) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if rec.text.trim().len() <= 5 { continue; }
+            let (mut seq, mut mask) = tokenizer.encode_dialog(&rec.text);
+            if seq.len() < MIN_TOKENS_PER_SEQ { continue; }
+            if seq.len() > MAX_TOKENS_PER_SEQ { seq.truncate(MAX_TOKENS_PER_SEQ); mask.truncate(MAX_TOKENS_PER_SEQ.saturating_sub(1)); }
+            let len = seq.len().min(u32::MAX as usize) as u32;
+            w.write_all(&len.to_le_bytes())?;
+            for &tok in &seq { w.write_all(&(tok as u32).to_le_bytes())?; }
+            let mlen = mask.len().min(len as usize) as u32;
+            w.write_all(&mlen.to_le_bytes())?;
+            for &v in &mask[..mlen as usize] { w.write_all(&v.to_le_bytes())?; }
+            count = count.saturating_add(1);
+            if count >= max_seqs as u32 { break; }
         }
         w.flush()?;
         drop(w);
         let mut cache_file = fs::File::options().write(true).open(&cache_path)?;
         cache_file.seek(SeekFrom::Start(0))?;
         cache_file.write_all(&count.to_le_bytes())?;
-        println!("Saved packed cache: {} sequences\n", count);
+        println!("Saved masked cache: {} sequences\n", count);
 
-        load_seq_cache_packed_chunked(&cache_path, MAX_TOKENS_PER_SEQ, MAX_SEQS_PER_EPOCH)
+        load_seq_cache_masked_chunked(&cache_path, MAX_TOKENS_PER_SEQ, max_seqs)
             .unwrap_or_default()
     };
 
     println!("{} sequences total\n", all_seqs.len());
     if all_seqs.is_empty() { return Ok(()); }
 
-    let use_count = all_seqs.len().min(MAX_SEQS_PER_EPOCH);
-    let total_batches = (use_count + PRETRAIN_BATCH_SIZE - 1) / PRETRAIN_BATCH_SIZE;
+    let use_count = all_seqs.len().min(max_seqs);
+    let _total_batches = (use_count + PRETRAIN_BATCH_SIZE - 1) / PRETRAIN_BATCH_SIZE;
 
-    // Train / validation split: keep last 5% as eval, never shuffled into train
     let val_count = (use_count / 20).max(1).min(use_count / 10);
     let train_count = use_count - val_count;
-    let (train_seqs, val_seqs) = all_seqs.split_at(train_count);
+    let train_masks = all_masks.split_off(val_count);
+    let train_seqs = all_seqs.split_off(val_count);
+    let val_seqs = all_seqs;
+    let val_masks = all_masks;
     println!("Using {} train + {} val sequences per epoch\n", train_count, val_count);
 
     let mut current_lr: f64 = std::env::var("ARIA_LR")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(LEARNING_RATE);
     let fixed_len = MAX_TOKENS_PER_SEQ;
     let train_batches = (train_count + PRETRAIN_BATCH_SIZE - 1) / PRETRAIN_BATCH_SIZE;
-    let val_batches   = (val_count + PRETRAIN_BATCH_SIZE - 1) / PRETRAIN_BATCH_SIZE;
+    let _val_batches   = (val_count + PRETRAIN_BATCH_SIZE - 1) / PRETRAIN_BATCH_SIZE;
 
+    let mut rng = rand::thread_rng();
     for epoch in 0..PRETRAIN_EPOCHS {
         let ep = Instant::now();
         let mut last_report = Instant::now();
-        let mut epoch_train = train_seqs.to_vec();
-        epoch_train.shuffle(&mut rand::thread_rng());
         let mut total_loss = 0.0f32;
         let mut batches    = 0usize;
         let mut seqs_done  = 0usize;
 
         let mut batch_buf: Vec<Vec<usize>> = Vec::with_capacity(PRETRAIN_BATCH_SIZE);
-        for chunk in epoch_train.chunks(PRETRAIN_BATCH_SIZE) {
+        let mut mask_buf:  Vec<Vec<f32>>  = Vec::with_capacity(PRETRAIN_BATCH_SIZE);
+
+        // Shuffle indices once per epoch to keep seq/mask aligned
+        let mut idx: Vec<usize> = (0..train_count).collect();
+        idx.shuffle(&mut rng);
+        for i in 0..train_batches {
+            let start_idx = i * PRETRAIN_BATCH_SIZE;
+            let end_idx = ((i + 1) * PRETRAIN_BATCH_SIZE).min(train_count);
             batch_buf.clear();
-            batch_buf.extend(chunk.iter().cloned());
-            let loss = model.train_batch(&batch_buf, current_lr);
-            if loss.is_finite() { total_loss += loss; batches += 1; }
-            if batches <= 10 {
-                println!("    [batch {}] loss={:.4} total_loss={:.4} avg={:.4}", batches, loss, total_loss, total_loss / batches.max(1) as f32);
+            mask_buf.clear();
+            for &j in &idx[start_idx..end_idx] {
+                batch_buf.push(train_seqs[j].clone());
+                mask_buf.push(train_masks[j].clone());
             }
-            seqs_done += chunk.len();
+            let loss = model.train_batch_masked(&batch_buf, &mask_buf, current_lr);
+            if loss.is_finite() { total_loss += loss; batches += 1; }
+            if i < 10 {
+                println!("    [batch {}] loss={:.4} total_loss={:.4} avg={:.4}", i+1, loss, total_loss, total_loss / batches.max(1) as f32);
+            }
+            seqs_done += batch_buf.len();
 
             if last_report.elapsed().as_secs_f32() >= 1.0 {
                 let avg       = total_loss / batches.max(1) as f32;
                 let elapsed   = ep.elapsed().as_secs_f32();
                 let seq_s     = seqs_done as f32 / elapsed;
-                let remaining = train_batches.saturating_sub(batches);
+                let remaining = train_batches.saturating_sub(i + 1);
                 let tokens_s  = seq_s * fixed_len as f32;
                 println!("  Epoch {}/{}  |  batch {}/{}  ({} remaining)  |  loss={:.4}  |  {:.0} seq/s  ({:.0} tok/s)",
-                         epoch+1, PRETRAIN_EPOCHS, batches, train_batches, remaining, avg, seq_s, tokens_s);
+                         epoch+1, PRETRAIN_EPOCHS, i+1, train_batches, remaining, avg, seq_s, tokens_s);
                 std::io::stdout().flush().ok();
                 last_report = Instant::now();
             }
         }
 
-        // Validation pass (no gradient update)
+        // Validation pass with masked loss (no gradient update)
         let mut val_loss = 0.0f32;
         let mut val_batches_done = 0usize;
-        for chunk in val_seqs.chunks(PRETRAIN_BATCH_SIZE) {
+        for i in 0..((val_count + PRETRAIN_BATCH_SIZE - 1) / PRETRAIN_BATCH_SIZE) {
+            let start_idx = i * PRETRAIN_BATCH_SIZE;
+            let end_idx = ((i + 1) * PRETRAIN_BATCH_SIZE).min(val_count);
             batch_buf.clear();
-            batch_buf.extend(chunk.iter().cloned());
-            let loss = model.train_batch(&batch_buf, 0.0);
+            mask_buf.clear();
+            for j in start_idx..end_idx {
+                batch_buf.push(val_seqs[j].clone());
+                mask_buf.push(val_masks[j].clone());
+            }
+            let loss = model.train_batch_masked(&batch_buf, &mask_buf, 0.0);
             if loss.is_finite() { val_loss += loss; val_batches_done += 1; }
         }
         let val_avg = val_loss / val_batches_done.max(1) as f32;

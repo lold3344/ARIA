@@ -4,12 +4,16 @@ use std::io::Write;
 use rayon::prelude::*;
 use ocl::{Buffer, Context, Device, DeviceType, Kernel, Platform, Program, Queue};
 
-const PAD:   usize = 0;
-const UNK:   usize = 1;
-const START: usize = 2;
-const END:   usize = 3;
-const SPACE: usize = 4;
-const SPACE_TOKEN: &str = "<SP>";
+const PAD:        usize = 0;
+const UNK:        usize = 1;
+const START:      usize = 2;
+const END:        usize = 3;
+const SPACE:      usize = 4;
+const USER:       usize = 5;
+const ASSISTANT:  usize = 6;
+const SPACE_TOKEN:    &str = "<SP>";
+const USER_TOKEN:     &str = "<USER>";
+const ASSISTANT_TOKEN:&str = "<ASSISTANT>";
 
 const PUNCTUATION: &[&str] = &[".", ",", "!", "?", ";", ":", "\"", "'", "(", ")", "-"];
 
@@ -511,6 +515,8 @@ impl Tokenizer {
         t.add_special("<START>", START);
         t.add_special("<END>",   END);
         t.add_special(SPACE_TOKEN, SPACE);
+        t.add_special(USER_TOKEN, USER);
+        t.add_special(ASSISTANT_TOKEN, ASSISTANT);
         t
     }
 
@@ -550,7 +556,7 @@ impl Tokenizer {
         let mut sorted_chars: Vec<String> = chars.into_iter().collect();
         sorted_chars.sort();
 
-        let mut next_id = 5usize; // 0-4 reserved for special tokens incl. SPACE
+        let mut next_id = 7usize; // 0-6 reserved for special tokens incl. SPACE, USER, ASSISTANT
         for tok in &sorted_chars {
             if !self.token_to_id.contains_key(tok) {
                 self.token_to_id.insert(tok.clone(), next_id);
@@ -613,16 +619,63 @@ impl Tokenizer {
         }
 
         let mut tokens = vec![START];
-        // Replace newlines with spaces so multi-line dialog records stay as one sequence.
-        let cleaned = clean_line(&text.replace('\n', " "));
-        let mut word_buf = String::new();
+        self.encode_text_to_tokens(&clean_line(&text.replace('\n', " ")), &mut tokens);
+        tokens.push(END);
+        tokens
+    }
 
-        for c in cleaned.chars() {
+    // Encode text and build a target mask for supervised dialog fine-tuning.
+    // Uses explicit role tokens:
+    //   <START> <USER> ... <ASSISTANT> ... <END>
+    // mask[t] == 1.0 means the target token at position t (seq[t+1]) is inside the
+    // assistant turn and should contribute to the loss. Only supports the format:
+    //   Пользователь: ...\nАссистент: ...
+    pub fn encode_dialog(&mut self, text: &str) -> (Vec<usize>, Vec<f32>) {
+        let mut tokens = vec![START];
+        let turns: Vec<&str> = text.split('\n').collect();
+
+        let mut assistant_token_start: Option<usize> = None;
+        for turn in turns {
+            let trimmed = turn.trim();
+            if trimmed.is_empty() { continue; }
+            if let Some(rest) = trimmed.strip_prefix("Пользователь:") {
+                tokens.push(USER);
+                self.encode_text_to_tokens(&clean_line(rest), &mut tokens);
+            } else if let Some(rest) = trimmed.strip_prefix("Ассистент:") {
+                tokens.push(ASSISTANT);
+                assistant_token_start = Some(tokens.len());
+                self.encode_text_to_tokens(&clean_line(rest), &mut tokens);
+            } else {
+                // Unknown turn header: treat as user text (not trained).
+                tokens.push(USER);
+                self.encode_text_to_tokens(&clean_line(trimmed), &mut tokens);
+            }
+        }
+        tokens.push(END);
+
+        // One mask entry per target position (tokens.len() - 1). Only assistant tokens are
+        // trained; the final <END> is also trained so the model learns to stop.
+        let mut mask = vec![0.0f32; tokens.len() - 1];
+        if let Some(start) = assistant_token_start {
+            // To predict the first assistant content token, we train on the target position
+            // right after the ASSISTANT token. The final END target is also trained.
+            let from = start;
+            let to = tokens.len().saturating_sub(1); // exclusive
+            for t in from..to {
+                if t < mask.len() { mask[t] = 1.0f32; }
+            }
+        }
+        (tokens, mask)
+    }
+
+    fn encode_text_to_tokens(&self, text: &str, tokens: &mut Vec<usize>) {
+        let mut word_buf = String::new();
+        for c in text.chars() {
             if c.is_alphabetic() || c.is_ascii_digit() {
                 word_buf.push(c);
             } else if c == ' ' {
                 if !word_buf.is_empty() {
-                    encode_word(&word_buf, &mut tokens, &self.token_to_id, &self.merge_rank);
+                    encode_word(&word_buf, tokens, &self.token_to_id, &self.merge_rank);
                     word_buf.clear();
                 }
                 if tokens.last() != Some(&SPACE) {
@@ -630,7 +683,7 @@ impl Tokenizer {
                 }
             } else if is_punctuation(c) {
                 if !word_buf.is_empty() {
-                    encode_word(&word_buf, &mut tokens, &self.token_to_id, &self.merge_rank);
+                    encode_word(&word_buf, tokens, &self.token_to_id, &self.merge_rank);
                     word_buf.clear();
                 }
                 if let Some(&id) = self.token_to_id.get(&c.to_string()) {
@@ -639,10 +692,8 @@ impl Tokenizer {
             }
         }
         if !word_buf.is_empty() {
-            encode_word(&word_buf, &mut tokens, &self.token_to_id, &self.merge_rank);
+            encode_word(&word_buf, tokens, &self.token_to_id, &self.merge_rank);
         }
-        tokens.push(END);
-        tokens
     }
 
     pub fn vocab_size(&self) -> usize { self.token_to_id.len() }
@@ -693,7 +744,7 @@ impl Tokenizer {
         let merges_list: Vec<[String; 2]> = self.merges.iter()
             .map(|(a, b)| [a.clone(), b.clone()]).collect();
         let data = serde_json::json!({
-            "version": "bpe_v2_cyrillic",
+            "version": "bpe_v3_roles",
             "merges_hash": self.merges_hash,
             "word_to_id":  self.token_to_id,
             "id_to_word":  id_to_word_str,
@@ -708,7 +759,7 @@ impl Tokenizer {
 
         // Version guard — refuse to load old tokenizers
         let ver = data["version"].as_str().unwrap_or("");
-        if ver != "bpe_v2_cyrillic" {
+        if ver != "bpe_v3_roles" {
             anyhow::bail!("Stale tokenizer (version='{}'), please retrain from scratch", ver);
         }
 
@@ -746,10 +797,18 @@ impl Tokenizer {
         t.merge_rank  = t.merges.iter().enumerate()
             .map(|(i, (a, b))| ((a.clone(), b.clone()), i)).collect();
 
-        // Ensure SPACE and punctuation tokens exist in a loaded tokenizer
+        // Ensure reserved special tokens exist in a loaded tokenizer
         if !t.token_to_id.contains_key(SPACE_TOKEN) {
             t.token_to_id.insert(SPACE_TOKEN.to_string(), SPACE);
             t.id_to_token.insert(SPACE, SPACE_TOKEN.to_string());
+        }
+        if !t.token_to_id.contains_key(USER_TOKEN) {
+            t.token_to_id.insert(USER_TOKEN.to_string(), USER);
+            t.id_to_token.insert(USER, USER_TOKEN.to_string());
+        }
+        if !t.token_to_id.contains_key(ASSISTANT_TOKEN) {
+            t.token_to_id.insert(ASSISTANT_TOKEN.to_string(), ASSISTANT);
+            t.id_to_token.insert(ASSISTANT, ASSISTANT_TOKEN.to_string());
         }
         let mut next_id = t.token_to_id.len();
         for p in PUNCTUATION {

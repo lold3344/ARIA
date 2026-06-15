@@ -40,7 +40,9 @@ fn main() -> anyhow::Result<()> {
 
     let encryptor = EncryptionManager::new(&encryption_key)?;
 
-    let db_path = "aria_dialogs.json";
+    let json_dir = "aria json";
+    fs::create_dir_all(&json_dir)?;
+    let db_path = "aria json/aria_dialogs.json";
     db::init_db(db_path)?;
 
     let data_dir = "data base";
@@ -61,8 +63,8 @@ fn main() -> anyhow::Result<()> {
     let embed_dim = 1024;
     let hidden_dim = 2048;
 
-    let checkpoint_path = "aria_checkpoint.json";
-    let tokenizer_path = "aria_tokenizer.json";
+    let checkpoint_path = "aria json/aria_checkpoint.json";
+    let tokenizer_path = "aria json/aria_tokenizer.json";
 
     let checkpoint_exists = std::path::Path::new(checkpoint_path).exists();
     let tokenizer_exists = std::path::Path::new(tokenizer_path).exists();
@@ -178,7 +180,9 @@ fn main() -> anyhow::Result<()> {
         }
         if input.is_empty() { continue; }
 
-        let tokens = tokenizer.encode(input);
+        // Build role-formatted prompt for the model.
+        let prompt = format!("Пользователь: {}\nАссистент:", input);
+        let tokens = tokenizer.encode(&prompt);
         if tokens.len() < 3 { continue; }
 
         let user_entry_id = Uuid::new_v4().to_string();
@@ -196,8 +200,8 @@ fn main() -> anyhow::Result<()> {
         let (mut current_logits, mut current_state) = model.forward_seq(input_no_end);
         let mut generated_tokens: Vec<usize> = Vec::new();
 
-        for _ in 0..50 {
-            // Constrained decoding: block non-Cyrillic tokens
+        // Greedy / short decoding for stable dialog: stop at END or after 40 tokens.
+        for _ in 0..40 {
             tokenizer.mask_logits(&mut current_logits);
 
             let action = match mode {
@@ -207,8 +211,7 @@ fn main() -> anyhow::Result<()> {
             };
 
             if action >= tokenizer.vocab_size() { break; }
-            if action == 3 { break; }
-            if action == 0 { break; }
+            if action == 3 || action == 0 { break; }
             if action == 1 { continue; }
 
             generated_tokens.push(action);
@@ -228,42 +231,6 @@ fn main() -> anyhow::Result<()> {
         };
         db::insert_dialog(db_path, &aria_entry, &session_id)?;
         stats.total_messages += 1;
-
-        print!("Rate (I like / I dont like / skip): ");
-        io::stdout().flush()?;
-
-        let mut rating = String::new();
-        io::stdin().read_line(&mut rating)?;
-        let rating = rating.trim();
-
-        let reward = if rating.starts_with("I like") {
-            stats.positive_rewards += 1; 1.0f32
-        } else if rating.starts_with("I dont like") {
-            stats.negative_rewards += 1; -1.0f32
-        } else { 0.0f32 };
-
-        if reward != 0.0 {
-            db::update_dialog_reward(db_path, &aria_entry_id, reward)?;
-            println!("Reward: {}", if reward > 0.0 { "+1" } else { "-1" });
-
-            let mut combined: Vec<usize> = input_no_end.to_vec();
-            combined.extend(generated_tokens.iter().copied());
-            combined.push(3);
-
-            if combined.len() >= 3 {
-                if reward > 0.0 {
-                    // Reinforce: gradient descent, make this response more likely.
-                    let loss = model.backward_step(&combined, 0.0005);
-                    stats.total_loss += loss;
-                    println!("Reinforced (loss = {:.4})\n", loss);
-                } else {
-                    // Punish: gradient ascent, make this response less likely.
-                    let loss = model.backward_step(&combined, -0.0002);
-                    stats.total_loss += loss.abs();
-                    println!("Penalized (loss = {:.4})\n", loss);
-                }
-            }
-        }
     }
 
     Ok(())

@@ -8,8 +8,8 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().collect();
     let prompt = args.get(1).cloned().unwrap_or_else(|| "привет".to_string());
 
-    let model_path = "aria_checkpoint.json";
-    let tokenizer_path = "aria_tokenizer.json";
+    let model_path = "aria json/aria_checkpoint.json";
+    let tokenizer_path = "aria json/aria_tokenizer.json";
 
     println!("Loading tokenizer from {}...", tokenizer_path);
     let mut tokenizer = Tokenizer::load(tokenizer_path)?;

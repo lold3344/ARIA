@@ -14,14 +14,16 @@ fn run_case(model: &LSTMModelCuda, tokenizer: &mut Tokenizer, name: &str, prompt
 }
 
 fn main() -> anyhow::Result<()> {
-    let model_path = "aria_checkpoint.json";
-    let tokenizer_path = "aria_tokenizer.json";
+    let model_path = "aria json/aria_checkpoint.json";
+    let tokenizer_path = "aria json/aria_tokenizer.json";
 
     println!("Loading tokenizer...");
     let mut tokenizer = Tokenizer::load(tokenizer_path)?;
     println!("Loading checkpoint...");
     let model = LSTMModelCuda::load_checkpoint(model_path)?;
     println!("Ready. vocab={}\n", tokenizer.vocab_size());
+
+    fs::create_dir_all("logs")?;
 
     let mut log = String::new();
     log.push_str(&format!("ARIA validation snapshot\nmodel: {}\ntokenizer: {}\nvocab: {}\n\n",
@@ -45,7 +47,7 @@ fn main() -> anyhow::Result<()> {
         log.push_str(&format!("[{}] {}\n  -> {}\n\n", name, prompt, response));
     }
 
-    fs::write("validation_log.txt", log)?;
-    println!("Results saved to validation_log.txt");
+    fs::write("logs/validation_log.txt", log)?;
+    println!("Results saved to logs/validation_log.txt");
     Ok(())
 }
