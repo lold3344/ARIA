@@ -19,3 +19,4 @@ validation_log.txt
 tokenizer_sample.txt
 aria_checkpoint.json
 /logs
+ARIA_Train_Full.bat
