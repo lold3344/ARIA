@@ -16,3 +16,5 @@ Math_Learn/phase2_train.jsonl
 aria_dialogs.json
 tokenizer_analysis.txt
 validation_log.txt
+tokenizer_sample.txt
+aria_checkpoint.json

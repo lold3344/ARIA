@@ -1,3 +1,5 @@
+# **This is a research tool. The author is not responsible for misuse, training data, or generated content.**
+
 # ARIA Wotan 3.1
 
 **ARIA Wotan 3.1** - локальная языковая модель на основе LSTM с обучением через обратную связь (RLHF-like), написанная на Rust. Вычисления выполняются на NVIDIA GPU через CUDA/cuBLAS с кастомными PTX ядрами.

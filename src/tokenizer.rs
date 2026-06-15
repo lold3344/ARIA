@@ -8,6 +8,15 @@ const PAD:   usize = 0;
 const UNK:   usize = 1;
 const START: usize = 2;
 const END:   usize = 3;
+const SPACE: usize = 4;
+const SPACE_TOKEN: &str = "<SP>";
+
+const PUNCTUATION: &[&str] = &[".", ",", "!", "?", ";", ":", "\"", "'", "(", ")", "-"];
+
+#[inline]
+fn is_punctuation(c: char) -> bool {
+    matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | '"' | '\'' | '(' | ')' | '-')
+}
 
 // Profanity / vulgar language roots used to filter vocabulary and generation.
 const BAD_ROOTS: &[&str] = &[
@@ -444,6 +453,17 @@ fn cpu_count_pairs(vocab: &[(Vec<String>, usize)]) -> HashMap<(String, String), 
         })
 }
 
+fn encode_word(word: &str, tokens: &mut Vec<usize>, token_to_id: &HashMap<String, usize>, merge_rank: &HashMap<(String, String), usize>) {
+    let w: String = word.chars().filter(|c| is_cyrillic(*c) || c.is_ascii_digit()).collect();
+    if w.is_empty() { return; }
+    let pieces = apply_merges(&w, merge_rank);
+    for piece in pieces {
+        if let Some(&id) = token_to_id.get(&piece) {
+            tokens.push(id);
+        }
+    }
+}
+
 fn apply_merges(word: &str, merge_rank: &HashMap<(String, String), usize>) -> Vec<String> {
     if word.is_empty() { return vec![]; }
     let mut pieces: Vec<String> = word.chars()
@@ -490,6 +510,7 @@ impl Tokenizer {
         t.add_special("<UNK>",   UNK);
         t.add_special("<START>", START);
         t.add_special("<END>",   END);
+        t.add_special(SPACE_TOKEN, SPACE);
         t
     }
 
@@ -529,7 +550,7 @@ impl Tokenizer {
         let mut sorted_chars: Vec<String> = chars.into_iter().collect();
         sorted_chars.sort();
 
-        let mut next_id = 4usize;
+        let mut next_id = 5usize; // 0-4 reserved for special tokens incl. SPACE
         for tok in &sorted_chars {
             if !self.token_to_id.contains_key(tok) {
                 self.token_to_id.insert(tok.clone(), next_id);
@@ -545,11 +566,21 @@ impl Tokenizer {
                 next_id += 1;
             }
         }
+        // Punctuation tokens
+        for p in PUNCTUATION {
+            if !self.token_to_id.contains_key(*p) {
+                self.token_to_id.insert(p.to_string(), next_id);
+                self.id_to_token.insert(next_id, p.to_string());
+                next_id += 1;
+            }
+        }
 
-        // Build allowed_ids: tokens that are purely Cyrillic/digit (for constrained decoding)
+        // Build allowed_ids: special tokens, space, punctuation, Cyrillic/digit tokens
         self.allowed_ids = self.token_to_id.iter()
             .filter(|(tok, _)| {
                 tok.starts_with('<') // special tokens allowed
+                || *tok == SPACE_TOKEN
+                || PUNCTUATION.contains(&tok.as_str())
                 || tok.chars().all(|c| is_cyrillic(c) || c.is_ascii_digit())
             })
             .map(|(_, &id)| id)
@@ -583,17 +614,31 @@ impl Tokenizer {
 
         let mut tokens = vec![START];
         let cleaned = clean_line(text);
-        for word in cleaned.split_whitespace() {
-            let w = clean_word(word);
-            if w.is_empty() { continue; }
-            let pieces = apply_merges(&w, &self.merge_rank);
-            for piece in pieces {
-                // Skip piece if not in vocab — don't emit UNK into training sequences
-                if let Some(&id) = self.token_to_id.get(&piece) {
+        let mut word_buf = String::new();
+
+        for c in cleaned.chars() {
+            if c.is_alphabetic() || c.is_ascii_digit() {
+                word_buf.push(c);
+            } else if c == ' ' {
+                if !word_buf.is_empty() {
+                    encode_word(&word_buf, &mut tokens, &self.token_to_id, &self.merge_rank);
+                    word_buf.clear();
+                }
+                if tokens.last() != Some(&SPACE) {
+                    tokens.push(SPACE);
+                }
+            } else if is_punctuation(c) {
+                if !word_buf.is_empty() {
+                    encode_word(&word_buf, &mut tokens, &self.token_to_id, &self.merge_rank);
+                    word_buf.clear();
+                }
+                if let Some(&id) = self.token_to_id.get(&c.to_string()) {
                     tokens.push(id);
                 }
-                // Unknown subword pieces are silently skipped (not UNK)
             }
+        }
+        if !word_buf.is_empty() {
+            encode_word(&word_buf, &mut tokens, &self.token_to_id, &self.merge_rank);
         }
         tokens.push(END);
         tokens
@@ -606,10 +651,14 @@ impl Tokenizer {
     }
 
     // Decode a sequence of token IDs back into a string.
-    // BPE subwords are concatenated directly; special tokens are ignored.
+    // BPE subwords are concatenated directly; punctuation is preserved; SPACE becomes a real space.
     pub fn decode(&self, ids: &[usize]) -> String {
         let mut out = String::new();
         for &id in ids {
+            if id == SPACE {
+                out.push(' ');
+                continue;
+            }
             if let Some(word) = self.id_to_token.get(&id) {
                 if word.starts_with('<') { continue; }
                 out.push_str(word);
@@ -696,9 +745,28 @@ impl Tokenizer {
         t.merge_rank  = t.merges.iter().enumerate()
             .map(|(i, (a, b))| ((a.clone(), b.clone()), i)).collect();
 
+        // Ensure SPACE and punctuation tokens exist in a loaded tokenizer
+        if !t.token_to_id.contains_key(SPACE_TOKEN) {
+            t.token_to_id.insert(SPACE_TOKEN.to_string(), SPACE);
+            t.id_to_token.insert(SPACE, SPACE_TOKEN.to_string());
+        }
+        let mut next_id = t.token_to_id.len();
+        for p in PUNCTUATION {
+            if !t.token_to_id.contains_key(*p) {
+                t.token_to_id.insert(p.to_string(), next_id);
+                t.id_to_token.insert(next_id, p.to_string());
+                next_id += 1;
+            }
+        }
+
         // Rebuild allowed_ids and bad_ids
         t.allowed_ids = t.token_to_id.iter()
-            .filter(|(tok, _)| tok.starts_with('<') || tok.chars().all(|c| is_cyrillic(c) || c.is_ascii_digit()))
+            .filter(|(tok, _)| {
+                tok.starts_with('<')
+                || *tok == SPACE_TOKEN
+                || PUNCTUATION.contains(&tok.as_str())
+                || tok.chars().all(|c| is_cyrillic(c) || c.is_ascii_digit())
+            })
             .map(|(_, &id)| id)
             .collect();
         t.bad_ids = t.token_to_id.iter()
