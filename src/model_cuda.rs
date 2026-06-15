@@ -1396,21 +1396,28 @@ pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer,
         cached
     } else {
         use rayon::prelude::*;
-        let files: Vec<String> = fs::read_dir(path)?
+        #[derive(serde::Deserialize)]
+        struct DialogRecord { text: String }
+
+        let entries: Vec<(std::path::PathBuf, String)> = fs::read_dir(path)?
             .par_bridge()
             .filter_map(|e| {
                 let e = e.ok()?;
                 let p = e.path();
-                if p.extension().map_or(false, |x| x == "txt") {
+                let ext = p.extension().and_then(|x| x.to_str())?;
+                if ext == "txt" {
                     let c = fs::read_to_string(&p).ok()?;
-                    if !c.trim().is_empty() { return Some(c); }
+                    if !c.trim().is_empty() { return Some((p, c)); }
+                } else if ext == "jsonl" {
+                    let c = fs::read_to_string(&p).ok()?;
+                    if !c.trim().is_empty() { return Some((p, c)); }
                 }
                 None
             })
             .collect();
 
-        println!("Loaded {} files", files.len());
-        if files.is_empty() { return Ok(()); }
+        println!("Loaded {} files", entries.len());
+        if entries.is_empty() { return Ok(()); }
 
         println!("Streaming tokenized sequences to cache...");
         let cache_file = fs::File::create(&cache_path)?;
@@ -1418,18 +1425,39 @@ pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer,
         w.write_all(&0u32.to_le_bytes())?;
 
         let mut count: u32 = 0;
-        for c in &files {
-            for s in c.split(|ch| ch == '.' || ch == '\n' || ch == '!' || ch == '?') {
-                let s = s.trim();
-                if s.len() <= 5 { continue; }
-                let mut t = tokenizer.encode(s);
-                if t.len() < MIN_TOKENS_PER_SEQ { continue; }
-                if t.len() > MAX_TOKENS_PER_SEQ { t.truncate(MAX_TOKENS_PER_SEQ); }
-                let len = t.len().min(u32::MAX as usize) as u32;
-                w.write_all(&len.to_le_bytes())?;
-                for &tok in &t { w.write_all(&(tok as u32).to_le_bytes())?; }
-                count = count.saturating_add(1);
-                if count >= MAX_SEQS_PER_EPOCH as u32 { break; }
+        for (p, c) in &entries {
+            let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
+            if ext == "jsonl" {
+                for line in c.lines() {
+                    let line = line.trim();
+                    if line.is_empty() { continue; }
+                    let text: String = match serde_json::from_str::<DialogRecord>(line) {
+                        Ok(rec) => rec.text,
+                        Err(_) => continue,
+                    };
+                    if text.trim().len() <= 5 { continue; }
+                    let mut t = tokenizer.encode(&text);
+                    if t.len() < MIN_TOKENS_PER_SEQ { continue; }
+                    if t.len() > MAX_TOKENS_PER_SEQ { t.truncate(MAX_TOKENS_PER_SEQ); }
+                    let len = t.len().min(u32::MAX as usize) as u32;
+                    w.write_all(&len.to_le_bytes())?;
+                    for &tok in &t { w.write_all(&(tok as u32).to_le_bytes())?; }
+                    count = count.saturating_add(1);
+                    if count >= MAX_SEQS_PER_EPOCH as u32 { break; }
+                }
+            } else {
+                for s in c.split(|ch| ch == '.' || ch == '\n' || ch == '!' || ch == '?') {
+                    let s = s.trim();
+                    if s.len() <= 5 { continue; }
+                    let mut t = tokenizer.encode(s);
+                    if t.len() < MIN_TOKENS_PER_SEQ { continue; }
+                    if t.len() > MAX_TOKENS_PER_SEQ { t.truncate(MAX_TOKENS_PER_SEQ); }
+                    let len = t.len().min(u32::MAX as usize) as u32;
+                    w.write_all(&len.to_le_bytes())?;
+                    for &tok in &t { w.write_all(&(tok as u32).to_le_bytes())?; }
+                    count = count.saturating_add(1);
+                    if count >= MAX_SEQS_PER_EPOCH as u32 { break; }
+                }
             }
             if count >= MAX_SEQS_PER_EPOCH as u32 { break; }
         }

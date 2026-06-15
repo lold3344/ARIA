@@ -3,6 +3,7 @@ name = "aria"
 version = "3.1.0"
 edition = "2021"
 default-run = "aria"
+build = "src/build.rs"
 
 [dependencies]
 rayon = "1.10"

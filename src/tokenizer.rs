@@ -613,7 +613,8 @@ impl Tokenizer {
         }
 
         let mut tokens = vec![START];
-        let cleaned = clean_line(text);
+        // Replace newlines with spaces so multi-line dialog records stay as one sequence.
+        let cleaned = clean_line(&text.replace('\n', " "));
         let mut word_buf = String::new();
 
         for c in cleaned.chars() {

@@ -1,5 +1,8 @@
 # **This is a research tool. The author is not responsible for misuse, training data, or generated content.**
 
+> **Legal notice:** I have nothing to do with anyone who uses this tool for illegal purposes. If you train my AI model and use it for hacking, criminal activity, or any other unlawful actions, that is entirely your own responsibility and problem.
+
+
 # ARIA Wotan 3.1
 
 **ARIA Wotan 3.1** - локальная языковая модель на основе LSTM с обучением через обратную связь (RLHF-like), написанная на Rust. Вычисления выполняются на NVIDIA GPU через CUDA/cuBLAS с кастомными PTX ядрами.

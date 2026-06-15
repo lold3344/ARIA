@@ -277,10 +277,25 @@ fn train_fresh(tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str,
     if path.exists() {
         for entry in std::fs::read_dir(path)? {
             let entry = entry?;
-            if entry.path().extension().map_or(false, |e| e == "txt") {
-                if let Ok(content) = std::fs::read_to_string(entry.path()) {
+            let p = entry.path();
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if ext == "txt" {
+                if let Ok(content) = std::fs::read_to_string(&p) {
                     all_text.push_str(&content);
                     all_text.push(' ');
+                }
+            } else if ext == "jsonl" {
+                if let Ok(content) = std::fs::read_to_string(&p) {
+                    for line in content.lines() {
+                        let line = line.trim();
+                        if line.is_empty() { continue; }
+                        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) {
+                            if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                                all_text.push_str(text);
+                                all_text.push(' ');
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -297,7 +312,7 @@ fn train_fresh(tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str,
     model_cuda::pretrain_from_files(&mut model, tokenizer, data_dir, checkpoint_path, tokenizer_path).ok();
 
     println!("Math curriculum...");
-    math_train::train_math_curriculum(&mut model, tokenizer, "Math_Learn", 0.0003).ok();
+    math_train::train_math_curriculum(&mut model, tokenizer, "data base/Math_Learn", 0.0003).ok();
 
     println!("Training complete.\n");
     Ok(model)
