@@ -5,7 +5,7 @@
 
 # ARIA Wotan 3.2
 
-(ARIA-Logo.png)
+! (ARIA-Logo.png)
 
 **ARIA Wotan 3.2** - локальная языковая модель на основе LSTM с обучением через обратную связь (RLHF-like), написанная на Rust. Вычисления выполняются на NVIDIA GPU через CUDA/cuBLAS с кастомными PTX ядрами.
 
