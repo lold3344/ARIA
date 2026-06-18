@@ -1,7 +1,7 @@
 import json, random
 
 # Convert DataBase.txt (groups of 7 messages separated by newlines) into
-# a JSONL dialog dataset with roles: Пользователь / Ассистент.
+# a JSONL dialog dataset with roles: USER / ASSISTENT.
 # Each line is one dialog turn pair used for supervised fine-tuning.
 
 in_path = r"C:\Users\lold\Documents\GitHub\ARIA\data base\DataBase.txt"

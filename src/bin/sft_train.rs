@@ -16,14 +16,14 @@ fn main() -> anyhow::Result<()> {
 
     println!("\nFine-tuning complete. Running greedy test...");
     let prompts = [
-        "Пользователь: привет\nАссистент:",
-        "Пользователь: как дела\nАссистент:",
-        "Пользователь: сколько будет 1 плюс 1\nАссистент:",
-        "Пользователь: что ты умеешь\nАссистент:",
-        "Пользователь: расскажи о себе\nАссистент:",
+        "привет",
+        "как дела",
+        "сколько будет 1 плюс 1",
+        "что ты умеешь",
+        "расскажи о себе",
     ];
     for prompt in &prompts {
-        let ids = tokenizer.encode(prompt);
+        let ids = tokenizer.encode_prompt(prompt);
         let input = &ids[..ids.len().saturating_sub(1)];
         let (mut logits, mut state) = model.forward_seq(input);
         let mut generated = vec![];

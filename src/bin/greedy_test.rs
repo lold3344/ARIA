@@ -19,7 +19,7 @@ fn main() -> anyhow::Result<()> {
     ];
 
     for prompt in &cases {
-        let ids = tokenizer.encode(prompt);
+        let ids = tokenizer.encode_prompt(prompt);
         let input = &ids[..ids.len().saturating_sub(1)];
         let (mut logits, mut state) = model.forward_seq(input);
         let mut generated = vec![];

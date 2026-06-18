@@ -180,9 +180,8 @@ fn main() -> anyhow::Result<()> {
         }
         if input.is_empty() { continue; }
 
-        // Build role-formatted prompt for the model.
-        let prompt = format!("Пользователь: {}\nАссистент:", input);
-        let tokens = tokenizer.encode(&prompt);
+        // Encode using the same USER/ASSISTANT special tokens used during SFT training.
+        let tokens = tokenizer.encode_prompt(input);
         if tokens.len() < 3 { continue; }
 
         let user_entry_id = Uuid::new_v4().to_string();

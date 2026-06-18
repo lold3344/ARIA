@@ -1035,7 +1035,7 @@ impl LSTMModelCuda {
     }
 
     pub fn decode_greedy(&self, tokenizer: &mut Tokenizer, prompt: &str, max_tokens: usize) -> String {
-        let mut tokens = tokenizer.encode(prompt);
+        let mut tokens = tokenizer.encode_prompt(prompt);
         if tokens.len() < 2 { tokens.push(3); }
         let input = &tokens[..tokens.len().saturating_sub(1)];
         let (_, mut state) = self.forward_seq(input);
@@ -1061,7 +1061,7 @@ impl LSTMModelCuda {
     pub fn decode_top_k(&self, tokenizer: &mut Tokenizer, prompt: &str, max_tokens: usize,
                         k: usize, temperature: f32, repetition_penalty: f32) -> String
     {
-        let mut tokens = tokenizer.encode(prompt);
+        let mut tokens = tokenizer.encode_prompt(prompt);
         if tokens.len() < 2 { tokens.push(3); }
         let input = &tokens[..tokens.len().saturating_sub(1)];
         let (_, mut state) = self.forward_seq(input);

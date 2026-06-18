@@ -624,6 +624,17 @@ impl Tokenizer {
         tokens
     }
 
+    // Encode a user prompt for inference, matching the SFT training format:
+    //   <START> <USER> [user tokens] <ASSISTANT>
+    // The model then generates tokens starting from the ASSISTANT position.
+    pub fn encode_prompt(&self, user_text: &str) -> Vec<usize> {
+        let mut tokens = vec![START];
+        tokens.push(USER);
+        self.encode_text_to_tokens(&clean_line(user_text), &mut tokens);
+        tokens.push(ASSISTANT);
+        tokens
+    }
+
     // Encode text and build a target mask for supervised dialog fine-tuning.
     // Uses explicit role tokens:
     //   <START> <USER> ... <ASSISTANT> ... <END>
@@ -658,8 +669,9 @@ impl Tokenizer {
         let mut mask = vec![0.0f32; tokens.len() - 1];
         if let Some(start) = assistant_token_start {
             // To predict the first assistant content token, we train on the target position
-            // right after the ASSISTANT token. The final END target is also trained.
-            let from = start;
+            // right after the ASSISTANT token (i.e. at index start - 1, whose target is
+            // tokens[start]). The final END target is also trained.
+            let from = start.saturating_sub(1);
             let to = tokens.len().saturating_sub(1); // exclusive
             for t in from..to {
                 if t < mask.len() { mask[t] = 1.0f32; }
