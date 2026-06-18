@@ -1434,6 +1434,8 @@ const DIALOG_FILE:         &str  = "DataBase_roles.jsonl";
 pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str, tokenizer_path: &str) -> anyhow::Result<()> {
     let max_seqs: usize = std::env::var("ARIA_MAX_SEQS")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(MAX_SEQS_PER_EPOCH);
+    let pretrain_epochs: usize = std::env::var("ARIA_EPOCHS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(PRETRAIN_EPOCHS);
 
     let path = Path::new(data_dir);
     if !path.exists() { println!("Data dir not found."); return Ok(()); }
@@ -1443,7 +1445,7 @@ pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer,
     println!("\n===============================================");
     println!("       ARIA - DIALOG SFT (CUDA FP16)           ");
     println!("===============================================");
-    println!("LR: {}  Epochs: {}  Batch: {}  SeqLen: {}", LEARNING_RATE, PRETRAIN_EPOCHS, PRETRAIN_BATCH_SIZE, MAX_TOKENS_PER_SEQ);
+    println!("LR: {}  Epochs: {}  Batch: {}  SeqLen: {}", LEARNING_RATE, pretrain_epochs, PRETRAIN_BATCH_SIZE, MAX_TOKENS_PER_SEQ);
     println!("===============================================\n");
 
     // Use only the dialog JSONL; cache holds seq+mask pairs.
@@ -1523,7 +1525,7 @@ pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer,
     let _val_batches   = (val_count + PRETRAIN_BATCH_SIZE - 1) / PRETRAIN_BATCH_SIZE;
 
     let mut rng = rand::thread_rng();
-    for epoch in 0..PRETRAIN_EPOCHS {
+    for epoch in 0..pretrain_epochs {
         let ep = Instant::now();
         let mut last_report = Instant::now();
         let mut total_loss = 0.0f32;
@@ -1559,7 +1561,7 @@ pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer,
                 let remaining = train_batches.saturating_sub(i + 1);
                 let tokens_s  = seq_s * fixed_len as f32;
                 println!("  Epoch {}/{}  |  batch {}/{}  ({} remaining)  |  loss={:.4}  |  {:.0} seq/s  ({:.0} tok/s)",
-                         epoch+1, PRETRAIN_EPOCHS, i+1, train_batches, remaining, avg, seq_s, tokens_s);
+                         epoch+1, pretrain_epochs, i+1, train_batches, remaining, avg, seq_s, tokens_s);
                 std::io::stdout().flush().ok();
                 last_report = Instant::now();
             }
@@ -1587,7 +1589,7 @@ pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer,
         let seq_s = seqs_done as f32 / et.as_secs_f32();
         let tok_s = seq_s * fixed_len as f32;
         println!("Epoch {}/{} done  |  train_loss={:.6}  |  val_loss={:.6}  |  {:.1}s  |  {:.0} seq/s  ({:.0} tok/s)  |  lr={:.6}",
-                 epoch+1, PRETRAIN_EPOCHS, avg, val_avg, et.as_secs_f32(), seq_s, tok_s, current_lr);
+                 epoch+1, pretrain_epochs, avg, val_avg, et.as_secs_f32(), seq_s, tok_s, current_lr);
         if !checkpoint_path.is_empty() {
             println!("  Saving checkpoint to {} ...", checkpoint_path);
             model.save_checkpoint(checkpoint_path).ok();
