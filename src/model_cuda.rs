@@ -1286,6 +1286,26 @@ impl LSTMModelCuda {
         if let Some(asm) = AdaptiveSoftmax::from_json(&data["adaptive_sm"]) {
             model.adaptive_sm = asm;
         }
+        // Override CPU adaptive_sm with the trained GPU weights so inference is correct.
+        // g_w_head etc. are the live trained weights; adaptive_sm.w_head starts as random init.
+        {
+            let v = download_f16(&model.stream, &model.g_w_head);
+            if !v.is_empty() { model.adaptive_sm.w_head = v; }
+            let v = download_f16(&model.stream, &model.g_b_head);
+            if !v.is_empty() { model.adaptive_sm.b_head = v; }
+            let v = download_f16(&model.stream, &model.g_w_proj1);
+            if !v.is_empty() { model.adaptive_sm.w_proj1 = v; }
+            let v = download_f16(&model.stream, &model.g_w_tail1);
+            if !v.is_empty() { model.adaptive_sm.w_tail1 = v; }
+            let v = download_f16(&model.stream, &model.g_b_tail1);
+            if !v.is_empty() { model.adaptive_sm.b_tail1 = v; }
+            let v = download_f16(&model.stream, &model.g_w_proj2);
+            if !v.is_empty() { model.adaptive_sm.w_proj2 = v; }
+            let v = download_f16(&model.stream, &model.g_w_tail2);
+            if !v.is_empty() { model.adaptive_sm.w_tail2 = v; }
+            let v = download_f16(&model.stream, &model.g_b_tail2);
+            if !v.is_empty() { model.adaptive_sm.b_tail2 = v; }
+        }
         if let Some(v) = data["adam_step"].as_i64() { model.adam_step = v as i32; }
         if let Some(v) = data["asm_adam_step"].as_i64() { model.asm_adam_step = v as i32; }
         if let Some(v) = data["simple_adam_step"].as_i64() { model.simple_adam_step = v as i32; }

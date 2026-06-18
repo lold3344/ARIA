@@ -195,8 +195,7 @@ fn main() -> anyhow::Result<()> {
         print!("ARIA: ");
         io::stdout().flush()?;
 
-        let input_no_end = &tokens[..tokens.len() - 1];
-        let (mut current_logits, mut current_state) = model.forward_seq(input_no_end);
+        let (mut current_logits, mut current_state) = model.forward_seq(&tokens);
         let mut generated_tokens: Vec<usize> = Vec::new();
 
         // Greedy / short decoding for stable dialog: stop at END or after 40 tokens.

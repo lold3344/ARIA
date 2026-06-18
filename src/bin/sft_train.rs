@@ -24,8 +24,7 @@ fn main() -> anyhow::Result<()> {
     ];
     for prompt in &prompts {
         let ids = tokenizer.encode_prompt(prompt);
-        let input = &ids[..ids.len().saturating_sub(1)];
-        let (mut logits, mut state) = model.forward_seq(input);
+        let (mut logits, mut state) = model.forward_seq(&ids);
         let mut generated = vec![];
         for _ in 0..40 {
             let mut masked = logits.clone();
