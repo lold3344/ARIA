@@ -924,8 +924,8 @@ impl TransformerModel {
                 for ti in 0..t { for j in 0..d { lc.g_b_ff2[j] += d_ff2_raw[ti*d+j]; } }
                 // d_ff1_act = d_ff2 @ w_ff2^T [t, d] @ [d, ff] → [t, ff]
                 let d_ff1_act = cpu_matmul_t(d_ff2_raw, &lc.w_ff2, t, d, ff);
-                // g_w_ff2 += xn2^T @ d_ff2 [ff, t] @ [t, d] → [ff, d]
-                cpu_matmul_acc_t(&acts.xn2, d_ff2_raw, t, ff, d, &mut lc.g_w_ff2);
+                // g_w_ff2 += ff1_act^T @ d_ff2 [ff, t] @ [t, d] → [ff, d]
+                cpu_matmul_acc_t(&acts.ff1_act, d_ff2_raw, t, ff, d, &mut lc.g_w_ff2);
 
                 // GELU backward
                 let d_ff1: Vec<f32> = d_ff1_act.iter().zip(acts.ff1.iter()).map(|(&dy, &x)| dy * gelu_grad(x)).collect();
