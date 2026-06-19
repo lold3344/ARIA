@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
 
-use aria::model_cuda::LSTMModelCuda;
+use aria::transformer_cuda::TransformerModel;
 use aria::tokenizer::Tokenizer;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -33,23 +33,17 @@ fn load_tiny_subset(path: &str, max_records: usize, tokenizer: &mut Tokenizer) -
     Ok((seqs, masks))
 }
 
-fn greedy_generate(model: &LSTMModelCuda, tokenizer: &mut Tokenizer, prompt: &str, max_tokens: usize) -> String {
-    let ids = tokenizer.encode(prompt);
-    let input = &ids[..ids.len().saturating_sub(1)];
-    let (mut logits, mut state) = model.forward_seq(input);
+fn greedy_generate(model: &TransformerModel, tokenizer: &mut Tokenizer, prompt: &str, max_tokens: usize) -> String {
+    let ids = tokenizer.encode_prompt(prompt);
+    let (mut logits, mut kv) = model.forward_seq(&ids);
     let mut generated = vec![];
     for _ in 0..max_tokens {
-        let mut masked = logits.clone();
-        tokenizer.mask_logits(&mut masked);
-        let mut best = 0usize;
-        let mut best_val = masked[0];
-        for (i, &v) in masked.iter().enumerate() {
-            if v > best_val { best = i; best_val = v; }
-        }
+        tokenizer.mask_logits(&mut logits);
+        let best = model.sample_greedy(&logits);
         if best == 0 || best == 3 || best >= tokenizer.vocab_size() { break; }
         generated.push(best);
-        let (nl, ns) = model.step(best, &state);
-        state = ns;
+        let (nl, nkv) = model.step(best, &kv);
+        kv = nkv;
         logits = nl;
     }
     tokenizer.decode(&generated).trim().to_string()
@@ -61,34 +55,33 @@ fn main() -> anyhow::Result<()> {
     let data_path = "data base/DataBase_roles.jsonl";
 
     let mut tokenizer = Tokenizer::load(tokenizer_path)?;
-    let mut model = LSTMModelCuda::load_checkpoint(model_path)?;
+    let mut model = TransformerModel::load_checkpoint(model_path)?;
 
     println!("Loading tiny subset...");
     let (mut seqs, mut masks) = load_tiny_subset(data_path, 50_000, &mut tokenizer)?;
     println!("Loaded {} sequences", seqs.len());
 
     let val_count = (seqs.len() / 20).max(1).min(seqs.len() / 10);
-    let train_count = seqs.len() - val_count;
     let mut train_seqs = seqs.split_off(val_count);
     let mut train_masks = masks.split_off(val_count);
     let val_seqs = seqs;
     let val_masks = masks;
 
     let prompts = [
-        "Пользователь: привет\nАссистент:",
-        "Пользователь: как дела\nАссистент:",
-        "Пользователь: сколько будет 1 плюс 1\nАссистент:",
-        "Пользователь: что ты умеешь\nАссистент:",
-        "Пользователь: расскажи о себе\nАссистент:",
+        "привет",
+        "как дела",
+        "сколько будет 1 плюс 1",
+        "что ты умеешь",
+        "расскажи о себе",
     ];
 
-    let batch_size = 128;
-    let lr = 0.0003f64;
+    let batch_size = 64usize;
+    let lr = 0.0003f32;
     let total_steps = 100usize;
     let batches_per_step = 10usize;
 
-    println!("\nStarting tiny supervised fine-tuning: {} train / {} val / {} steps * {} batches",
-        train_count, val_count, total_steps, batches_per_step);
+    println!("\nStarting tiny fine-tuning: {} train / {} val / {} steps * {} batches",
+        train_seqs.len(), val_seqs.len(), total_steps, batches_per_step);
     let mut rng = rand::thread_rng();
     for step in 0..total_steps {
         train_seqs.shuffle(&mut rng);

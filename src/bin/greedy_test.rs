@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
 
-use aria::model_cuda::LSTMModelCuda;
+use aria::transformer_cuda::TransformerModel;
 use aria::tokenizer::Tokenizer;
 
 fn main() -> anyhow::Result<()> {
@@ -8,7 +8,7 @@ fn main() -> anyhow::Result<()> {
     let tokenizer_path = "aria json/aria_tokenizer.json";
 
     let mut tokenizer = Tokenizer::load(tokenizer_path)?;
-    let model = LSTMModelCuda::load_checkpoint(model_path)?;
+    let model = TransformerModel::load_checkpoint(model_path)?;
 
     let cases = [
         "привет",
@@ -20,19 +20,15 @@ fn main() -> anyhow::Result<()> {
 
     for prompt in &cases {
         let ids = tokenizer.encode_prompt(prompt);
-        let (mut logits, mut state) = model.forward_seq(&ids);
+        let (mut logits, mut kv) = model.forward_seq(&ids);
         let mut generated = vec![];
         for _ in 0..50 {
             tokenizer.mask_logits(&mut logits);
-            let mut best = 0usize;
-            let mut best_val = logits[0];
-            for (i, &v) in logits.iter().enumerate() {
-                if v > best_val { best = i; best_val = v; }
-            }
+            let best = model.sample_greedy(&logits);
             if best == 0 || best == 3 || best >= tokenizer.vocab_size() { break; }
             generated.push(best);
-            let (nl, ns) = model.step(best, &state);
-            state = ns;
+            let (nl, nkv) = model.step(best, &kv);
+            kv = nkv;
             logits = nl;
         }
         let out = tokenizer.decode(&generated);

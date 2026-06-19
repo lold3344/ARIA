@@ -1,17 +1,14 @@
 #![recursion_limit = "256"]
 
-mod model_cuda;
-mod adaptive_softmax;
+mod transformer_cuda;
 mod tokenizer;
 mod storage;
 mod db;
-mod lstm_cuda;
-mod math_train;
 
 use std::io::{self, Write};
 use std::fs;
 use uuid::Uuid;
-use crate::model_cuda::LSTMModelCuda;
+use crate::transformer_cuda::TransformerModel;
 use crate::tokenizer::Tokenizer;
 use crate::storage::{EncryptionManager, DialogEntry, get_current_timestamp};
 
@@ -60,9 +57,6 @@ fn main() -> anyhow::Result<()> {
     let session_id = Uuid::new_v4().to_string();
     println!("Session ID: {}\n", session_id);
 
-    let embed_dim = 1024;
-    let hidden_dim = 2048;
-
     let checkpoint_path = "aria json/aria_checkpoint.json";
     let tokenizer_path = "aria json/aria_tokenizer.json";
 
@@ -73,21 +67,21 @@ fn main() -> anyhow::Result<()> {
     let (mut model, mut tokenizer) = if checkpoint_exists && tokenizer_exists && !continue_train {
         println!("Loading checkpoint and tokenizer...");
         let t = Tokenizer::load(tokenizer_path)?;
-        let m = LSTMModelCuda::load_checkpoint(checkpoint_path)?;
+        let m = TransformerModel::load_checkpoint(checkpoint_path)?;
         println!("Checkpoint loaded. Vocabulary: {}\n", t.vocab_size());
         (m, t)
     } else if checkpoint_exists && tokenizer_exists && continue_train {
         println!("Loading checkpoint and tokenizer for continued training...");
         let mut t = Tokenizer::load(tokenizer_path)?;
-        let mut m = LSTMModelCuda::load_checkpoint(checkpoint_path)?;
+        let mut m = TransformerModel::load_checkpoint(checkpoint_path)?;
         println!("Checkpoint loaded. Continuing training...\n");
-        model_cuda::pretrain_from_files(&mut m, &mut t, data_dir, checkpoint_path, tokenizer_path).ok();
+        crate::transformer_cuda::pretrain_from_files(&mut m, &mut t, data_dir, checkpoint_path, tokenizer_path).ok();
         m.save_checkpoint(checkpoint_path).ok();
         t.save(tokenizer_path).ok();
         (m, t)
     } else {
         let mut t = Tokenizer::new();
-        let m = train_fresh(&mut t, data_dir, checkpoint_path, tokenizer_path, embed_dim, hidden_dim)?;
+        let m = train_fresh(&mut t, data_dir, checkpoint_path, tokenizer_path)?;
         m.save_checkpoint(checkpoint_path).ok();
         t.save(tokenizer_path).ok();
         (m, t)
@@ -180,7 +174,6 @@ fn main() -> anyhow::Result<()> {
         }
         if input.is_empty() { continue; }
 
-        // Encode using the same USER/ASSISTANT special tokens used during SFT training.
         let tokens = tokenizer.encode_prompt(input);
         if tokens.len() < 3 { continue; }
 
@@ -198,7 +191,6 @@ fn main() -> anyhow::Result<()> {
         let (mut current_logits, mut current_state) = model.forward_seq(&tokens);
         let mut generated_tokens: Vec<usize> = Vec::new();
 
-        // Greedy / short decoding for stable dialog: stop at END or after 40 tokens.
         for _ in 0..40 {
             tokenizer.mask_logits(&mut current_logits);
 
@@ -234,7 +226,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn train_fresh(tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str, tokenizer_path: &str, embed_dim: usize, hidden_dim: usize) -> anyhow::Result<LSTMModelCuda> {
+fn train_fresh(tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str, tokenizer_path: &str) -> anyhow::Result<TransformerModel> {
     println!("Building vocabulary from data...\n");
 
     let path = std::path::Path::new(data_dir);
@@ -269,15 +261,12 @@ fn train_fresh(tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str,
     let _ = tokenizer.encode(&all_text);
     tokenizer.freeze();
     let actual_vocab = tokenizer.vocab_size();
-    println!("Vocabulary built: {} words", actual_vocab);
+    println!("Vocabulary built: {} tokens", actual_vocab);
 
-    let mut model = LSTMModelCuda::new(actual_vocab, embed_dim, hidden_dim);
+    let mut model = TransformerModel::new(actual_vocab, 768, 12, 12, 3072, 256);
 
     println!("Pre-training...");
-    model_cuda::pretrain_from_files(&mut model, tokenizer, data_dir, checkpoint_path, tokenizer_path).ok();
-
-    println!("Math curriculum...");
-    math_train::train_math_curriculum(&mut model, tokenizer, "data base/Math_Learn", 0.0003).ok();
+    crate::transformer_cuda::pretrain_from_files(&mut model, tokenizer, data_dir, checkpoint_path, tokenizer_path).ok();
 
     println!("Training complete.\n");
     Ok(model)

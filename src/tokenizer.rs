@@ -495,7 +495,7 @@ fn apply_merges(word: &str, merge_rank: &HashMap<(String, String), usize>) -> Ve
 //  Tokenizer impl
 // ─────────────────────────────────────────────────────────────
 impl Tokenizer {
-    pub fn new() -> Self { Self::with_vocab(8_000) }
+    pub fn new() -> Self { Self::with_vocab(32_000) }
 
     pub fn with_vocab(target: usize) -> Self {
         let mut t = Self {

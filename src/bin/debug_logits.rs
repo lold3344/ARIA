@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
 
-use aria::model_cuda::LSTMModelCuda;
+use aria::transformer_cuda::TransformerModel;
 use aria::tokenizer::Tokenizer;
 
 fn main() -> anyhow::Result<()> {
@@ -8,7 +8,7 @@ fn main() -> anyhow::Result<()> {
     let tokenizer_path = "aria json/aria_tokenizer.json";
 
     let mut tokenizer = Tokenizer::load(tokenizer_path)?;
-    let model = LSTMModelCuda::load_checkpoint(model_path)?;
+    let model = TransformerModel::load_checkpoint(model_path)?;
 
     let prompt = "привет";
     let ids = tokenizer.encode_prompt(prompt);
@@ -16,7 +16,6 @@ fn main() -> anyhow::Result<()> {
 
     let (logits0, state0) = model.forward_seq(&ids);
 
-    // Print special token logits (0-6) both raw and after mask
     let mut logits0m = logits0.clone();
     tokenizer.mask_logits(&mut logits0m);
     println!("\n--- Logits for special token ids 0..=6 after ASSISTANT ---");
@@ -27,7 +26,6 @@ fn main() -> anyhow::Result<()> {
             if logits0m[id].is_finite() { format!("{:.4}", logits0m[id]) } else { "-inf".to_string() });
     }
 
-    // Simulate generation for 5 steps
     println!("\n--- Generation trace (5 steps) ---");
     let mut logits = logits0;
     let mut state = state0;

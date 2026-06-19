@@ -441,3 +441,192 @@ extern "C" __global__ void f32_to_f16(const float* in, __half* out, int n)
     if (i >= n) return;
     out[i] = __float2half(in[i]);
 }
+
+// ─────────────────────────────────────────────────────────────
+//  LayerNorm forward: out = (x - mean) / sqrt(var + eps) * gamma + beta
+//  x, out: [N, D]   mean, rstd: [N]   gamma, beta: [D]
+// ─────────────────────────────────────────────────────────────
+extern "C" __global__ void layer_norm_fwd(
+    __half*       out,
+    float*        mean,
+    float*        rstd,
+    const __half* x,
+    const __half* gamma,
+    const __half* beta,
+    int N, int D, float eps)
+{
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= N) return;
+
+    const __half* xr = x + row * D;
+    __half*       or_ = out + row * D;
+
+    // Compute mean via warp reduction
+    float s = 0.0f;
+    for (int i = tid; i < D; i += 32) s += __half2float(xr[i]);
+    for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffff, s, off);
+    float mu = s / (float)D;
+
+    // Compute variance
+    float sv = 0.0f;
+    for (int i = tid; i < D; i += 32) {
+        float d = __half2float(xr[i]) - mu;
+        sv += d * d;
+    }
+    for (int off = 16; off > 0; off >>= 1) sv += __shfl_xor_sync(0xffffffff, sv, off);
+    float rs = __frsqrt_rn(sv / (float)D + eps);
+
+    if (tid == 0) { mean[row] = mu; rstd[row] = rs; }
+
+    for (int i = tid; i < D; i += 32) {
+        float n = (__half2float(xr[i]) - mu) * rs;
+        or_[i] = __float2half(n * __half2float(gamma[i]) + __half2float(beta[i]));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  LayerNorm backward
+//  dy, x, out: [N, D]   gamma: [D]   mean, rstd: [N]
+//  dx += ...,  dgamma += ...,  dbeta += ...
+// ─────────────────────────────────────────────────────────────
+extern "C" __global__ void layer_norm_bwd(
+    __half*       dx,
+    __half*       dgamma,
+    __half*       dbeta,
+    const __half* dy,
+    const __half* x,
+    const float*  mean,
+    const float*  rstd,
+    const __half* gamma,
+    int N, int D)
+{
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= N) return;
+
+    const __half* dyr = dy    + row * D;
+    const __half* xr  = x    + row * D;
+    __half*       dxr = dx   + row * D;
+    float mu = mean[row];
+    float rs = rstd[row];
+
+    // sum(dy * gamma) and sum(dy * gamma * xhat)
+    float s1 = 0.0f, s2 = 0.0f;
+    for (int i = tid; i < D; i += 32) {
+        float dyi = __half2float(dyr[i]);
+        float gi  = __half2float(gamma[i]);
+        float xh  = (__half2float(xr[i]) - mu) * rs;
+        s1 += dyi * gi;
+        s2 += dyi * gi * xh;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        s1 += __shfl_xor_sync(0xffffffff, s1, off);
+        s2 += __shfl_xor_sync(0xffffffff, s2, off);
+    }
+
+    float inv_D = 1.0f / (float)D;
+    for (int i = tid; i < D; i += 32) {
+        float dyi = __half2float(dyr[i]);
+        float gi  = __half2float(gamma[i]);
+        float xh  = (__half2float(xr[i]) - mu) * rs;
+        float dx_ = rs * (dyi * gi - inv_D * s1 - inv_D * xh * s2);
+        dxr[i] = __float2half(__half2float(dxr[i]) + dx_);
+        // dgamma and dbeta accumulate across all rows — use atomicAdd
+        atomicAdd((float*)dgamma + i, dyi * xh);  // store in float trick
+        atomicAdd((float*)dbeta  + i, dyi);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  GELU forward: out[i] = x[i] * 0.5 * (1 + tanh(c*(x + 0.044715*x^3)))
+// ─────────────────────────────────────────────────────────────
+extern "C" __global__ void gelu_fwd(__half* out, const __half* x, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float xi = __half2float(x[i]);
+    float c = 0.7978845608f; // sqrt(2/pi)
+    float inner = c * (xi + 0.044715f * xi * xi * xi);
+    float t = tanhf(inner);
+    out[i] = __float2half(0.5f * xi * (1.0f + t));
+}
+
+// ─────────────────────────────────────────────────────────────
+//  GELU backward: dx += dy * (0.5*(1+tanh) + 0.5*x*sech^2*c*(1+3*0.044715*x^2))
+// ─────────────────────────────────────────────────────────────
+extern "C" __global__ void gelu_bwd(__half* dx, const __half* dy, const __half* x, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float xi  = __half2float(x[i]);
+    float dyi = __half2float(dy[i]);
+    float c     = 0.7978845608f;
+    float inner = c * (xi + 0.044715f * xi * xi * xi);
+    float t   = tanhf(inner);
+    float sech2 = 1.0f - t * t;
+    float grad = 0.5f * (1.0f + t) + 0.5f * xi * sech2 * c * (1.0f + 3.0f * 0.044715f * xi * xi);
+    dx[i] = __float2half(__half2float(dx[i]) + dyi * grad);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Causal softmax in-place: attn[BH, T, T]
+//  For each row i: zero out j > i (future), then softmax
+// ─────────────────────────────────────────────────────────────
+extern "C" __global__ void causal_softmax_fwd(__half* attn, int BH, int T)
+{
+    int bh  = blockIdx.x;
+    int row = blockIdx.y;   // query position (0..T)
+    int tid = threadIdx.x;
+    if (bh >= BH || row >= T) return;
+
+    __half* r = attn + bh * T * T + row * T;
+
+    // Find max over valid positions [0..row]
+    float mx = -1e30f;
+    for (int j = tid; j <= row; j += 32) mx = fmaxf(mx, __half2float(r[j]));
+    for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, off));
+
+    // Exp and sum
+    float s = 0.0f;
+    for (int j = tid; j < T; j += 32) {
+        float v;
+        if (j <= row) {
+            v = __expf(__half2float(r[j]) - mx);
+        } else {
+            v = 0.0f;
+        }
+        r[j] = __float2half(v);
+        if (j <= row) s += v;
+    }
+    for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffff, s, off);
+    float inv = s > 0.0f ? __frcp_rn(s) : 0.0f;
+    for (int j = tid; j <= row; j += 32) r[j] = __float2half(__half2float(r[j]) * inv);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Attention softmax backward: ds = p*(dy - sum_j(p_j * dy_j))
+//  p, dy, ds: [BH, T, T]
+// ─────────────────────────────────────────────────────────────
+extern "C" __global__ void attn_softmax_bwd(__half* ds, const __half* p, const __half* dy, int BH, int T)
+{
+    int bh  = blockIdx.x;
+    int row = blockIdx.y;
+    int tid = threadIdx.x;
+    if (bh >= BH || row >= T) return;
+
+    const __half* pr  = p  + bh * T * T + row * T;
+    const __half* dyr = dy + bh * T * T + row * T;
+    __half*       dsr = ds + bh * T * T + row * T;
+
+    // dot = sum_j p[j] * dy[j]  over valid [0..row]
+    float dot = 0.0f;
+    for (int j = tid; j <= row; j += 32) dot += __half2float(pr[j]) * __half2float(dyr[j]);
+    for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffff, dot, off);
+
+    for (int j = tid; j <= row; j += 32) {
+        float pj = __half2float(pr[j]);
+        float d  = pj * (__half2float(dyr[j]) - dot);
+        dsr[j] = __float2half(__half2float(dsr[j]) + d);
+    }
+}

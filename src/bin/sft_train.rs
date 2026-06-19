@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
 
-use aria::model_cuda::LSTMModelCuda;
+use aria::transformer_cuda::TransformerModel;
 use aria::tokenizer::Tokenizer;
 
 fn main() -> anyhow::Result<()> {
@@ -9,10 +9,10 @@ fn main() -> anyhow::Result<()> {
     let data_dir = "data base";
 
     let mut tokenizer = Tokenizer::load(tokenizer_path)?;
-    let mut model = LSTMModelCuda::load_checkpoint(model_path)?;
+    let mut model = TransformerModel::load_checkpoint(model_path)?;
 
-    println!("Starting supervised dialog fine-tuning from checkpoint...");
-    aria::model_cuda::pretrain_from_files(&mut model, &mut tokenizer, data_dir, model_path, tokenizer_path)?;
+    println!("Starting Transformer fine-tuning from checkpoint...");
+    aria::transformer_cuda::pretrain_from_files(&mut model, &mut tokenizer, data_dir, model_path, tokenizer_path)?;
 
     println!("\nFine-tuning complete. Running greedy test...");
     let prompts = [
@@ -24,20 +24,15 @@ fn main() -> anyhow::Result<()> {
     ];
     for prompt in &prompts {
         let ids = tokenizer.encode_prompt(prompt);
-        let (mut logits, mut state) = model.forward_seq(&ids);
+        let (mut logits, mut kv) = model.forward_seq(&ids);
         let mut generated = vec![];
         for _ in 0..40 {
-            let mut masked = logits.clone();
-            tokenizer.mask_logits(&mut masked);
-            let mut best = 0usize;
-            let mut best_val = masked[0];
-            for (i, &v) in masked.iter().enumerate() {
-                if v > best_val { best = i; best_val = v; }
-            }
+            tokenizer.mask_logits(&mut logits);
+            let best = model.sample_greedy(&logits);
             if best == 0 || best == 3 || best >= tokenizer.vocab_size() { break; }
             generated.push(best);
-            let (nl, ns) = model.step(best, &state);
-            state = ns;
+            let (nl, nkv) = model.step(best, &kv);
+            kv = nkv;
             logits = nl;
         }
         let out = tokenizer.decode(&generated).trim().to_string();

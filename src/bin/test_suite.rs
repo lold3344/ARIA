@@ -1,14 +1,26 @@
 #![recursion_limit = "256"]
 
-use aria::model_cuda::LSTMModelCuda;
+use aria::transformer_cuda::TransformerModel;
 use aria::tokenizer::Tokenizer;
 use std::fs;
 use std::time::Instant;
 
-fn run_case(model: &LSTMModelCuda, tokenizer: &mut Tokenizer, name: &str, prompt: &str) -> String {
+fn run_case(model: &TransformerModel, tokenizer: &mut Tokenizer, name: &str, prompt: &str) -> String {
     let start = Instant::now();
-    let response = model.decode_top_k(tokenizer, prompt, 50, 20, 0.7, 1.2);
+    let ids = tokenizer.encode_prompt(prompt);
+    let (mut logits, mut kv) = model.forward_seq(&ids);
+    let mut generated = vec![];
+    for _ in 0..50 {
+        tokenizer.mask_logits(&mut logits);
+        let token = model.sample_top_k(&logits, 0.7, 20);
+        if token == 0 || token == 3 || token >= tokenizer.vocab_size() { break; }
+        generated.push(token);
+        let (nl, nkv) = model.step(token, &kv);
+        kv = nkv;
+        logits = nl;
+    }
     let elapsed = start.elapsed().as_secs_f32();
+    let response = tokenizer.decode(&generated);
     println!("[{}] {:.2}s prompt: {}\n  -> {}\n", name, elapsed, prompt, response);
     response
 }
@@ -20,7 +32,7 @@ fn main() -> anyhow::Result<()> {
     println!("Loading tokenizer...");
     let mut tokenizer = Tokenizer::load(tokenizer_path)?;
     println!("Loading checkpoint...");
-    let model = LSTMModelCuda::load_checkpoint(model_path)?;
+    let model = TransformerModel::load_checkpoint(model_path)?;
     println!("Ready. vocab={}\n", tokenizer.vocab_size());
 
     fs::create_dir_all("logs")?;

@@ -1,6 +1,6 @@
 #![recursion_limit = "256"]
 
-use aria::model_cuda::LSTMModelCuda;
+use aria::transformer_cuda::TransformerModel;
 use aria::tokenizer::Tokenizer;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -35,11 +35,15 @@ fn main() -> anyhow::Result<()> {
     let checkpoint_path = "aria json/aria_checkpoint.json";
     let tokenizer_path = "aria json/aria_tokenizer.json";
 
-    let embed_dim = 1024;
-    let hidden_dim = 2048;
+    // Transformer hyperparams
+    let d_model    = 768;
+    let num_heads  = 12;
+    let num_layers = 12;
+    let ffn_dim    = 3072;
+    let max_seq    = 256;
 
     let vocab_lines: usize = std::env::var("ARIA_VOCAB_LINES")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(2_000_000);
 
     println!("Building vocabulary from dialog file (max {} records)...", vocab_lines);
     let mut tokenizer = Tokenizer::new();
@@ -48,19 +52,19 @@ fn main() -> anyhow::Result<()> {
     let vocab_size = tokenizer.vocab_size();
     println!("Vocab size: {}\n", vocab_size);
 
-    println!("Initializing fresh model...");
-    let mut model = LSTMModelCuda::new(vocab_size, embed_dim, hidden_dim);
-
-    // Remove stale masked cache so that the training run always builds a fresh cache
-    // for the requested ARIA_MAX_SEQS count.
-    let cache_path = format!("{}/sequences_cache_masked_v{}_len{}.bin", data_dir, tokenizer.vocab_size(), 80);
+    // Remove stale cache
+    let cache_path = format!("{}/sequences_cache_transformer_v{}_len{}.bin",
+                             data_dir, vocab_size, max_seq);
     if std::path::Path::new(&cache_path).exists() {
-        println!("Removing stale masked cache: {}", cache_path);
+        println!("Removing stale cache: {}", cache_path);
         std::fs::remove_file(&cache_path)?;
     }
 
+    println!("Initializing fresh Transformer model...");
+    let mut model = TransformerModel::new(vocab_size, d_model, num_heads, num_layers, ffn_dim, max_seq);
+
     println!("Starting supervised dialog training...");
-    aria::model_cuda::pretrain_from_files(&mut model, &mut tokenizer, data_dir, checkpoint_path, tokenizer_path)?;
+    aria::transformer_cuda::pretrain_from_files(&mut model, &mut tokenizer, data_dir, checkpoint_path, tokenizer_path)?;
 
     println!("\nSaving final checkpoint...");
     model.save_checkpoint(checkpoint_path)?;
