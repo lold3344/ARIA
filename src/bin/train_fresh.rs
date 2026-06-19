@@ -11,7 +11,11 @@ struct DialogRecord { text: String }
 fn feed_tokenizer(path: &str, tokenizer: &mut Tokenizer, max_lines: usize) -> anyhow::Result<()> {
     let f = File::open(path)?;
     let r = BufReader::new(f);
+
+    const CHUNK: usize = 50_000;
+    let mut batch: Vec<String> = Vec::with_capacity(CHUNK);
     let mut count = 0usize;
+
     for line in r.lines().take(max_lines) {
         let line = line?;
         if line.trim().is_empty() { continue; }
@@ -19,11 +23,19 @@ fn feed_tokenizer(path: &str, tokenizer: &mut Tokenizer, max_lines: usize) -> an
             Ok(r) => r,
             Err(_) => continue,
         };
-        tokenizer.encode(&rec.text);
+        batch.push(rec.text);
         count += 1;
-        if count % 100_000 == 0 {
-            println!("  vocab: processed {} records", count);
+
+        if batch.len() >= CHUNK {
+            tokenizer.feed_batch(&batch);
+            batch.clear();
+            if count % 200_000 == 0 {
+                println!("  vocab: processed {} records", count);
+            }
         }
+    }
+    if !batch.is_empty() {
+        tokenizer.feed_batch(&batch);
     }
     println!("  vocab: total records processed: {}", count);
     Ok(())

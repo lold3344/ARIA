@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use rayon::prelude::*;
-use ocl::{Buffer, Context, Device, DeviceType, Kernel, Platform, Program, Queue};
 
 const PAD:        usize = 0;
 const UNK:        usize = 1;
@@ -96,196 +95,8 @@ fn clean_line(s: &str) -> String {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  GPU BPE kernels (OpenCL — только для BPE training)
+//  Fast incremental BPE training (CPU + Rayon)
 // ─────────────────────────────────────────────────────────────
-const BPE_KERNELS: &str = r#"
-inline int next_live(__global const int* tokens, int pos, int off, int raw_len) {
-    for (int k = pos + 1; k < off + raw_len; k++) {
-        if (tokens[k] != -1) return k;
-    }
-    return -1;
-}
-
-__kernel void count_pairs(
-    __global const int* tokens,
-    __global const int* offsets,
-    __global const int* raw_lens,
-    __global const int* freqs,
-    __global       int* pair_counts,
-    int vocab_size
-) {
-    int wi = get_global_id(0);
-    int off     = offsets[wi];
-    int raw_len = raw_lens[wi];
-    int freq    = freqs[wi];
-    int prev = -1;
-    for (int i = off; i < off + raw_len; i++) {
-        int t = tokens[i];
-        if (t == -1) continue;
-        if (prev >= 0) atomic_add(&pair_counts[prev * vocab_size + t], freq);
-        prev = t;
-    }
-}
-
-__kernel void apply_merge(
-    __global       int* tokens,
-    __global const int* offsets,
-    __global const int* raw_lens,
-    int merge_a, int merge_b, int merge_ab
-) {
-    int wi = get_global_id(0);
-    int off     = offsets[wi];
-    int raw_len = raw_lens[wi];
-    for (int i = off; i < off + raw_len; i++) {
-        if (tokens[i] != merge_a) continue;
-        int j = next_live(tokens, i, off, raw_len);
-        if (j < 0) continue;
-        if (tokens[j] == merge_b) { tokens[i] = merge_ab; tokens[j] = -1; }
-    }
-}
-
-__kernel void reduce_argmax(
-    __global const int* counts,
-    __global       int* partial_idx,
-    __global       int* partial_val,
-    int n,
-    __local int* lcl_val,
-    __local int* lcl_idx
-) {
-    int gid = get_global_id(0);
-    int lid = get_local_id(0);
-    int lsz = get_local_size(0);
-    int grp = get_group_id(0);
-    int val = (gid < n) ? counts[gid] : 0;
-    int idx = (gid < n) ? gid : -1;
-    lcl_val[lid] = val; lcl_idx[lid] = idx;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    for (int s = lsz >> 1; s > 0; s >>= 1) {
-        if (lid < s) {
-            if (lcl_val[lid+s] > lcl_val[lid] ||
-                (lcl_val[lid+s] == lcl_val[lid] && lcl_idx[lid+s] < lcl_idx[lid])) {
-                lcl_val[lid] = lcl_val[lid+s];
-                lcl_idx[lid] = lcl_idx[lid+s];
-            }
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    if (lid == 0) { partial_val[grp] = lcl_val[0]; partial_idx[grp] = lcl_idx[0]; }
-}
-"#;
-
-struct GpuBpe {
-    queue:        Queue,
-    #[allow(dead_code)] context: Context,
-    #[allow(dead_code)] n_words: usize,
-    buf_tokens:   Buffer<i32>,
-    buf_offsets:  Buffer<i32>,
-    buf_raw_lens: Buffer<i32>,
-    buf_freqs:    Buffer<i32>,
-    buf_counts:   Buffer<i32>,
-    buf_part_idx: Buffer<i32>,
-    buf_part_val: Buffer<i32>,
-    n_groups:     usize,
-    vocab_cap:    usize,
-    local_size:   usize,
-    k_count:      Kernel,
-    k_merge:      Kernel,
-    k_argmax:     Kernel,
-}
-
-impl GpuBpe {
-    fn try_init(flat_tokens: &[i32], offsets: &[i32], raw_lens: &[i32], freqs: &[i32], vocab_cap: usize) -> Option<Self> {
-        let platform = Platform::list().into_iter()
-            .find(|p| { let n = p.name().unwrap_or_default().to_lowercase();
-                        n.contains("nvidia") || n.contains("amd") || n.contains("intel") })
-            .or_else(|| Platform::list().into_iter().next())?;
-        let device = Device::list(platform, Some(DeviceType::GPU)).ok()?.into_iter().next()?;
-        let context = Context::builder().platform(platform).devices(device).build().ok()?;
-        let queue   = Queue::new(&context, device, None).ok()?;
-        let program = Program::builder().src(BPE_KERNELS).devices(device).build(&context).ok()?;
-
-        let n_words    = offsets.len();
-        let pc_size    = vocab_cap * vocab_cap;
-        let local_size = 256usize;
-        let n_groups   = (pc_size + local_size - 1) / local_size;
-
-        let buf_tokens   = Buffer::<i32>::builder().queue(queue.clone()).len(flat_tokens.len()).copy_host_slice(flat_tokens).build().ok()?;
-        let buf_offsets  = Buffer::<i32>::builder().queue(queue.clone()).len(n_words).copy_host_slice(offsets).build().ok()?;
-        let buf_raw_lens = Buffer::<i32>::builder().queue(queue.clone()).len(n_words).copy_host_slice(raw_lens).build().ok()?;
-        let buf_freqs    = Buffer::<i32>::builder().queue(queue.clone()).len(n_words).copy_host_slice(freqs).build().ok()?;
-        let buf_counts   = Buffer::<i32>::builder().queue(queue.clone()).len(pc_size).fill_val(0i32).build().ok()?;
-        let buf_part_idx = Buffer::<i32>::builder().queue(queue.clone()).len(n_groups).build().ok()?;
-        let buf_part_val = Buffer::<i32>::builder().queue(queue.clone()).len(n_groups).build().ok()?;
-
-        let k_count = Kernel::builder().program(&program).name("count_pairs").queue(queue.clone())
-            .global_work_size(n_words)
-            .arg(&buf_tokens).arg(&buf_offsets).arg(&buf_raw_lens).arg(&buf_freqs).arg(&buf_counts).arg(0i32)
-            .build().ok()?;
-        let k_merge = Kernel::builder().program(&program).name("apply_merge").queue(queue.clone())
-            .global_work_size(n_words)
-            .arg(&buf_tokens).arg(&buf_offsets).arg(&buf_raw_lens).arg(0i32).arg(0i32).arg(0i32)
-            .build().ok()?;
-        let global_argmax = ((pc_size + local_size - 1) / local_size) * local_size;
-        let k_argmax = Kernel::builder().program(&program).name("reduce_argmax").queue(queue.clone())
-            .global_work_size(global_argmax).local_work_size(local_size)
-            .arg(&buf_counts).arg(&buf_part_idx).arg(&buf_part_val).arg(0i32)
-            .arg_local::<i32>(local_size).arg_local::<i32>(local_size)
-            .build().ok()?;
-
-        println!("[BPE-GPU] {} | tokens={}K words={} pc_buf={}MB",
-            device.name().unwrap_or_default(), flat_tokens.len() / 1000, n_words, pc_size * 4 / 1_000_000);
-
-        Some(GpuBpe { queue, context, n_words, buf_tokens, buf_offsets, buf_raw_lens, buf_freqs,
-                      buf_counts, buf_part_idx, buf_part_val, n_groups, vocab_cap, local_size,
-                      k_count, k_merge, k_argmax })
-    }
-
-    fn ensure_vocab_cap(&mut self, v: usize) -> Option<()> {
-        if v <= self.vocab_cap { return Some(()); }
-        let pc_size  = v * v;
-        let n_groups = (pc_size + self.local_size - 1) / self.local_size;
-        self.buf_counts   = Buffer::<i32>::builder().queue(self.queue.clone()).len(pc_size).fill_val(0i32).build().ok()?;
-        self.buf_part_idx = Buffer::<i32>::builder().queue(self.queue.clone()).len(n_groups).build().ok()?;
-        self.buf_part_val = Buffer::<i32>::builder().queue(self.queue.clone()).len(n_groups).build().ok()?;
-        self.k_count.set_arg(4, &self.buf_counts).ok()?;
-        let global = ((pc_size + self.local_size - 1) / self.local_size) * self.local_size;
-        self.k_argmax.set_arg(0, &self.buf_counts).ok()?;
-        self.k_argmax.set_arg(1, &self.buf_part_idx).ok()?;
-        self.k_argmax.set_arg(2, &self.buf_part_val).ok()?;
-        unsafe { self.k_argmax.set_default_global_work_size(ocl::SpatialDims::One(global)); }
-        self.vocab_cap = v;
-        self.n_groups  = n_groups;
-        Some(())
-    }
-
-    fn step(&mut self, vocab_size: usize) -> Option<(usize, usize, i32)> {
-        let pc_size = vocab_size * vocab_size;
-        self.ensure_vocab_cap(vocab_size)?;
-        self.buf_counts.cmd().fill(0i32, Some(pc_size)).enq().ok()?;
-        self.k_count.set_arg(5, vocab_size as i32).ok()?;
-        unsafe { self.k_count.enq().ok()?; }
-        self.k_argmax.set_arg(3, pc_size as i32).ok()?;
-        unsafe { self.k_argmax.enq().ok()?; }
-        let mut part_val = vec![0i32; self.n_groups];
-        let mut part_idx = vec![0i32; self.n_groups];
-        self.buf_part_val.read(&mut part_val).enq().ok()?;
-        self.buf_part_idx.read(&mut part_idx).enq().ok()?;
-        let (best_grp, &freq) = part_val.iter().enumerate()
-            .filter(|(_, &v)| v > 0)
-            .max_by(|(ia, &va), (ib, &vb)| va.cmp(&vb).then_with(|| ib.cmp(ia)))?;
-        if freq == 0 { return None; }
-        let idx = part_idx[best_grp] as usize;
-        Some((idx / vocab_size, idx % vocab_size, freq))
-    }
-
-    fn apply_merge(&mut self, a: i32, b: i32, ab: i32) -> Option<()> {
-        self.k_merge.set_arg(3, a).ok()?;
-        self.k_merge.set_arg(4, b).ok()?;
-        self.k_merge.set_arg(5, ab).ok()?;
-        unsafe { self.k_merge.enq().ok()?; }
-        Some(())
-    }
-}
 
 // ─────────────────────────────────────────────────────────────
 //  Tokenizer
@@ -318,143 +129,159 @@ fn hash_merges(merges: &[(String, String)]) -> u64 {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  BPE training
+//  BPE training — fast incremental CPU implementation
+//
+//  Key idea: maintain a pair_freq HashMap and update only the
+//  pairs *affected* by each merge, instead of recomputing all
+//  pairs from scratch on every step.  This turns O(steps × words)
+//  into O(steps × affected_words) which is 100-1000× faster.
+//
+//  Words are stored as Vec<u32> (token ids) to avoid String
+//  heap allocations inside the hot loop.
 // ─────────────────────────────────────────────────────────────
+fn bpe_get_id(tok: &str, tok_to_id: &mut HashMap<String, u32>, id_to_tok: &mut Vec<String>) -> u32 {
+    if let Some(&id) = tok_to_id.get(tok) { return id; }
+    let id = id_to_tok.len() as u32;
+    tok_to_id.insert(tok.to_string(), id);
+    id_to_tok.push(tok.to_string());
+    id
+}
+
 fn train_bpe(word_freq: &HashMap<String, usize>, num_merges: usize) -> Vec<(String, String)> {
-    let words: Vec<(&str, usize)> = word_freq.iter()
-        .filter(|(_, &f)| f > 0)
-        .map(|(w, &f)| (w.as_str(), f))
-        .collect();
-
-    let mut tok_to_id: HashMap<String, u32> = HashMap::new();
+    // ── Build initial token table (single chars) ──────────────
     let mut id_to_tok: Vec<String> = Vec::new();
+    let mut tok_to_id: HashMap<String, u32> = HashMap::new();
 
-    let get_id = |tok: &str, m: &mut HashMap<String, u32>, v: &mut Vec<String>| -> u32 {
-        if let Some(&id) = m.get(tok) { return id; }
-        let id = v.len() as u32;
-        m.insert(tok.to_string(), id);
-        v.push(tok.to_string());
-        id
-    };
-
-    let mut flat_tokens: Vec<i32> = Vec::new();
-    let mut offsets:     Vec<i32> = Vec::new();
-    let mut raw_lens:    Vec<i32> = Vec::new();
-    let mut freqs:       Vec<i32> = Vec::new();
-
-    for &(word, freq) in &words {
-        offsets.push(flat_tokens.len() as i32);
-        // Only allow Cyrillic chars in BPE vocab — filter anything else
-        let chars: Vec<i32> = word.chars()
-            .filter(|c| is_cyrillic(*c) || c.is_ascii_digit())
-            .map(|c| get_id(&c.to_string(), &mut tok_to_id, &mut id_to_tok) as i32)
-            .collect();
-        if chars.is_empty() {
-            // pop the offset we just pushed — word has no valid chars
-            offsets.pop();
-            continue;
-        }
-        raw_lens.push(chars.len() as i32);
-        freqs.push(freq as i32);
-        flat_tokens.extend_from_slice(&chars);
-    }
-
-    if flat_tokens.is_empty() {
-        return Vec::new();
-    }
-
-    let vocab_cap = id_to_tok.len() + num_merges + 64;
-    let mut gpu = GpuBpe::try_init(&flat_tokens, &offsets, &raw_lens, &freqs, vocab_cap);
-    if gpu.is_none() {
-        println!("  [BPE] GPU unavailable, falling back to CPU");
-        return train_bpe_cpu(word_freq, num_merges);
-    }
-    let g = gpu.as_mut().unwrap();
-
-    let mut merges: Vec<(String, String)> = Vec::with_capacity(num_merges);
-
-    for step in 0..num_merges {
-        let vocab_size = id_to_tok.len();
-        let (a_id, b_id, freq) = match g.step(vocab_size) {
-            Some(r) => r,
-            None => break,
-        };
-
-        let a_tok  = id_to_tok[a_id].clone();
-        let b_tok  = id_to_tok[b_id].clone();
-        let merged = format!("{}{}", a_tok, b_tok);
-
-        // Reject merges that produce non-Cyrillic tokens
-        if !merged.chars().all(|c| is_cyrillic(c) || c.is_ascii_digit()) {
-            continue;
-        }
-
-        let merged_id = get_id(&merged, &mut tok_to_id, &mut id_to_tok) as i32;
-
-        if step % 500 == 0 {
-            println!("  BPE step {}/{} best={} (freq={})", step, num_merges, merged, freq);
-            let _ = std::io::stdout().flush();
-        }
-
-        merges.push((a_tok, b_tok));
-        if g.apply_merge(a_id as i32, b_id as i32, merged_id).is_none() {
-            println!("  [BPE] apply_merge failed at step {}", step);
-            break;
-        }
-    }
-
-    merges
-}
-
-fn train_bpe_cpu(word_freq: &HashMap<String, usize>, num_merges: usize) -> Vec<(String, String)> {
-    let mut vocab: Vec<(Vec<String>, usize)> = word_freq.iter()
+    // Each word: (token_ids, freq).  Only Cyrillic chars + digits.
+    // Build char→id first (single-threaded, needs mut tok_to_id/id_to_tok)
+    let mut vocab: Vec<(Vec<u32>, usize)> = word_freq.iter()
         .filter(|(_, &f)| f > 0)
-        .map(|(w, &f)| (w.chars()
-            .filter(|c| is_cyrillic(*c) || c.is_ascii_digit())
-            .map(|c| c.to_string()).collect::<Vec<_>>(), f))
-        .filter(|(v, _)| !v.is_empty())
+        .filter_map(|(w, &f)| {
+            let ids: Vec<u32> = w.chars()
+                .filter(|c| is_cyrillic(*c) || c.is_ascii_digit())
+                .map(|c| bpe_get_id(&c.to_string(), &mut tok_to_id, &mut id_to_tok))
+                .collect();
+            if ids.is_empty() { None } else { Some((ids, f)) }
+        })
         .collect();
 
-    let mut merges = Vec::with_capacity(num_merges);
-    for step in 0..num_merges {
-        let pair_freq = cpu_count_pairs(&vocab);
-        if pair_freq.is_empty() { break; }
-        let (best, &freq) = pair_freq.iter()
-            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0))).unwrap();
-        if step % 500 == 0 {
-            println!("  BPE step {}/{} best={}{} (freq={})", step, num_merges, best.0, best.1, freq);
-            let _ = std::io::stdout().flush();
-        }
-        let merged = format!("{}{}", best.0, best.1);
-        if !merged.chars().all(|c| is_cyrillic(c) || c.is_ascii_digit()) { continue; }
-        merges.push(best.clone());
-        let best = best.clone();
-        vocab = vocab.into_par_iter().map(|(word, f)| {
-            let mut out = Vec::with_capacity(word.len());
-            let mut i = 0;
-            while i < word.len() {
-                if i + 1 < word.len() && word[i] == best.0 && word[i+1] == best.1 {
-                    out.push(merged.clone()); i += 2;
-                } else { out.push(word[i].clone()); i += 1; }
-            }
-            (out, f)
-        }).collect();
-    }
-    merges
-}
+    let n_words = vocab.len();
 
-fn cpu_count_pairs(vocab: &[(Vec<String>, usize)]) -> HashMap<(String, String), usize> {
-    vocab.par_iter()
-        .fold(HashMap::new, |mut acc, (word, freq)| {
-            for i in 0..word.len().saturating_sub(1) {
-                *acc.entry((word[i].clone(), word[i+1].clone())).or_insert(0) += freq;
+    // ── Initial pair frequency count (parallel) ───────────────
+    let mut pair_freq: HashMap<(u32, u32), i64> = vocab.par_iter()
+        .fold(HashMap::new, |mut acc, (ids, f)| {
+            for w in ids.windows(2) {
+                *acc.entry((w[0], w[1])).or_insert(0) += *f as i64;
             }
             acc
         })
         .reduce(HashMap::new, |mut a, b| {
             for (k, v) in b { *a.entry(k).or_insert(0) += v; }
             a
-        })
+        });
+
+    // For each pair, which word indices contain it — for incremental update
+    // We rebuild this lazily: recount from pair_freq after each merge.
+    // To avoid O(n_words) scan per step we maintain pair→word_set.
+    // Build it once, then update incrementally.
+    let mut pair_to_words: HashMap<(u32, u32), Vec<usize>> = {
+        let mut m: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+        for (wi, (ids, _)) in vocab.iter().enumerate() {
+            for w in ids.windows(2) {
+                m.entry((w[0], w[1])).or_default().push(wi);
+            }
+        }
+        m
+    };
+
+    let mut merges: Vec<(String, String)> = Vec::with_capacity(num_merges);
+
+    println!("BPE: {} merges on {} words...", num_merges, n_words);
+    let _ = std::io::stdout().flush();
+
+    for step in 0..num_merges {
+        // ── Find best pair ────────────────────────────────────
+        let best = pair_freq.iter()
+            .filter(|(_, &v)| v > 0)
+            .max_by(|(pa, &va), (pb, &vb)| {
+                va.cmp(&vb).then_with(|| {
+                    // tie-break: lexicographic on token strings for determinism
+                    let sa = format!("{}{}", id_to_tok[pa.0 as usize], id_to_tok[pa.1 as usize]);
+                    let sb = format!("{}{}", id_to_tok[pb.0 as usize], id_to_tok[pb.1 as usize]);
+                    sb.cmp(&sa)
+                })
+            });
+
+        let (&(a_id, b_id), &freq) = match best {
+            Some(r) => r,
+            None => break,
+        };
+        if freq <= 0 { break; }
+
+        let a_tok  = id_to_tok[a_id as usize].clone();
+        let b_tok  = id_to_tok[b_id as usize].clone();
+        let merged = format!("{}{}", a_tok, b_tok);
+
+        // Only allow fully-Cyrillic merges
+        if !merged.chars().all(|c| is_cyrillic(c) || c.is_ascii_digit()) {
+            pair_freq.insert((a_id, b_id), 0);
+            continue;
+        }
+
+        let ab_id = bpe_get_id(&merged, &mut tok_to_id, &mut id_to_tok);
+
+        if step % 500 == 0 {
+            println!("  BPE step {}/{} best={} (freq={})", step, num_merges, merged, freq);
+            let _ = std::io::stdout().flush();
+        }
+
+        merges.push((a_tok.clone(), b_tok.clone()));
+
+        // ── Apply merge to affected words only ────────────────
+        let affected: Vec<usize> = pair_to_words
+            .get(&(a_id, b_id))
+            .cloned()
+            .unwrap_or_default();
+
+        for wi in &affected {
+            let (ids, wf) = &mut vocab[*wi];
+            if ids.len() < 2 { continue; }
+            let f = *wf as i64;
+
+            let mut i = 0;
+            while i < ids.len().saturating_sub(1) {
+                if ids[i] == a_id && ids[i + 1] == b_id {
+                    // Remove pairs touching this position from pair_freq
+                    if i > 0 {
+                        *pair_freq.entry((ids[i - 1], ids[i])).or_insert(0) -= f;
+                        *pair_freq.entry((ids[i - 1], ab_id)).or_insert(0) += f;
+                        pair_to_words.entry((ids[i - 1], ab_id)).or_default().push(*wi);
+                    }
+                    // ids[i+1] might become ab_id's right neighbour
+                    let right_exists = i + 2 < ids.len();
+                    if right_exists {
+                        *pair_freq.entry((ids[i + 1], ids[i + 2])).or_insert(0) -= f;
+                        *pair_freq.entry((ab_id, ids[i + 2])).or_insert(0) += f;
+                        pair_to_words.entry((ab_id, ids[i + 2])).or_default().push(*wi);
+                    }
+                    // Remove the merged pair itself
+                    *pair_freq.entry((a_id, b_id)).or_insert(0) -= f;
+
+                    ids[i] = ab_id;
+                    ids.remove(i + 1);
+                    // Don't advance i — newly merged token may pair with next
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        // Remove exhausted entry
+        pair_freq.remove(&(a_id, b_id));
+        pair_to_words.remove(&(a_id, b_id));
+    }
+
+    merges
 }
 
 fn encode_word(word: &str, tokens: &mut Vec<usize>, token_to_id: &HashMap<String, usize>, merge_rank: &HashMap<(String, String), usize>) {
@@ -602,6 +429,31 @@ impl Tokenizer {
         println!("BPE: vocab size = {}  allowed_ids = {}  bad_ids = {}",
                  self.token_to_id.len(), self.allowed_ids.len(), self.bad_ids.len());
         self.frozen = true;
+    }
+
+    // Feed a large batch of texts in parallel for vocabulary building.
+    // Must be called before freeze(). Much faster than calling encode() line by line.
+    pub fn feed_batch(&mut self, texts: &[String]) {
+        assert!(!self.frozen, "feed_batch called after freeze");
+        // Count word frequencies in parallel, then merge into self.word_freq
+        let merged: HashMap<String, usize> = texts.par_iter()
+            .fold(HashMap::new, |mut acc, text| {
+                let cleaned = clean_line(text);
+                for word in cleaned.split_whitespace() {
+                    let w = clean_word(word);
+                    if w.len() >= 2 && cyrillic_ratio(&w) && !is_bad_word(&w) {
+                        *acc.entry(w).or_insert(0) += 1;
+                    }
+                }
+                acc
+            })
+            .reduce(HashMap::new, |mut a, b| {
+                for (k, v) in b { *a.entry(k).or_insert(0) += v; }
+                a
+            });
+        for (k, v) in merged {
+            *self.word_freq.entry(k).or_insert(0) += v;
+        }
     }
 
     pub fn encode(&mut self, text: &str) -> Vec<usize> {

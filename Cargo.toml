@@ -9,7 +9,6 @@ build = "src/build.rs"
 rayon = "1.10"
 cudarc = { version = "0.19", features = ["cublas", "driver", "nvrtc", "cuda-12090", "dynamic-linking", "f16"] }
 half = { version = "2.4", features = ["num-traits"] }
-ocl = "0.19"
 rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
