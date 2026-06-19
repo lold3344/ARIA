@@ -630,3 +630,382 @@ extern "C" __global__ void attn_softmax_bwd(__half* ds, const __half* p, const _
         dsr[j] = __float2half(__half2float(dsr[j]) + d);
     }
 }
+
+// ─────────────────────────────────────────────────────────────
+//  GPU TRAINING KERNELS (v2 — fully on-GPU forward/backward)
+// ─────────────────────────────────────────────────────────────
+
+// Embedding + positional add: x[t,d] = embed[ids[t],d] + pos[t,d]
+extern "C" __global__ void embedding_pos_fwd(
+    __half* out, const __half* embed, const __half* pos,
+    const int* ids, int T, int D)
+{
+    int t = blockIdx.x;
+    int d = threadIdx.x + blockIdx.y * blockDim.x;
+    if (t >= T || d >= D) return;
+    out[t*D+d] = __hadd(embed[(long)ids[t]*D+d], pos[t*D+d]);
+}
+
+// Split qkv[T, 3D] → q[H,T,dh], k[H,T,dh], v[H,T,dh]
+// Grid: (T, H, 1)  Block: (dh, 1, 1)
+extern "C" __global__ void qkv_split_heads(
+    const __half* qkv, __half* q, __half* k, __half* v,
+    int T, int H, int dh)
+{
+    int t  = blockIdx.x;
+    int hd = blockIdx.y;
+    int d  = threadIdx.x;
+    int D  = H * dh;
+    if (t >= T || hd >= H || d >= dh) return;
+    q[hd*T*dh + t*dh + d] = qkv[t*3*D + hd*dh + d];
+    k[hd*T*dh + t*dh + d] = qkv[t*3*D + D + hd*dh + d];
+    v[hd*T*dh + t*dh + d] = qkv[t*3*D + 2*D + hd*dh + d];
+}
+
+// Merge [H,T,dh] → out[T,D]
+// Grid: (T, H, 1)  Block: (dh, 1, 1)
+extern "C" __global__ void heads_merge(
+    const __half* ctx, __half* out,
+    int T, int H, int dh)
+{
+    int t  = blockIdx.x;
+    int hd = blockIdx.y;
+    int d  = threadIdx.x;
+    if (t >= T || hd >= H || d >= dh) return;
+    out[t*H*dh + hd*dh + d] = ctx[hd*T*dh + t*dh + d];
+}
+
+// heads_split: same as heads_merge but direction reversed [T,D] → [H,T,dh]
+// Grid: (T, H, 1)  Block: (dh, 1, 1)
+extern "C" __global__ void heads_split(
+    const __half* inp, __half* out,
+    int T, int H, int dh)
+{
+    int t  = blockIdx.x;
+    int hd = blockIdx.y;
+    int d  = threadIdx.x;
+    if (t >= T || hd >= H || d >= dh) return;
+    out[hd*T*dh + t*dh + d] = inp[t*H*dh + hd*dh + d];
+}
+
+// Merge d_q,d_k,d_v [H,T,dh] → d_qkv[T,3D]
+// Grid: (T, H, 1)  Block: (dh, 1, 1)
+extern "C" __global__ void qkv_grad_merge(
+    const __half* dq, const __half* dk, const __half* dv,
+    __half* d_qkv, int T, int H, int dh)
+{
+    int t  = blockIdx.x;
+    int hd = blockIdx.y;
+    int d  = threadIdx.x;
+    int D  = H * dh;
+    if (t >= T || hd >= H || d >= dh) return;
+    d_qkv[t*3*D + hd*dh + d]   = dq[hd*T*dh + t*dh + d];
+    d_qkv[t*3*D + D + hd*dh + d]   = dk[hd*T*dh + t*dh + d];
+    d_qkv[t*3*D + 2*D + hd*dh + d] = dv[hd*T*dh + t*dh + d];
+}
+
+// In-place add: a[i] += b[i]  (f16)
+extern "C" __global__ void add_inplace(__half* a, const __half* b, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    a[i] = __hadd(a[i], b[i]);
+}
+
+// Copy f16 buffer
+extern "C" __global__ void copy_f16(__half* dst, const __half* src, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = src[i];
+}
+
+// Zero f16 buffer
+extern "C" __global__ void zero_f16(__half* x, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    x[i] = __float2half(0.0f);
+}
+
+// Zero f32 buffer
+extern "C" __global__ void zero_f32(float* x, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    x[i] = 0.0f;
+}
+
+// Multi-head attention scores: scores[h,qi,ki] = scale*dot(Q[h,qi],K[h,ki])
+// Grid: (H, T, 1)  Block: (T, 1, 1)  — T <= 256
+extern "C" __global__ void mha_scores(
+    const __half* q, const __half* k, __half* scores,
+    int H, int T, int dh, float scale)
+{
+    int h  = blockIdx.x;
+    int qi = blockIdx.y;
+    int ki = threadIdx.x;
+    if (h >= H || qi >= T || ki >= T) return;
+    const __half* qv = q + h*T*dh + qi*dh;
+    const __half* kv = k + h*T*dh + ki*dh;
+    float dot = 0.0f;
+    for (int d = 0; d < dh; d++) dot += __half2float(qv[d]) * __half2float(kv[d]);
+    scores[h*T*T + qi*T + ki] = __float2half(dot * scale);
+}
+
+// Multi-head attention context: ctx[h,qi,d] = sum_{ki<=qi} attn[h,qi,ki]*V[h,ki,d]
+// Grid: (H, T, 1)  Block: (dh, 1, 1)
+extern "C" __global__ void mha_context(
+    const __half* attn, const __half* v, __half* ctx,
+    int H, int T, int dh)
+{
+    int h  = blockIdx.x;
+    int qi = blockIdx.y;
+    int d  = threadIdx.x;
+    if (h >= H || qi >= T || d >= dh) return;
+    float s = 0.0f;
+    const __half* av = attn + h*T*T + qi*T;
+    for (int ki = 0; ki <= qi; ki++)
+        s += __half2float(av[ki]) * __half2float(v[h*T*dh + ki*dh + d]);
+    ctx[h*T*dh + qi*dh + d] = __float2half(s);
+}
+
+// Backward d_v: dv[h,ki,d] += sum_{qi>=ki} attn[h,qi,ki]*d_ctx[h,qi,d]
+// Grid: (H, T, 1)  Block: (dh, 1, 1)
+extern "C" __global__ void mha_dv(
+    const __half* attn, const __half* d_ctx, __half* dv,
+    int H, int T, int dh)
+{
+    int h  = blockIdx.x;
+    int ki = blockIdx.y;
+    int d  = threadIdx.x;
+    if (h >= H || ki >= T || d >= dh) return;
+    float s = 0.0f;
+    for (int qi = ki; qi < T; qi++)
+        s += __half2float(attn[h*T*T + qi*T + ki]) * __half2float(d_ctx[h*T*dh + qi*dh + d]);
+    dv[h*T*dh + ki*dh + d] = __float2half(__half2float(dv[h*T*dh + ki*dh + d]) + s);
+}
+
+// Backward d_attn: d_attn[h,qi,ki] = dot(d_ctx[h,qi], V[h,ki])  (ki<=qi)
+// Grid: (H, T, 1)  Block: (T, 1, 1)
+extern "C" __global__ void mha_dattn(
+    const __half* d_ctx, const __half* v, __half* d_attn,
+    int H, int T, int dh)
+{
+    int h  = blockIdx.x;
+    int qi = blockIdx.y;
+    int ki = threadIdx.x;
+    if (h >= H || qi >= T || ki >= T) return;
+    if (ki > qi) { d_attn[h*T*T + qi*T + ki] = __float2half(0.0f); return; }
+    float s = 0.0f;
+    const __half* dcv = d_ctx + h*T*dh + qi*dh;
+    const __half* vv  = v + h*T*dh + ki*dh;
+    for (int d = 0; d < dh; d++) s += __half2float(dcv[d]) * __half2float(vv[d]);
+    d_attn[h*T*T + qi*T + ki] = __float2half(s);
+}
+
+// Backward d_q: dq[h,qi,d] += sum_{ki<=qi} d_attn_pre[h,qi,ki]*K[h,ki,d]
+// Grid: (H, T, 1)  Block: (dh, 1, 1)
+extern "C" __global__ void mha_dq(
+    const __half* d_attn_pre, const __half* k, __half* dq,
+    int H, int T, int dh)
+{
+    int h  = blockIdx.x;
+    int qi = blockIdx.y;
+    int d  = threadIdx.x;
+    if (h >= H || qi >= T || d >= dh) return;
+    float s = 0.0f;
+    for (int ki = 0; ki <= qi; ki++)
+        s += __half2float(d_attn_pre[h*T*T + qi*T + ki]) * __half2float(k[h*T*dh + ki*dh + d]);
+    dq[h*T*dh + qi*dh + d] = __float2half(__half2float(dq[h*T*dh + qi*dh + d]) + s);
+}
+
+// Backward d_k: dk[h,ki,d] += sum_{qi>=ki} d_attn_pre[h,qi,ki]*Q[h,qi,d]
+// Grid: (H, T, 1)  Block: (dh, 1, 1)
+extern "C" __global__ void mha_dk(
+    const __half* d_attn_pre, const __half* q, __half* dk,
+    int H, int T, int dh)
+{
+    int h  = blockIdx.x;
+    int ki = blockIdx.y;
+    int d  = threadIdx.x;
+    if (h >= H || ki >= T || d >= dh) return;
+    float s = 0.0f;
+    for (int qi = ki; qi < T; qi++)
+        s += __half2float(d_attn_pre[h*T*T + qi*T + ki]) * __half2float(q[h*T*dh + qi*dh + d]);
+    dk[h*T*dh + ki*dh + d] = __float2half(__half2float(dk[h*T*dh + ki*dh + d]) + s);
+}
+
+// CE loss + d_logits for masked positions
+// Grid: (T, 1, 1)  Block: (256, 1, 1)  shared: 256*4 bytes
+extern "C" __global__ void softmax_ce_masked(
+    const __half* logits,
+    float*        d_logits,
+    float*        loss_acc,
+    const int*    targets,
+    const float*  mask,
+    int T, int V, float scale)
+{
+    extern __shared__ float shmem[];
+    int t   = blockIdx.x;
+    int tid = threadIdx.x;
+    int bsz = blockDim.x;
+    if (t >= T) return;
+    if (fabsf(mask[t]) < 0.5f) { return; }
+
+    const __half* row  = logits   + (long)t * V;
+    float*        drow = d_logits + (long)t * V;
+    int tgt = targets[t];
+    if (tgt < 0 || tgt >= V) return;
+
+    // max
+    float mx = -1e30f;
+    for (int v = tid; v < V; v += bsz) mx = fmaxf(mx, __half2float(row[v]));
+    shmem[tid] = mx;
+    __syncthreads();
+    for (int s = bsz/2; s > 0; s >>= 1) {
+        if (tid < s) shmem[tid] = fmaxf(shmem[tid], shmem[tid+s]);
+        __syncthreads();
+    }
+    mx = shmem[0];
+    __syncthreads();
+
+    // sum exp
+    float sm = 0.0f;
+    for (int v = tid; v < V; v += bsz) sm += __expf(__half2float(row[v]) - mx);
+    shmem[tid] = sm;
+    __syncthreads();
+    for (int s = bsz/2; s > 0; s >>= 1) {
+        if (tid < s) shmem[tid] += shmem[tid+s];
+        __syncthreads();
+    }
+    float inv = __frcp_rn(shmem[0]);
+    __syncthreads();
+
+    // d_logits = (prob - onehot) * scale
+    for (int v = tid; v < V; v += bsz) {
+        float prob = __expf(__half2float(row[v]) - mx) * inv;
+        drow[v] = (prob - (v == tgt ? 1.0f : 0.0f)) * scale;
+    }
+    if (tid == 0) {
+        float tp = __expf(__half2float(row[tgt]) - mx) * inv;
+        atomicAdd(loss_acc, -__logf(fmaxf(tp, 1e-9f)));
+    }
+}
+
+// Bias grad: g_bias[j] += sum_t dx[t,j]  (atomicAdd into f32)
+// Grid: ceil(N/256)  Block: 256
+extern "C" __global__ void bias_grad_f16_to_f32(
+    const __half* dx, float* g_bias, int T, int N)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= N) return;
+    float s = 0.0f;
+    for (int t = 0; t < T; t++) s += __half2float(dx[t*N+j]);
+    atomicAdd(&g_bias[j], s);
+}
+
+// LayerNorm backward v2: dx (f16 +=), dgamma/dbeta f32 atomicAdd
+// One block per row, 32 threads
+extern "C" __global__ void layer_norm_bwd_v2(
+    __half*       dx,
+    float*        dgamma,
+    float*        dbeta,
+    const __half* dy,
+    const __half* x,
+    const float*  mean,
+    const float*  rstd,
+    const __half* gamma,
+    int N, int D)
+{
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= N) return;
+
+    const __half* dyr = dy  + row * D;
+    const __half* xr  = x   + row * D;
+    __half*       dxr = dx  + row * D;
+    float mu = mean[row], rs = rstd[row];
+
+    float s1 = 0.0f, s2 = 0.0f;
+    for (int i = tid; i < D; i += 32) {
+        float dyi = __half2float(dyr[i]);
+        float gi  = __half2float(gamma[i]);
+        float xh  = (__half2float(xr[i]) - mu) * rs;
+        s1 += dyi * gi;
+        s2 += dyi * gi * xh;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        s1 += __shfl_xor_sync(0xffffffff, s1, off);
+        s2 += __shfl_xor_sync(0xffffffff, s2, off);
+    }
+    float inv_D = 1.0f / (float)D;
+    for (int i = tid; i < D; i += 32) {
+        float dyi = __half2float(dyr[i]);
+        float gi  = __half2float(gamma[i]);
+        float xh  = (__half2float(xr[i]) - mu) * rs;
+        float dx_ = rs * (dyi*gi - inv_D*s1 - inv_D*xh*s2);
+        dxr[i] = __float2half(__half2float(dxr[i]) + dx_);
+        atomicAdd(&dgamma[i], dyi * xh);
+        atomicAdd(&dbeta[i],  dyi);
+    }
+}
+
+// Adam update: f32 grad → f16 param, f32 moments
+extern "C" __global__ void adam_update_f16_from_f32(
+    __half*      param,
+    float*       m,
+    float*       v,
+    const float* grad,
+    float lr, float b1, float b2, float eps, float bc1, float bc2,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g  = grad[i];
+    float m_ = b1*m[i] + (1.0f-b1)*g;
+    float v_ = b2*v[i] + (1.0f-b2)*g*g;
+    m[i] = m_; v[i] = v_;
+    float p = __half2float(param[i]) - lr*(m_/bc1)/(__fsqrt_rn(v_/bc2)+eps);
+    param[i] = __float2half(p);
+}
+
+// Scatter-add embedding grad (f32): g_embed[ids[t],d] += dx[t,d]
+// Grid: (T, ceil(D/256), 1)  Block: (256, 1, 1)
+extern "C" __global__ void embedding_bwd_f32(
+    const __half* dx, const int* ids, float* g_embed, int T, int D)
+{
+    int t = blockIdx.x;
+    int d = threadIdx.x + blockIdx.y * blockDim.x;
+    if (t >= T || d >= D) return;
+    atomicAdd(&g_embed[(long)ids[t]*D+d], __half2float(dx[t*D+d]));
+}
+
+// Positional embedding grad: g_pos[t,d] += dx[t,d]
+// Grid: (T, ceil(D/256), 1)  Block: (256, 1, 1)
+extern "C" __global__ void pos_grad_add_f32(
+    const __half* dx, float* g_pos, int T, int D)
+{
+    int t = blockIdx.x;
+    int d = threadIdx.x + blockIdx.y * blockDim.x;
+    if (t >= T || d >= D) return;
+    atomicAdd(&g_pos[t*D+d], __half2float(dx[t*D+d]));
+}
+
+// d_logits f32 → f16 conversion for GEMM
+// Grid: ceil(n/256)  Block: 256
+extern "C" __global__ void f32_to_f16_2d(const float* in, __half* out, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = __float2half(in[i]);
+}
+
+// Adam update for embed/pos: f32 grad → f16 param
+// (reuses adam_update_f16_from_f32, same kernel)
+
+// Zero a single f32 scalar
+extern "C" __global__ void zero_scalar_f32(float* x)
+{
+    if (threadIdx.x == 0 && blockIdx.x == 0) x[0] = 0.0f;
+}
