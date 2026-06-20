@@ -20,3 +20,4 @@ tokenizer_sample.txt
 aria_checkpoint.json
 /logs
 ARIA_Train_Full.bat
+convert_txt.py
