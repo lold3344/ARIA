@@ -454,10 +454,10 @@ fn gemm_batched_f16(blas: &CudaBlas,
     // Row-major A[m,k] @ B[k,n] ≡ col-major (B^T)[n,k] @ (A^T)[k,m] → C^T[n,m]
     // Swap roles: cuBLAS "a" = our B, cuBLAS "b" = our A; swap m↔n
     let (transa_op, lda, stride_a) = if transb {
-        // our B is [n,k] in row-major → col-major it's [k,n] → need CUBLAS_OP_T to get [n,k]^T=[k,n]
-        (CUBLAS_OP_T, n as i32, (n * k) as i64)
+        // our B is [n,k] in row-major → col-major it's [k,n] → CUBLAS_OP_T; lda = k (rows in col-major)
+        (CUBLAS_OP_T, k as i32, (n * k) as i64)
     } else {
-        // our B is [k,n] in row-major → col-major it's [n,k], no transpose needed
+        // our B is [k,n] in row-major → col-major it's [n,k], no transpose; lda = n
         (CUBLAS_OP_N, n as i32, (k * n) as i64)
     };
     let cfg = StridedBatchedConfig::<f16> {
