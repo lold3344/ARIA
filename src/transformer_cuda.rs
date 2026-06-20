@@ -1040,16 +1040,10 @@ impl TransformerModel {
             let chunk_end = (chunk_start + micro_n).min(nb);
             let cn = chunk_end - chunk_start; // actual sequences in this chunk
 
-            // Full chunks use a fixed shape (t=mt) so a CUDA Graph can be captured and replayed.
-            // Partial chunks (last chunk, cn < micro_n) fall back to normal execution.
-            let use_graph = cn == micro_n;
-            let t = if use_graph {
-                mt  // fixed shape for graph capture/replay
-            } else {
-                (chunk_start..chunk_end)
-                    .map(|i| seqs[i].len().min(mt))
-                    .max().unwrap_or(0)
-            };
+            // Max sequence length in this chunk
+            let t = (chunk_start..chunk_end)
+                .map(|i| seqs[i].len().min(mt))
+                .max().unwrap_or(0);
             if t < 2 { chunk_start = chunk_end; continue; }
 
             let nt = cn * t;  // total tokens: cn sequences × t each
@@ -1079,24 +1073,9 @@ impl TransformerModel {
             if !chunk_has_tgt { chunk_start = chunk_end; continue; }
             counted += cn;
 
-            // Upload input data — always outside the graph so each replay sees fresh data
             self.stream.memcpy_htod(&ids_flat, &mut self.ids_buf).unwrap();
             self.stream.memcpy_htod(&tgt_flat, &mut self.tgt_buf).unwrap();
             self.stream.memcpy_htod(&msk_flat, &mut self.msk_buf).unwrap();
-
-            // ── CUDA GRAPH replay (skip compute, just re-launch captured graph) ──
-            if use_graph && self.cuda_graph.is_some() {
-                self.cuda_graph.as_ref().unwrap().launch().unwrap();
-                chunk_start = chunk_end;
-                continue;
-            }
-
-            let capturing = use_graph && self.cuda_graph.is_none();
-            if capturing {
-                self.stream.begin_capture(
-                    cudarc::driver::sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_GLOBAL
-                ).unwrap();
-            }
 
             // ── FORWARD PASS ─────────────────────────────────────────
             // embedding_pos_fwd_nb: x_buf[nt,d] = embed[ids[gt]] + pos[gt%t]
@@ -1697,19 +1676,6 @@ impl TransformerModel {
                         .arg(&(nt as i32)).arg(&(t as i32)).arg(&(d as i32))
                         .launch(cfg).unwrap();
                 }
-            }
-
-            // ── CUDA GRAPH capture: end recording and store the instantiated graph ──
-            if capturing {
-                let flags = unsafe {
-                    std::mem::transmute::<u32, cudarc::driver::sys::CUgraphInstantiate_flags>(0u32)
-                };
-                let graph = self.stream.end_capture(flags).unwrap().unwrap();
-                graph.upload().unwrap();
-                // The kernels were recorded but NOT executed during capture; launch now.
-                graph.launch().unwrap();
-                self.cuda_graph = Some(graph);
-                println!("[GPU] CUDA Graph captured and launched for micro_n={micro_n} t={mt}");
             }
 
             chunk_start = chunk_end;
