@@ -167,7 +167,7 @@ data base/
 Пример — тестовый запуск на 100k последовательностей:
 
 ```powershell
-$env:ARIA_MAX_SEQS="100000"
+$env:ARIA_MAX_SEQS="200000"
 $env:ARIA_EPOCHS="1"
 .\target\release\train_fresh.exe
 ```
