@@ -1742,53 +1742,73 @@ impl TransformerModel {
     //  Checkpoint
     // ─────────────────────────────────────────────────────────────
     pub fn save_checkpoint(&self, path: &str) -> anyhow::Result<()> {
-        use serde_json::json;
-        let mut obj = serde_json::Map::new();
-        obj.insert("version".into(), json!("transformer_v1"));
-        obj.insert("vocab_size".into(),  json!(self.vocab_size));
-        obj.insert("d_model".into(),     json!(self.d_model));
-        obj.insert("num_heads".into(),   json!(self.num_heads));
-        obj.insert("num_layers".into(),  json!(self.num_layers));
-        obj.insert("ffn_dim".into(),     json!(self.ffn_dim));
-        obj.insert("max_seq_len".into(), json!(self.max_seq_len));
-        obj.insert("adam_step".into(),   json!(self.adam_step));
-
-        obj.insert("embed".into(),     json!(b64_f16(&self.stream, &self.embed)));
-        obj.insert("pos_embed".into(), json!(b64_f16(&self.stream, &self.pos_embed)));
-        obj.insert("m_embed".into(),   json!(b64_f32(&self.stream, &self.m_embed)));
-        obj.insert("v_embed".into(),   json!(b64_f32(&self.stream, &self.v_embed)));
-        obj.insert("m_pos".into(),     json!(b64_f32(&self.stream, &self.m_pos)));
-        obj.insert("v_pos".into(),     json!(b64_f32(&self.stream, &self.v_pos)));
-        obj.insert("ln_f_g".into(),    json!(b64_f16(&self.stream, &self.ln_f_g)));
-        obj.insert("ln_f_b".into(),    json!(b64_f16(&self.stream, &self.ln_f_b)));
-        obj.insert("m_ln_f_g".into(),  json!(b64_f32(&self.stream, &self.m_ln_f_g)));
-        obj.insert("v_ln_f_g".into(),  json!(b64_f32(&self.stream, &self.v_ln_f_g)));
-        obj.insert("m_ln_f_b".into(),  json!(b64_f32(&self.stream, &self.m_ln_f_b)));
-        obj.insert("v_ln_f_b".into(),  json!(b64_f32(&self.stream, &self.v_ln_f_b)));
-
-        let mut layers_json = Vec::new();
-        for l in &self.layers {
-            let mut lj = serde_json::Map::new();
-            macro_rules! s16 { ($f:ident) => { lj.insert(stringify!($f).into(), json!(b64_f16(&self.stream, &l.$f))); } }
-            macro_rules! s32 { ($f:ident) => { lj.insert(stringify!($f).into(), json!(b64_f32(&self.stream, &l.$f))); } }
-            s16!(w_qkv); s16!(b_qkv); s16!(w_out); s16!(b_out);
-            s16!(w_ff1); s16!(b_ff1); s16!(w_ff2); s16!(b_ff2);
-            s16!(ln1_g); s16!(ln1_b); s16!(ln2_g); s16!(ln2_b);
-            s32!(m_w_qkv); s32!(v_w_qkv); s32!(m_b_qkv); s32!(v_b_qkv);
-            s32!(m_w_out);  s32!(v_w_out);  s32!(m_b_out);  s32!(v_b_out);
-            s32!(m_w_ff1);  s32!(v_w_ff1);  s32!(m_b_ff1);  s32!(v_b_ff1);
-            s32!(m_w_ff2);  s32!(v_w_ff2);  s32!(m_b_ff2);  s32!(v_b_ff2);
-            s32!(m_ln1_g);  s32!(v_ln1_g);  s32!(m_ln1_b);  s32!(v_ln1_b);
-            s32!(m_ln2_g);  s32!(v_ln2_g);  s32!(m_ln2_b);  s32!(v_ln2_b);
-            layers_json.push(serde_json::Value::Object(lj));
-        }
-        obj.insert("layers".into(), serde_json::Value::Array(layers_json));
-
-        let json = serde_json::Value::Object(obj);
+        use std::io::{BufWriter, Write as IoWrite};
         if let Some(parent) = std::path::Path::new(path).parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, serde_json::to_string(&json)?)?;
+        let file = fs::File::create(path)?;
+        let mut w = BufWriter::with_capacity(4 * 1024 * 1024, file);
+
+        // Write one tensor at a time directly to disk — avoids holding the full JSON in RAM
+        macro_rules! w16 { ($key:expr, $buf:expr, $comma:expr) => {{
+            let s = b64_f16(&self.stream, $buf);
+            if $comma { write!(w, ",")?; }
+            write!(w, "\"{}\":\"{}\"", $key, s)?;
+        }}}
+        macro_rules! w32 { ($key:expr, $buf:expr) => {{
+            let s = b64_f32(&self.stream, $buf);
+            write!(w, ",\"{}\":\"{}\"", $key, s)?;
+        }}}
+
+        write!(w, "{{")?;
+        write!(w, "\"version\":\"transformer_v1\"")?;
+        write!(w, ",\"vocab_size\":{}", self.vocab_size)?;
+        write!(w, ",\"d_model\":{}", self.d_model)?;
+        write!(w, ",\"num_heads\":{}", self.num_heads)?;
+        write!(w, ",\"num_layers\":{}", self.num_layers)?;
+        write!(w, ",\"ffn_dim\":{}", self.ffn_dim)?;
+        write!(w, ",\"max_seq_len\":{}", self.max_seq_len)?;
+        write!(w, ",\"adam_step\":{}", self.adam_step)?;
+
+        w16!("embed",     &self.embed,     true);
+        w16!("pos_embed", &self.pos_embed, false);
+        w32!("m_embed",   &self.m_embed);
+        w32!("v_embed",   &self.v_embed);
+        w32!("m_pos",     &self.m_pos);
+        w32!("v_pos",     &self.v_pos);
+        w16!("ln_f_g",    &self.ln_f_g,   false);
+        w16!("ln_f_b",    &self.ln_f_b,   false);
+        w32!("m_ln_f_g",  &self.m_ln_f_g);
+        w32!("v_ln_f_g",  &self.v_ln_f_g);
+        w32!("m_ln_f_b",  &self.m_ln_f_b);
+        w32!("v_ln_f_b",  &self.v_ln_f_b);
+
+        write!(w, ",\"layers\":[")?;
+        for (i, l) in self.layers.iter().enumerate() {
+            if i > 0 { write!(w, ",")?; }
+            write!(w, "{{")?;
+            macro_rules! l16 { ($f:ident, $first:expr) => {{
+                let s = b64_f16(&self.stream, &l.$f);
+                if $first { write!(w, "\"{}\":\"{}\"", stringify!($f), s)?; }
+                else      { write!(w, ",\"{}\":\"{}\"", stringify!($f), s)?; }
+            }}}
+            macro_rules! l32 { ($f:ident) => {{
+                let s = b64_f32(&self.stream, &l.$f);
+                write!(w, ",\"{}\":\"{}\"", stringify!($f), s)?;
+            }}}
+            l16!(w_qkv, true); l16!(b_qkv, false); l16!(w_out, false); l16!(b_out, false);
+            l16!(w_ff1, false); l16!(b_ff1, false); l16!(w_ff2, false); l16!(b_ff2, false);
+            l16!(ln1_g, false); l16!(ln1_b, false); l16!(ln2_g, false); l16!(ln2_b, false);
+            l32!(m_w_qkv); l32!(v_w_qkv); l32!(m_b_qkv); l32!(v_b_qkv);
+            l32!(m_w_out);  l32!(v_w_out);  l32!(m_b_out);  l32!(v_b_out);
+            l32!(m_w_ff1);  l32!(v_w_ff1);  l32!(m_b_ff1);  l32!(v_b_ff1);
+            l32!(m_w_ff2);  l32!(v_w_ff2);  l32!(m_b_ff2);  l32!(v_b_ff2);
+            l32!(m_ln1_g);  l32!(v_ln1_g);  l32!(m_ln1_b);  l32!(v_ln1_b);
+            l32!(m_ln2_g);  l32!(v_ln2_g);  l32!(m_ln2_b);  l32!(v_ln2_b);
+            write!(w, "}}")?;
+        }
+        write!(w, "]}}")?;
+        w.flush()?;
         println!("  Checkpoint saved → {}", path);
         Ok(())
     }

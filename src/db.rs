@@ -29,6 +29,17 @@ pub fn insert_dialog(
     Ok(())
 }
 
+pub fn load_recent_dialogs(db_path: &str, n: usize) -> Result<Vec<DialogEntry>> {
+    let content = fs::read_to_string(db_path).unwrap_or_else(|_| "[]".to_string());
+    let dialogs: Vec<serde_json::Value> = serde_json::from_str(&content).unwrap_or_default();
+    let recent = dialogs.iter().rev().take(n * 2).collect::<Vec<_>>();
+    let mut result: Vec<DialogEntry> = recent.iter().rev()
+        .filter_map(|v| serde_json::from_value((*v).clone()).ok())
+        .collect();
+    result.truncate(n * 2);
+    Ok(result)
+}
+
 pub fn update_dialog_reward(
     db_path: &str,
     dialog_id: &str,

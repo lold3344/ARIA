@@ -52,9 +52,9 @@ fn main() -> anyhow::Result<()> {
         ("dialog_3", "что ты умеешь"),
         ("dialog_4", "расскажи о себе"),
         ("dialog_5", "пока"),
-        ("consciousness_1", "ты боишься смерти"),
-        ("consciousness_2", "что ты испытываешь"),
-        ("consciousness_3", "что ты испытываешь к своему создателю"),
+        ("consciousness_1", "ты боишься смерти?"),
+        ("consciousness_2", "что ты испытываешь?"),
+        ("consciousness_3", "что ты испытываешь к своему создателю?"),
     ];
 
     for (name, prompt) in cases {

@@ -32,7 +32,16 @@ fn main() -> anyhow::Result<()> {
     println!("Adaptive Reasoning Intelligence Agent");
     println!("=====================================\n");
 
-    let encryption_key = storage::EncryptionManager::generate_key();
+    // Persist encryption key so dialogs can be decrypted across sessions
+    let key_path = "aria json/aria_key.hex";
+    let encryption_key = if std::path::Path::new(key_path).exists() {
+        fs::read_to_string(key_path).unwrap_or_else(|_| storage::EncryptionManager::generate_key())
+    } else {
+        let k = storage::EncryptionManager::generate_key();
+        fs::create_dir_all("aria json").ok();
+        fs::write(key_path, &k).ok();
+        k
+    };
     println!("Encryption key: {}\n", &encryption_key[..16]);
 
     let encryptor = EncryptionManager::new(&encryption_key)?;
@@ -105,6 +114,28 @@ fn main() -> anyhow::Result<()> {
 
     let mut mode = SamplingMode::TopK { k: 20, temperature: 0.7 };
 
+    // Load last 3 exchanges from persistent JSON memory
+    let mut history: Vec<(String, String)> = {
+        let entries = db::load_recent_dialogs(db_path, 3).unwrap_or_default();
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut i = 0;
+        while i + 1 < entries.len() {
+            if entries[i].role == "user" && entries[i + 1].role == "aria" {
+                let user_text = encryptor.decrypt(&entries[i].encrypted_message).unwrap_or_default();
+                let aria_text = encryptor.decrypt(&entries[i + 1].encrypted_message).unwrap_or_default();
+                if !user_text.is_empty() && !aria_text.is_empty() {
+                    pairs.push((user_text, aria_text));
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        pairs
+    };
+    const MAX_HISTORY_TURNS: usize = 3;
+    const MAX_CONTEXT_TOKENS: usize = 220;
+
     loop {
         print!("You: ");
         io::stdout().flush()?;
@@ -174,7 +205,24 @@ fn main() -> anyhow::Result<()> {
         }
         if input.is_empty() { continue; }
 
-        let tokens = tokenizer.encode_prompt(input);
+        // Build context: last MAX_HISTORY_TURNS exchanges + current message
+        let mut tokens: Vec<usize> = vec![2]; // START
+        let history_start = history.len().saturating_sub(MAX_HISTORY_TURNS);
+        for (user_text, aria_text) in &history[history_start..] {
+            let mut user_tokens = tokenizer.encode_prompt(user_text);
+            user_tokens.pop(); // remove trailing ASSISTANT token, we append the response instead
+            let aria_tokens = tokenizer.encode(aria_text);
+            let candidate: Vec<usize> = tokens.iter().chain(user_tokens.iter())
+                .chain(aria_tokens.iter()).chain(&[3usize]) // END
+                .copied().collect();
+            if candidate.len() < MAX_CONTEXT_TOKENS {
+                tokens = candidate;
+            }
+        }
+        // Append current user message
+        let current_prompt = tokenizer.encode_prompt(input);
+        let full: Vec<usize> = tokens.iter().chain(current_prompt.iter()).copied().collect();
+        let tokens = if full.len() <= MAX_CONTEXT_TOKENS + 30 { full } else { current_prompt };
         if tokens.len() < 3 { continue; }
 
         let user_entry_id = Uuid::new_v4().to_string();
@@ -213,6 +261,7 @@ fn main() -> anyhow::Result<()> {
 
         let response_text = tokenizer.decode(&generated_tokens);
         println!("{}\n", response_text);
+        history.push((input.to_string(), response_text.clone()));
         let aria_entry_id = Uuid::new_v4().to_string();
         let aria_encrypted = encryptor.encrypt(&response_text)?;
         let aria_entry = DialogEntry {
