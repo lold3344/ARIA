@@ -56,6 +56,7 @@ fn main() {
 
     let cl = find_cl_exe();
 
+    // ── 1. Compile kernels.cu → PTX (device kernels) ──────────────
     let mut args = vec![
         kernel_src.to_string(),
         "--ptx".to_string(),
@@ -70,7 +71,6 @@ fn main() {
         args.push("-ccbin".to_string());
         args.push(cc.clone());
     } else {
-        // No cl.exe found — try compiling device-only (no host code in our kernel)
         println!("cargo:warning=cl.exe not found, trying nvcc without host compiler flag");
     }
 
@@ -80,7 +80,6 @@ fn main() {
         .expect("nvcc not found — ensure CUDA Toolkit is installed and nvcc is in PATH");
 
     if !status.success() {
-        // If it failed and we had no cl.exe, give a helpful message
         if cl.is_none() {
             panic!(
                 "nvcc PTX compilation failed.\n\

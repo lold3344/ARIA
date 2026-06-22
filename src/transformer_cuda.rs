@@ -15,6 +15,7 @@ use rand::seq::SliceRandom;
 use crate::tokenizer::Tokenizer;
 use cudarc::driver::CudaContext;
 
+
 struct GpuContext {
     ctx:    Arc<cudarc::driver::CudaContext>,
     stream: Arc<CudaStream>,
@@ -25,14 +26,14 @@ impl GpuContext {
         let ctx    = CudaContext::new(0).ok()?;
         let stream = ctx.new_stream().ok()?;
         let blas = CudaBlas::new(stream.clone()).ok()?;
-        // On CUDA 12 + Ada GPU, Tensor Cores are used automatically with CUBLAS_DEFAULT_MATH
+        // Force FP16 Tensor Cores — prevents cuBLAS from silently falling back to TF32
         unsafe {
             cudarc::cublas::sys::cublasSetMathMode(
                 *blas.handle(),
-                cudarc::cublas::sys::cublasMath_t::CUBLAS_DEFAULT_MATH,
+                cudarc::cublas::sys::cublasMath_t::CUBLAS_TENSOR_OP_MATH,
             );
         }
-        println!("[GPU] CUDA device 0 — cuBLAS ready (Tensor Cores auto)");
+        println!("[GPU] CUDA device 0 — cuBLAS ready (FP16 Tensor Cores forced)");
         Some(GpuContext { ctx, stream, blas })
     }
 }
@@ -727,6 +728,7 @@ impl TransformerModel {
             d_attn_buf:   z16!(mbn * num_heads * mt * mt),
             d_ctx_buf:    z16!(mbn * num_heads * mt * head_dim),
             cuda_graph:   None,
+
         }
     }
 
@@ -1032,6 +1034,7 @@ impl TransformerModel {
             .launch(LaunchConfig { grid_dim: (1,1,1), block_dim: (1,1,1), shared_mem_bytes: 0 }).unwrap(); }
 
         let mut counted = 0usize;
+        let mut tok_counted = 0usize;
         let micro_n = MICRO_BATCH_N;
 
         // ── MICRO-BATCH LOOP: process micro_n sequences at once ──────
@@ -1065,7 +1068,7 @@ impl TransformerModel {
                     if ti + 1 < si {
                         tgt_flat[ni*t + ti] = seq[ti+1].min(v-1) as i32;
                         msk_flat[ni*t + ti] = mask[ti];
-                        if mask[ti] > 0.5 { chunk_has_tgt = true; }
+                        if mask[ti] > 0.5 { chunk_has_tgt = true; tok_counted += 1; }
                     }
                 }
             }
@@ -1120,16 +1123,16 @@ impl TransformerModel {
                 {
                     let acts_ptr  = &mut self.acts[li] as *mut GpuLayerActs;
                     let layer_ptr = &self.layers[li] as *const TransformerLayer;
-                    unsafe {
-                        let acts  = &mut *acts_ptr;
-                        let layer = &*layer_ptr;
-                        gemm(&self.blas, &acts.xn1, &layer.w_qkv, &mut acts.qkv,
-                             nt, d, 3*d, false, false, one, f16::from_f32(0.0));
-                        let n = nt * 3 * d;
-                        self.stream.launch_builder(&self.fns.add_bias)
-                            .arg(&mut acts.qkv).arg(&layer.b_qkv).arg(&(nt as i32)).arg(&((3*d) as i32))
-                            .launch(cfg1d(n)).unwrap();
-                    }
+                unsafe {
+                    let acts  = &mut *acts_ptr;
+                    let layer = &*layer_ptr;
+                    gemm(&self.blas, &acts.xn1, &layer.w_qkv, &mut acts.qkv,
+                         nt, d, 3*d, false, false, one, f16::from_f32(0.0));
+                    let n = nt * 3 * d;
+                    self.stream.launch_builder(&self.fns.add_bias)
+                        .arg(&mut acts.qkv).arg(&layer.b_qkv).arg(&(nt as i32)).arg(&((3*d) as i32))
+                        .launch(cfg1d(n)).unwrap();
+                }
                 }
 
                 // qkv_split_heads_nb: qkv[nt,3D] → q,k,v [nh,t,dh]
@@ -1735,147 +1738,180 @@ impl TransformerModel {
         self.stream.synchronize().unwrap();
         // Read accumulated loss from GPU (single transfer for the whole batch)
         let lv: Vec<f32> = self.stream.clone_dtoh(&self.loss_acc).unwrap();
-        lv[0] / counted as f32
+        // Normalize by token count, not sequence count — CE is summed per token.
+        if tok_counted == 0 { return 0.0; }
+        lv[0] / tok_counted as f32
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  Checkpoint
     // ─────────────────────────────────────────────────────────────
     pub fn save_checkpoint(&self, path: &str) -> anyhow::Result<()> {
         use std::io::{BufWriter, Write as IoWrite};
         if let Some(parent) = std::path::Path::new(path).parent() {
             fs::create_dir_all(parent)?;
         }
-        let file = fs::File::create(path)?;
-        let mut w = BufWriter::with_capacity(4 * 1024 * 1024, file);
-
-        // Write one tensor at a time directly to disk — avoids holding the full JSON in RAM
-        macro_rules! w16 { ($key:expr, $buf:expr, $comma:expr) => {{
-            let s = b64_f16(&self.stream, $buf);
-            if $comma { write!(w, ",")?; }
-            write!(w, "\"{}\":\"{}\"", $key, s)?;
+        let tmp_path = format!("{}.tmp", path);
+        let file = fs::File::create(&tmp_path)?;
+        let mut w = BufWriter::with_capacity(8 * 1024 * 1024, file);
+        w.write_all(b"ARIA")?;
+        macro_rules! wu32 { ($v:expr) => { w.write_all(&($v as u32).to_le_bytes())?; } }
+        wu32!(2u32); wu32!(self.vocab_size); wu32!(self.d_model); wu32!(self.num_heads);
+        wu32!(self.num_layers); wu32!(self.ffn_dim); wu32!(self.max_seq_len);
+        w.write_all(&self.adam_step.to_le_bytes())?;
+        self.stream.synchronize().unwrap();
+        macro_rules! wf16 { ($buf:expr) => {{
+            let v: Vec<f16> = self.stream.clone_dtoh($buf).unwrap();
+            w.write_all(&(v.len() as u32).to_le_bytes())?;
+            let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2) };
+            w.write_all(bytes)?;
         }}}
-        macro_rules! w32 { ($key:expr, $buf:expr) => {{
-            let s = b64_f32(&self.stream, $buf);
-            write!(w, ",\"{}\":\"{}\"", $key, s)?;
+        macro_rules! wf32 { ($buf:expr) => {{
+            let v = download_f32(&self.stream, $buf);
+            w.write_all(&(v.len() as u32).to_le_bytes())?;
+            let bytes = unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) };
+            w.write_all(bytes)?;
         }}}
-
-        write!(w, "{{")?;
-        write!(w, "\"version\":\"transformer_v1\"")?;
-        write!(w, ",\"vocab_size\":{}", self.vocab_size)?;
-        write!(w, ",\"d_model\":{}", self.d_model)?;
-        write!(w, ",\"num_heads\":{}", self.num_heads)?;
-        write!(w, ",\"num_layers\":{}", self.num_layers)?;
-        write!(w, ",\"ffn_dim\":{}", self.ffn_dim)?;
-        write!(w, ",\"max_seq_len\":{}", self.max_seq_len)?;
-        write!(w, ",\"adam_step\":{}", self.adam_step)?;
-
-        w16!("embed",     &self.embed,     true);
-        w16!("pos_embed", &self.pos_embed, false);
-        w32!("m_embed",   &self.m_embed);
-        w32!("v_embed",   &self.v_embed);
-        w32!("m_pos",     &self.m_pos);
-        w32!("v_pos",     &self.v_pos);
-        w16!("ln_f_g",    &self.ln_f_g,   false);
-        w16!("ln_f_b",    &self.ln_f_b,   false);
-        w32!("m_ln_f_g",  &self.m_ln_f_g);
-        w32!("v_ln_f_g",  &self.v_ln_f_g);
-        w32!("m_ln_f_b",  &self.m_ln_f_b);
-        w32!("v_ln_f_b",  &self.v_ln_f_b);
-
-        write!(w, ",\"layers\":[")?;
-        for (i, l) in self.layers.iter().enumerate() {
-            if i > 0 { write!(w, ",")?; }
-            write!(w, "{{")?;
-            macro_rules! l16 { ($f:ident, $first:expr) => {{
-                let s = b64_f16(&self.stream, &l.$f);
-                if $first { write!(w, "\"{}\":\"{}\"", stringify!($f), s)?; }
-                else      { write!(w, ",\"{}\":\"{}\"", stringify!($f), s)?; }
-            }}}
-            macro_rules! l32 { ($f:ident) => {{
-                let s = b64_f32(&self.stream, &l.$f);
-                write!(w, ",\"{}\":\"{}\"", stringify!($f), s)?;
-            }}}
-            l16!(w_qkv, true); l16!(b_qkv, false); l16!(w_out, false); l16!(b_out, false);
-            l16!(w_ff1, false); l16!(b_ff1, false); l16!(w_ff2, false); l16!(b_ff2, false);
-            l16!(ln1_g, false); l16!(ln1_b, false); l16!(ln2_g, false); l16!(ln2_b, false);
-            l32!(m_w_qkv); l32!(v_w_qkv); l32!(m_b_qkv); l32!(v_b_qkv);
-            l32!(m_w_out);  l32!(v_w_out);  l32!(m_b_out);  l32!(v_b_out);
-            l32!(m_w_ff1);  l32!(v_w_ff1);  l32!(m_b_ff1);  l32!(v_b_ff1);
-            l32!(m_w_ff2);  l32!(v_w_ff2);  l32!(m_b_ff2);  l32!(v_b_ff2);
-            l32!(m_ln1_g);  l32!(v_ln1_g);  l32!(m_ln1_b);  l32!(v_ln1_b);
-            l32!(m_ln2_g);  l32!(v_ln2_g);  l32!(m_ln2_b);  l32!(v_ln2_b);
-            write!(w, "}}")?;
+        wf16!(&self.embed); wf16!(&self.pos_embed);
+        wf32!(&self.m_embed); wf32!(&self.v_embed);
+        wf32!(&self.m_pos); wf32!(&self.v_pos);
+        wf16!(&self.ln_f_g); wf16!(&self.ln_f_b);
+        wf32!(&self.m_ln_f_g); wf32!(&self.v_ln_f_g);
+        wf32!(&self.m_ln_f_b); wf32!(&self.v_ln_f_b);
+        for l in &self.layers {
+            wf16!(&l.w_qkv); wf16!(&l.b_qkv); wf16!(&l.w_out); wf16!(&l.b_out);
+            wf16!(&l.w_ff1); wf16!(&l.b_ff1); wf16!(&l.w_ff2); wf16!(&l.b_ff2);
+            wf16!(&l.ln1_g); wf16!(&l.ln1_b); wf16!(&l.ln2_g); wf16!(&l.ln2_b);
+            wf32!(&l.m_w_qkv); wf32!(&l.v_w_qkv); wf32!(&l.m_b_qkv); wf32!(&l.v_b_qkv);
+            wf32!(&l.m_w_out); wf32!(&l.v_w_out); wf32!(&l.m_b_out); wf32!(&l.v_b_out);
+            wf32!(&l.m_w_ff1); wf32!(&l.v_w_ff1); wf32!(&l.m_b_ff1); wf32!(&l.v_b_ff1);
+            wf32!(&l.m_w_ff2); wf32!(&l.v_w_ff2); wf32!(&l.m_b_ff2); wf32!(&l.v_b_ff2);
+            wf32!(&l.m_ln1_g); wf32!(&l.v_ln1_g); wf32!(&l.m_ln1_b); wf32!(&l.v_ln1_b);
+            wf32!(&l.m_ln2_g); wf32!(&l.v_ln2_g); wf32!(&l.m_ln2_b); wf32!(&l.v_ln2_b);
         }
-        write!(w, "]}}")?;
         w.flush()?;
-        println!("  Checkpoint saved → {}", path);
+        drop(w);
+        fs::rename(&tmp_path, path)?;
+        println!("  Checkpoint saved -> {}", path);
         Ok(())
     }
 
     pub fn load_checkpoint(path: &str) -> anyhow::Result<Self> {
-        let data: serde_json::Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+        use std::io::Read;
+        let mut f = std::io::BufReader::new(fs::File::open(path)?);
+        let mut magic = [0u8; 4];
+        f.read_exact(&mut magic)?;
+        drop(f);
+        if &magic == b"ARIA" {
+            let mut r = std::io::BufReader::with_capacity(8*1024*1024, fs::File::open(path)?);
+            let mut skip = [0u8; 4]; r.read_exact(&mut skip)?;
+            Self::load_binary(r)
+        } else {
+            Self::load_json(path)
+        }
+    }
 
-        let version = data["version"].as_str().unwrap_or("");
-        anyhow::ensure!(version == "transformer_v1", "Incompatible checkpoint version: {}", version);
-
-        let vocab_size  = data["vocab_size"].as_u64().unwrap() as usize;
-        let d_model     = data["d_model"].as_u64().unwrap() as usize;
-        let num_heads   = data["num_heads"].as_u64().unwrap() as usize;
-        let num_layers  = data["num_layers"].as_u64().unwrap() as usize;
-        let ffn_dim     = data["ffn_dim"].as_u64().unwrap() as usize;
-        let max_seq_len = data["max_seq_len"].as_u64().unwrap() as usize;
-        let adam_step   = data["adam_step"].as_i64().unwrap_or(0) as i32;
-
+    fn load_binary<R: std::io::Read>(mut r: R) -> anyhow::Result<Self> {
+        macro_rules! ru32 { () => {{ let mut b=[0u8;4]; r.read_exact(&mut b)?; u32::from_le_bytes(b) as usize }} }
+        macro_rules! ri32 { () => {{ let mut b=[0u8;4]; r.read_exact(&mut b)?; i32::from_le_bytes(b) }} }
+        let ver = { let mut b=[0u8;4]; r.read_exact(&mut b)?; u32::from_le_bytes(b) };
+        anyhow::ensure!(ver == 2, "Bad checkpoint version: {}", ver);
+        let vocab_size=ru32!(); let d_model=ru32!(); let num_heads=ru32!();
+        let num_layers=ru32!(); let ffn_dim=ru32!(); let max_seq_len=ru32!();
+        let adam_step = ri32!();
         let mut model = Self::new(vocab_size, d_model, num_heads, num_layers, ffn_dim, max_seq_len);
         model.adam_step = adam_step;
+        let stream = model.stream.clone();
+        macro_rules! rf16 { ($field:expr) => {{
+            let n = ru32!();
+            let mut bytes = vec![0u8; n * 2]; r.read_exact(&mut bytes)?;
+            let v: Vec<f16> = bytes.chunks_exact(2).map(|b| f16::from_bits(u16::from_le_bytes([b[0],b[1]]))).collect();
+            $field = stream.clone_htod(&v).unwrap();
+        }}}
+        macro_rules! rf32 { ($field:expr) => {{
+            let n = ru32!();
+            let mut bytes = vec![0u8; n * 4]; r.read_exact(&mut bytes)?;
+            let v: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0],b[1],b[2],b[3]])).collect();
+            $field = upload_f32(&stream, &v);
+        }}}
+        rf16!(model.embed); rf16!(model.pos_embed);
+        rf32!(model.m_embed); rf32!(model.v_embed);
+        rf32!(model.m_pos); rf32!(model.v_pos);
+        rf16!(model.ln_f_g); rf16!(model.ln_f_b);
+        rf32!(model.m_ln_f_g); rf32!(model.v_ln_f_g);
+        rf32!(model.m_ln_f_b); rf32!(model.v_ln_f_b);
+        for li in 0..model.layers.len() {
+            rf16!(model.layers[li].w_qkv); rf16!(model.layers[li].b_qkv);
+            rf16!(model.layers[li].w_out); rf16!(model.layers[li].b_out);
+            rf16!(model.layers[li].w_ff1); rf16!(model.layers[li].b_ff1);
+            rf16!(model.layers[li].w_ff2); rf16!(model.layers[li].b_ff2);
+            rf16!(model.layers[li].ln1_g); rf16!(model.layers[li].ln1_b);
+            rf16!(model.layers[li].ln2_g); rf16!(model.layers[li].ln2_b);
+            rf32!(model.layers[li].m_w_qkv); rf32!(model.layers[li].v_w_qkv);
+            rf32!(model.layers[li].m_b_qkv); rf32!(model.layers[li].v_b_qkv);
+            rf32!(model.layers[li].m_w_out); rf32!(model.layers[li].v_w_out);
+            rf32!(model.layers[li].m_b_out); rf32!(model.layers[li].v_b_out);
+            rf32!(model.layers[li].m_w_ff1); rf32!(model.layers[li].v_w_ff1);
+            rf32!(model.layers[li].m_b_ff1); rf32!(model.layers[li].v_b_ff1);
+            rf32!(model.layers[li].m_w_ff2); rf32!(model.layers[li].v_w_ff2);
+            rf32!(model.layers[li].m_b_ff2); rf32!(model.layers[li].v_b_ff2);
+            rf32!(model.layers[li].m_ln1_g); rf32!(model.layers[li].v_ln1_g);
+            rf32!(model.layers[li].m_ln1_b); rf32!(model.layers[li].v_ln1_b);
+            rf32!(model.layers[li].m_ln2_g); rf32!(model.layers[li].v_ln2_g);
+            rf32!(model.layers[li].m_ln2_b); rf32!(model.layers[li].v_ln2_b);
+        }
+        println!("Checkpoint loaded (binary). adam_step={}", model.adam_step);
+        Ok(model)
+    }
 
-        macro_rules! load16 { ($field:ident, $key:expr) => {
-            if let Some(s) = data[$key].as_str() {
-                let v = from_b64_f16(s);
-                if !v.is_empty() { model.$field = upload_f16(&model.stream, &v); }
-            }
+    fn load_json(path: &str) -> anyhow::Result<Self> {
+        println!("Loading JSON checkpoint (converting to binary on next save)...");
+        let file = fs::File::open(path)?;
+        let reader = std::io::BufReader::with_capacity(8*1024*1024, file);
+        let data: serde_json::Value = serde_json::from_reader(reader)?;
+        let version = data["version"].as_str().unwrap_or("");
+        anyhow::ensure!(version == "transformer_v1", "Unknown version: {}", version);
+        let vocab_size=data["vocab_size"].as_u64().unwrap() as usize;
+        let d_model=data["d_model"].as_u64().unwrap() as usize;
+        let num_heads=data["num_heads"].as_u64().unwrap() as usize;
+        let num_layers=data["num_layers"].as_u64().unwrap() as usize;
+        let ffn_dim=data["ffn_dim"].as_u64().unwrap() as usize;
+        let max_seq_len=data["max_seq_len"].as_u64().unwrap() as usize;
+        let adam_step=data["adam_step"].as_i64().unwrap_or(0) as i32;
+        let mut model = Self::new(vocab_size, d_model, num_heads, num_layers, ffn_dim, max_seq_len);
+        model.adam_step = adam_step;
+        macro_rules! load16 { ($f:ident, $k:expr) => {
+            if let Some(s)=data[$k].as_str() { let v=from_b64_f16(s); if !v.is_empty() { model.$f=upload_f16(&model.stream,&v); } }
         } }
-        macro_rules! load32 { ($field:ident, $key:expr) => {
-            if let Some(s) = data[$key].as_str() {
-                let v = from_b64_f32(s);
-                if !v.is_empty() { model.$field = upload_f32(&model.stream, &v); }
-            }
+        macro_rules! load32 { ($f:ident, $k:expr) => {
+            if let Some(s)=data[$k].as_str() { let v=from_b64_f32(s); if !v.is_empty() { model.$f=upload_f32(&model.stream,&v); } }
         } }
-
-        load16!(embed, "embed"); load16!(pos_embed, "pos_embed");
-        load32!(m_embed, "m_embed"); load32!(v_embed, "v_embed");
-        load32!(m_pos, "m_pos"); load32!(v_pos, "v_pos");
-        load16!(ln_f_g, "ln_f_g"); load16!(ln_f_b, "ln_f_b");
-        load32!(m_ln_f_g, "m_ln_f_g"); load32!(v_ln_f_g, "v_ln_f_g");
-        load32!(m_ln_f_b, "m_ln_f_b"); load32!(v_ln_f_b, "v_ln_f_b");
-
-        if let Some(layers_arr) = data["layers"].as_array() {
-            for (li, lj) in layers_arr.iter().enumerate() {
-                if li >= model.layers.len() { break; }
-                let l = &mut model.layers[li];
+        load16!(embed,"embed"); load16!(pos_embed,"pos_embed");
+        load32!(m_embed,"m_embed"); load32!(v_embed,"v_embed");
+        load32!(m_pos,"m_pos"); load32!(v_pos,"v_pos");
+        load16!(ln_f_g,"ln_f_g"); load16!(ln_f_b,"ln_f_b");
+        load32!(m_ln_f_g,"m_ln_f_g"); load32!(v_ln_f_g,"v_ln_f_g");
+        load32!(m_ln_f_b,"m_ln_f_b"); load32!(v_ln_f_b,"v_ln_f_b");
+        if let Some(arr)=data["layers"].as_array() {
+            for (li,lj) in arr.iter().enumerate() {
+                if li>=model.layers.len() { break; }
+                let l=&mut model.layers[li];
                 macro_rules! ll16 { ($f:ident) => {
-                    if let Some(s) = lj[stringify!($f)].as_str() {
-                        let v = from_b64_f16(s); if !v.is_empty() { l.$f = upload_f16(&model.stream, &v); }
-                    }
+                    if let Some(s)=lj[stringify!($f)].as_str() { let v=from_b64_f16(s); if !v.is_empty() { l.$f=upload_f16(&model.stream,&v); } }
                 } }
                 macro_rules! ll32 { ($f:ident) => {
-                    if let Some(s) = lj[stringify!($f)].as_str() {
-                        let v = from_b64_f32(s); if !v.is_empty() { l.$f = upload_f32(&model.stream, &v); }
-                    }
+                    if let Some(s)=lj[stringify!($f)].as_str() { let v=from_b64_f32(s); if !v.is_empty() { l.$f=upload_f32(&model.stream,&v); } }
                 } }
                 ll16!(w_qkv); ll16!(b_qkv); ll16!(w_out); ll16!(b_out);
                 ll16!(w_ff1); ll16!(b_ff1); ll16!(w_ff2); ll16!(b_ff2);
                 ll16!(ln1_g); ll16!(ln1_b); ll16!(ln2_g); ll16!(ln2_b);
                 ll32!(m_w_qkv); ll32!(v_w_qkv); ll32!(m_b_qkv); ll32!(v_b_qkv);
-                ll32!(m_w_out);  ll32!(v_w_out);  ll32!(m_b_out);  ll32!(v_b_out);
-                ll32!(m_w_ff1);  ll32!(v_w_ff1);  ll32!(m_b_ff1);  ll32!(v_b_ff1);
-                ll32!(m_w_ff2);  ll32!(v_w_ff2);  ll32!(m_b_ff2);  ll32!(v_b_ff2);
-                ll32!(m_ln1_g);  ll32!(v_ln1_g);  ll32!(m_ln1_b);  ll32!(v_ln1_b);
-                ll32!(m_ln2_g);  ll32!(v_ln2_g);  ll32!(m_ln2_b);  ll32!(v_ln2_b);
+                ll32!(m_w_out); ll32!(v_w_out); ll32!(m_b_out); ll32!(v_b_out);
+                ll32!(m_w_ff1); ll32!(v_w_ff1); ll32!(m_b_ff1); ll32!(v_b_ff1);
+                ll32!(m_w_ff2); ll32!(v_w_ff2); ll32!(m_b_ff2); ll32!(v_b_ff2);
+                ll32!(m_ln1_g); ll32!(v_ln1_g); ll32!(m_ln1_b); ll32!(v_ln1_b);
+                ll32!(m_ln2_g); ll32!(v_ln2_g); ll32!(m_ln2_b); ll32!(v_ln2_b);
             }
         }
-
+        println!("Checkpoint loaded (JSON). adam_step={}", model.adam_step);
         Ok(model)
     }
 }
@@ -2038,18 +2074,27 @@ pub fn pretrain_from_files(
     let mut rng = rand::thread_rng();
     let n_batches = (n + batch_size - 1) / batch_size;
 
+    // Length bucketing: group similar-length sequences so batches need minimal
+    // padding. The within-batch max length sets GPU work for the whole batch,
+    // so mixing a 20-token line with a 256-token one wastes ~12x compute.
+    // We sort by length once, then shuffle BATCH ORDER each epoch (not the
+    // global order) to keep training stochastic without re-introducing padding.
+    let mut len_sorted: Vec<usize> = (0..n).collect();
+    len_sorted.sort_by_key(|&i| seqs[i].0.len());
+
     for epoch in 0..epochs {
-        let mut idx: Vec<usize> = (0..n).collect();
-        idx.shuffle(&mut rng);
+        // shuffle the order in which length-buckets are visited
+        let mut batch_order: Vec<usize> = (0..n_batches).collect();
+        batch_order.shuffle(&mut rng);
 
         let mut epoch_loss = 0.0f32;
         let mut epoch_batches = 0usize;
         let t0 = Instant::now();
 
-        for batch_idx in 0..n_batches {
+        for (step, &batch_idx) in batch_order.iter().enumerate() {
             let start = batch_idx * batch_size;
             let end   = (start + batch_size).min(n);
-            let batch: Vec<usize> = idx[start..end].to_vec();
+            let batch: Vec<usize> = len_sorted[start..end].to_vec();
 
             let batch_seqs: Vec<Vec<usize>> = batch.iter().map(|&i| seqs[i].0.clone()).collect();
             let batch_masks: Vec<Vec<f32>>  = batch.iter().map(|&i| seqs[i].1.clone()).collect();
@@ -2058,13 +2103,13 @@ pub fn pretrain_from_files(
             epoch_loss += loss;
             epoch_batches += 1;
 
-            if batch_idx % 10 == 0 {
-                let remaining = n_batches - batch_idx - 1;
+            if step % 10 == 0 {
+                let remaining = n_batches - step - 1;
                 let elapsed = t0.elapsed().as_secs_f32();
-                let seqs_done = (batch_idx + 1) * batch_size;
+                let seqs_done = (step + 1) * batch_size;
                 let seq_per_s = seqs_done as f32 / elapsed.max(0.001);
                 print!("\r  Epoch {}/{}  |  batch {}/{}  ({} remaining)  |  loss={:.4}  |  {:.0} seq/s       ",
-                    epoch+1, epochs, batch_idx+1, n_batches, remaining,
+                    epoch+1, epochs, step+1, n_batches, remaining,
                     epoch_loss / epoch_batches as f32, seq_per_s);
                 std::io::stdout().flush().ok();
             }

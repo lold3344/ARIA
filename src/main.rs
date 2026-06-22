@@ -26,11 +26,25 @@ enum SamplingMode {
     TopP { p: f32, temperature: f32 },
 }
 
+fn print_logo() {
+    let logo_path = "screenshots/ARIA-LOGO-ANSI.txt";
+    if let Ok(content) = fs::read_to_string(logo_path) {
+        let esc = '\x1b';
+        for line in content.lines() {
+            println!("{}", line.replace("\\e", &esc.to_string()));
+        }
+        print!("\x1b[0m");
+    } else {
+        println!("=====================================");
+        println!("                 ARIA                ");
+        println!("Adaptive Reasoning Intelligence Agent");
+        println!("=====================================");
+    }
+    println!();
+}
+
 fn main() -> anyhow::Result<()> {
-    println!("=====================================");
-    println!("                 ARIA                ");
-    println!("Adaptive Reasoning Intelligence Agent");
-    println!("=====================================\n");
+    print_logo();
 
     // Persist encryption key so dialogs can be decrypted across sessions
     let key_path = "aria json/aria_key.hex";
@@ -114,9 +128,9 @@ fn main() -> anyhow::Result<()> {
 
     let mut mode = SamplingMode::TopK { k: 20, temperature: 0.7 };
 
-    // Load last 3 exchanges from persistent JSON memory
+    // Load full dialog history from persistent JSON memory
     let mut history: Vec<(String, String)> = {
-        let entries = db::load_recent_dialogs(db_path, 3).unwrap_or_default();
+        let entries = db::load_recent_dialogs(db_path, usize::MAX / 4).unwrap_or_default();
         let mut pairs: Vec<(String, String)> = Vec::new();
         let mut i = 0;
         while i + 1 < entries.len() {
@@ -133,7 +147,6 @@ fn main() -> anyhow::Result<()> {
         }
         pairs
     };
-    const MAX_HISTORY_TURNS: usize = 3;
     const MAX_CONTEXT_TOKENS: usize = 220;
 
     loop {
@@ -205,22 +218,27 @@ fn main() -> anyhow::Result<()> {
         }
         if input.is_empty() { continue; }
 
-        // Build context: last MAX_HISTORY_TURNS exchanges + current message
-        let mut tokens: Vec<usize> = vec![2]; // START
-        let history_start = history.len().saturating_sub(MAX_HISTORY_TURNS);
-        for (user_text, aria_text) in &history[history_start..] {
+        // Build context: pack as many recent exchanges as fit + current message
+        let current_prompt = tokenizer.encode_prompt(input);
+        // reserve room for the current prompt inside the window
+        let budget = MAX_CONTEXT_TOKENS.saturating_sub(current_prompt.len());
+        let mut hist_tokens: Vec<usize> = Vec::new();
+        for (user_text, aria_text) in history.iter().rev() {
             let mut user_tokens = tokenizer.encode_prompt(user_text);
             user_tokens.pop(); // remove trailing ASSISTANT token, we append the response instead
             let aria_tokens = tokenizer.encode(aria_text);
-            let candidate: Vec<usize> = tokens.iter().chain(user_tokens.iter())
-                .chain(aria_tokens.iter()).chain(&[3usize]) // END
-                .copied().collect();
-            if candidate.len() < MAX_CONTEXT_TOKENS {
-                tokens = candidate;
-            }
+            let turn_len = user_tokens.len() + aria_tokens.len() + 1; // +1 for END
+            if 1 + hist_tokens.len() + turn_len >= budget { break; } // +1 for START
+            // prepend this (older) turn before the already-collected newer turns
+            let mut turn: Vec<usize> = user_tokens;
+            turn.extend(aria_tokens);
+            turn.push(3usize); // END
+            turn.extend(hist_tokens);
+            hist_tokens = turn;
         }
+        let mut tokens: Vec<usize> = vec![2]; // START
+        tokens.extend(hist_tokens);
         // Append current user message
-        let current_prompt = tokenizer.encode_prompt(input);
         let full: Vec<usize> = tokens.iter().chain(current_prompt.iter()).copied().collect();
         let tokens = if full.len() <= MAX_CONTEXT_TOKENS + 30 { full } else { current_prompt };
         if tokens.len() < 3 { continue; }
@@ -276,38 +294,48 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn train_fresh(tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str, tokenizer_path: &str) -> anyhow::Result<TransformerModel> {
-    println!("Building vocabulary from data...\n");
+    use std::io::{BufRead, BufReader};
+
+    // Limit vocab building to avoid OOM — full corpus not needed for BPE
+    let vocab_lines: usize = std::env::var("ARIA_VOCAB_LINES")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(500_000);
+
+    println!("Building vocabulary from data (max {} lines)...\n", vocab_lines);
 
     let path = std::path::Path::new(data_dir);
-    let mut all_text = String::new();
     if path.exists() {
-        for entry in std::fs::read_dir(path)? {
+        let mut total_lines = 0usize;
+        'outer: for entry in std::fs::read_dir(path)? {
             let entry = entry?;
             let p = entry.path();
             let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
             if ext == "txt" {
-                if let Ok(content) = std::fs::read_to_string(&p) {
-                    all_text.push_str(&content);
-                    all_text.push(' ');
+                if let Ok(f) = std::fs::File::open(&p) {
+                    for line in BufReader::new(f).lines().flatten() {
+                        tokenizer.encode(&line);
+                        total_lines += 1;
+                        if total_lines >= vocab_lines { break 'outer; }
+                    }
                 }
             } else if ext == "jsonl" {
-                if let Ok(content) = std::fs::read_to_string(&p) {
-                    for line in content.lines() {
-                        let line = line.trim();
+                if let Ok(f) = std::fs::File::open(&p) {
+                    for line in BufReader::new(f).lines().flatten() {
+                        let line = line.trim().to_string();
                         if line.is_empty() { continue; }
-                        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) {
+                        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) {
                             if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
-                                all_text.push_str(text);
-                                all_text.push(' ');
+                                tokenizer.encode(text);
                             }
                         }
+                        total_lines += 1;
+                        if total_lines >= vocab_lines { break 'outer; }
                     }
                 }
             }
         }
+        println!("Processed {} lines for vocabulary.", total_lines);
     }
 
-    let _ = tokenizer.encode(&all_text);
     tokenizer.freeze();
     let actual_vocab = tokenizer.vocab_size();
     println!("Vocabulary built: {} tokens", actual_vocab);

@@ -21,3 +21,5 @@ aria_checkpoint.json
 /logs
 ARIA_Train_Full.bat
 convert_txt.py
+aria json/aria_key.hex
+src/fp8_gemm.cu

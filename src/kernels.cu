@@ -1523,3 +1523,4 @@ extern "C" __global__ void flash_attn_bwd(
         dq_head[qi * dh + tid] = __float2half(old + dq_acc[r]);
     }
 }
+
