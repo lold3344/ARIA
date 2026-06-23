@@ -336,11 +336,13 @@ extern "C" __global__ void adam_update_f16(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float g  = __half2float(grad[i]);
+    if (!isfinite(g)) return;
     float m_ = b1 * m[i] + (1.0f - b1) * g;
     float v_ = b2 * v[i] + (1.0f - b2) * g * g;
     m[i] = m_;
     v[i] = v_;
     float p = __half2float(param[i]) - lr * (m_ / bc1) / (__fsqrt_rn(v_ / bc2) + eps);
+    if (!isfinite(p)) return;
     param[i] = __float2half(p);
 }
 
@@ -963,10 +965,12 @@ extern "C" __global__ void adam_update_f16_from_f32(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float g  = grad[i];
+    if (!isfinite(g)) return;
     float m_ = b1*m[i] + (1.0f-b1)*g;
     float v_ = b2*v[i] + (1.0f-b2)*g*g;
     m[i] = m_; v[i] = v_;
     float p = __half2float(param[i]) - lr*(m_/bc1)/(__fsqrt_rn(v_/bc2)+eps);
+    if (!isfinite(p)) return;
     param[i] = __float2half(p);
 }
 

@@ -27,10 +27,12 @@ fn main() -> anyhow::Result<()> {
     let ids = tokenizer.encode_prompt(&prompt);
     let (mut logits, mut kv) = model.forward_seq(&ids);
     let mut generated = vec![];
-    for _ in 0..max_tokens {
+    for step in 0..max_tokens {
         tokenizer.mask_logits(&mut logits);
         let token = model.sample_top_k(&logits, temperature, k);
-        if token == 0 || token == 3 || token >= tokenizer.vocab_size() { break; }
+        if token >= tokenizer.vocab_size() { break; }
+        if (token == 0 || token == 3) && step >= 3 { break; }
+        if token == 1 { continue; }
         generated.push(token);
         let (nl, nkv) = model.step(token, &kv);
         kv = nkv;
