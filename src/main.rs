@@ -257,7 +257,7 @@ fn main() -> anyhow::Result<()> {
         let (mut current_logits, mut current_state) = model.forward_seq(&tokens);
         let mut generated_tokens: Vec<usize> = Vec::new();
 
-        for _ in 0..40 {
+        for step in 0..120 {
             tokenizer.mask_logits(&mut current_logits);
 
             let action = match mode {
@@ -267,7 +267,7 @@ fn main() -> anyhow::Result<()> {
             };
 
             if action >= tokenizer.vocab_size() { break; }
-            if action == 3 || action == 0 { break; }
+            if (action == 3 || action == 0) && step >= 3 { break; }
             if action == 1 { continue; }
 
             generated_tokens.push(action);

@@ -942,7 +942,7 @@ impl TransformerModel {
 
     pub fn sample_top_k(&self, logits: &[f32], temperature: f32, k: usize) -> usize {
         let mut idx: Vec<usize> = (0..logits.len()).collect();
-        idx.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+        idx.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal));
         idx.truncate(k);
         let temp = temperature.max(1e-3);
         let max_l = idx.iter().map(|&i| logits[i]).fold(f32::NEG_INFINITY, f32::max);
@@ -958,7 +958,7 @@ impl TransformerModel {
 
     pub fn sample_top_p(&self, logits: &[f32], temperature: f32, p: f32) -> usize {
         let mut idx: Vec<usize> = (0..logits.len()).collect();
-        idx.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap());
+        idx.sort_unstable_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal));
         let temp = temperature.max(1e-3);
         let max_l = logits[idx[0]];
         let exps: Vec<f32> = idx.iter().map(|&i| ((logits[i] - max_l) / temp).exp()).collect();
