@@ -236,10 +236,8 @@ fn main() -> anyhow::Result<()> {
             turn.extend(hist_tokens);
             hist_tokens = turn;
         }
-        let mut tokens: Vec<usize> = vec![2]; // START
-        tokens.extend(hist_tokens);
-        // Append current user message
-        let full: Vec<usize> = tokens.iter().chain(current_prompt.iter()).copied().collect();
+        // Append current user message (current_prompt already starts with START)
+        let full: Vec<usize> = hist_tokens.iter().chain(current_prompt.iter()).copied().collect();
         let tokens = if full.len() <= MAX_CONTEXT_TOKENS + 30 { full } else { current_prompt };
         if tokens.len() < 3 { continue; }
 

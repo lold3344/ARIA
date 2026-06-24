@@ -998,7 +998,7 @@ impl TransformerModel {
         let mt  = self.max_seq_len;
         let nb  = seqs.len();
         if nb == 0 { return 0.0; }
-        let scale_f = 1.0f32 / nb as f32;
+        let scale_f = 1.0f32;
 
         self.adam_step += 1;
         let step = self.adam_step;
