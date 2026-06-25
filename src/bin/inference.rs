@@ -26,9 +26,17 @@ fn main() -> anyhow::Result<()> {
     println!("Prompt: {}", prompt);
     let ids = tokenizer.encode_prompt(&prompt);
     let (mut logits, mut kv) = model.forward_seq(&ids);
+    let repeat_penalty = 1.3f32;
     let mut generated = vec![];
     for step in 0..max_tokens {
         tokenizer.mask_logits(&mut logits);
+        // Apply repetition penalty
+        for &prev in &generated {
+            if prev < logits.len() {
+                if logits[prev] > 0.0 { logits[prev] /= repeat_penalty; }
+                else { logits[prev] *= repeat_penalty; }
+            }
+        }
         let token = model.sample_top_k(&logits, temperature, k);
         if token >= tokenizer.vocab_size() { break; }
         if (token == 0 || token == 3) && step >= 3 { break; }

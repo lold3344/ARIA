@@ -2099,7 +2099,13 @@ pub fn pretrain_from_files(
             let batch_seqs: Vec<Vec<usize>> = batch.iter().map(|&i| seqs[i].0.clone()).collect();
             let batch_masks: Vec<Vec<f32>>  = batch.iter().map(|&i| seqs[i].1.clone()).collect();
 
-            let loss = model.train_batch_masked(&batch_seqs, &batch_masks, lr);
+            // Cosine decay: lr → lr * 0.1 over all epochs
+            let total_steps = epochs * n_batches;
+            let current_step = epoch * n_batches + step;
+            let cos = (std::f32::consts::PI * current_step as f32 / total_steps as f32).cos();
+            let step_lr = lr * (0.1 + 0.9 * (cos * 0.5 + 0.5));
+
+            let loss = model.train_batch_masked(&batch_seqs, &batch_masks, step_lr);
             epoch_loss += loss;
             epoch_batches += 1;
 
@@ -2108,17 +2114,18 @@ pub fn pretrain_from_files(
                 let elapsed = t0.elapsed().as_secs_f32();
                 let seqs_done = (step + 1) * batch_size;
                 let seq_per_s = seqs_done as f32 / elapsed.max(0.001);
-                print!("\r  Epoch {}/{}  |  batch {}/{}  ({} remaining)  |  loss={:.4}  |  {:.0} seq/s       ",
+                print!("\r  Epoch {}/{}  |  batch {}/{}  ({} remaining)  |  loss={:.4}  |  {:.0} seq/s  |  lr={:.6}       ",
                     epoch+1, epochs, step+1, n_batches, remaining,
-                    epoch_loss / epoch_batches as f32, seq_per_s);
+                    epoch_loss / epoch_batches as f32, seq_per_s, step_lr);
                 std::io::stdout().flush().ok();
             }
         }
 
         let elapsed = t0.elapsed().as_secs_f32();
         let avg_loss = epoch_loss / epoch_batches as f32;
+        let final_lr = lr * (0.1 + 0.9 * (((std::f32::consts::PI * (epoch * n_batches + n_batches - 1) as f32) / (epochs * n_batches) as f32).cos() * 0.5 + 0.5));
         println!("\nEpoch {}/{}  done  |  loss={:.6}  |  {:.1}s  |  lr={:.6}",
-            epoch+1, epochs, avg_loss, elapsed, lr);
+            epoch+1, epochs, avg_loss, elapsed, final_lr);
 
         println!("  Saving checkpoint...");
         model.save_checkpoint(checkpoint_path).ok();
