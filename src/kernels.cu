@@ -1008,6 +1008,15 @@ extern "C" __global__ void f32_to_f16_2d(const float* in, __half* out, int n)
 // Adam update for embed/pos: f32 grad → f16 param
 // (reuses adam_update_f16_from_f32, same kernel)
 
+// Add f16 buffer into f32 accumulator (for tied embed grad: g_embed += tmp_f16)
+// Grid: ceil(n/256)  Block: 256
+extern "C" __global__ void add_f16_to_f32(const __half* src, float* dst, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] += __half2float(src[i]);
+}
+
 // Zero a single f32 scalar
 extern "C" __global__ void zero_scalar_f32(float* x)
 {

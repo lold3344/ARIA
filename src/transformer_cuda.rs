@@ -69,6 +69,7 @@ const KERNEL_NAMES: &[&str] = &[
     "softmax_ce_masked", "bias_grad_f16_to_f32", "layer_norm_bwd_v2",
     "adam_update_f16_from_f32", "embedding_bwd_f32", "pos_grad_add_f32",
     "f32_to_f16_2d", "zero_scalar_f32",
+    "add_f16_to_f32",
     // LN backward optimized (no atomicAdd contention)
     "layer_norm_bwd_dx", "ln_param_grad", "gelu_bwd_overwrite",
     // micro-batch variants
@@ -140,6 +141,7 @@ struct TrFns {
     pos_grad_f32:     cudarc::driver::CudaFunction,
     f32_to_f16_2d:    cudarc::driver::CudaFunction,
     zero_scalar_f32:  cudarc::driver::CudaFunction,
+    add_f16_to_f32:   cudarc::driver::CudaFunction,
     // LN backward optimized
     ln_bwd_dx:        cudarc::driver::CudaFunction,
     ln_param_grad:    cudarc::driver::CudaFunction,
@@ -267,6 +269,7 @@ pub struct TransformerModel {
     acts:       Vec<GpuLayerActs>,
     g_embed:    CudaSlice<f32>,  // [vocab, D]
     g_pos:      CudaSlice<f32>,  // [max_seq_len, D]
+    g_embed_head_f16: CudaSlice<f16>, // [vocab, D] — tied output-head grad (f16 GEMM target)
     g_ln_f_g:   CudaSlice<f32>,
     g_ln_f_b:   CudaSlice<f32>,
     // Working buffers
@@ -580,6 +583,7 @@ impl TransformerModel {
             pos_grad_f32:    fn_!("pos_grad_add_f32"),
             f32_to_f16_2d:   fn_!("f32_to_f16_2d"),
             zero_scalar_f32: fn_!("zero_scalar_f32"),
+            add_f16_to_f32:  fn_!("add_f16_to_f32"),
             ln_bwd_dx:       fn_!("layer_norm_bwd_dx"),
             ln_param_grad:   fn_!("ln_param_grad"),
             gelu_bwd_ow:     fn_!("gelu_bwd_overwrite"),
@@ -705,6 +709,7 @@ impl TransformerModel {
             acts,
             g_embed:      zf32!(vocab_size * d_model),
             g_pos:        zf32!(max_seq_len * d_model),
+            g_embed_head_f16: z16!(vocab_size * d_model),
             g_ln_f_g:     zf32!(d_model),
             g_ln_f_b:     zf32!(d_model),
             x_buf:        z16!(mbn * mt * d_model),
@@ -1019,6 +1024,12 @@ impl TransformerModel {
         }}
         zf32!(self.g_embed); zf32!(self.g_pos);
         zf32!(self.g_ln_f_g); zf32!(self.g_ln_f_b);
+        {
+            let n = self.g_embed_head_f16.len();
+            let cfg = cfg1d(n);
+            unsafe { self.stream.launch_builder(&self.fns.zero_f16)
+                .arg(&mut self.g_embed_head_f16).arg(&(n as i32)).launch(cfg).unwrap(); }
+        }
         for li in 0..nl {
             zf16!(self.grads[li].g_w_qkv); zf16!(self.grads[li].g_w_out);
             zf16!(self.grads[li].g_w_ff1); zf16!(self.grads[li].g_w_ff2);
@@ -1293,6 +1304,16 @@ impl TransformerModel {
             }
 
             // ── BACKWARD PASS ────────────────────────────────────────
+            // Tied embed grad from output head: g_embed += d_logits^T @ x_norm
+            // x_norm_buf currently holds x_norm (final LN output) — use it before overwrite.
+            // g_embed_head_f16[v,D] += d_logits[nt,v]^T @ x_norm[nt,D]  → [v, D]
+            {
+                unsafe {
+                    gemm(&self.blas, &self.d_logits, &self.x_norm_buf, &mut self.g_embed_head_f16,
+                         v, nt, d, true, false, one, one);
+                }
+            }
+
             // d_x_norm[nt,D] = d_logits[nt,V] @ embed[V,D]
             gemm(&self.blas, &self.d_logits, &self.embed, &mut self.x_norm_buf,
                  nt, v, d, false, false, one, f16::from_f32(0.0));
@@ -1685,6 +1706,15 @@ impl TransformerModel {
         } // end micro-batch loop
 
         if counted == 0 { return 0.0; }
+
+        // Fold tied output-head embed grad (f16) into g_embed (f32) before Adam
+        {
+            let n = self.g_embed_head_f16.len();
+            let cfg = cfg1d(n);
+            unsafe { self.stream.launch_builder(&self.fns.add_f16_to_f32)
+                .arg(&self.g_embed_head_f16).arg(&mut self.g_embed).arg(&(n as i32))
+                .launch(cfg).unwrap(); }
+        }
 
         // ── ADAM UPDATE (all on GPU) ──────────────────────────────
         macro_rules! adam16 { ($p:expr, $m:expr, $v:expr, $g:expr) => {{
