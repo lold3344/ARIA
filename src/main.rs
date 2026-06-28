@@ -68,12 +68,6 @@ fn main() -> anyhow::Result<()> {
     let data_dir = "data base";
     fs::create_dir_all(&data_dir)?;
 
-    for filename in &["DataBase.txt", "Words.txt"] {
-        let filepath = format!("{}/{}", data_dir, filename);
-        if !std::path::Path::new(&filepath).exists() {
-            fs::write(&filepath, "")?;
-        }
-    }
 
     println!("Data directory: {}\n", data_dir);
 

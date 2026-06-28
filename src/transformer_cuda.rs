@@ -47,7 +47,6 @@ const MIN_TOKENS_PER_SEQ:  usize = 6;
 const PRETRAIN_EPOCHS:     usize = 5;
 const PRETRAIN_BATCH_SIZE: usize = 64;
 const MAX_SEQS_PER_EPOCH:  usize = 500_000;
-const DIALOG_FILE:         &str  = "DataBase_roles.jsonl";
 const MICRO_BATCH_N:       usize = 32; // sequences processed simultaneously
 
 const KERNEL_NAMES: &[&str] = &[
@@ -2171,20 +2170,51 @@ pub fn pretrain_from_files(
 fn build_seq_cache(tok: &mut Tokenizer, data_dir: &str, max_len: usize, min_len: usize, max_seqs: usize)
     -> anyhow::Result<Vec<(Vec<usize>, Vec<f32>)>>
 {
-    let dialog_path = format!("{}/{}", data_dir, DIALOG_FILE);
-    let content = fs::read_to_string(&dialog_path)
-        .unwrap_or_else(|_| { eprintln!("Warning: {} not found", dialog_path); String::new() });
+    use std::io::BufRead;
 
-    let mut seqs = Vec::new();
-    for line in content.lines() {
-        if seqs.len() >= max_seqs { break; }
-        let line = line.trim();
-        if line.is_empty() { continue; }
-        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) {
-            if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
-                let (ids, mask) = tok.encode_dialog(text);
-                if ids.len() >= min_len && ids.len() <= max_len {
-                    seqs.push((ids, mask));
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    match fs::read_dir(data_dir) {
+        Ok(rd) => {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                if p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                    files.push(p);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Warning: cannot read {}: {}", data_dir, e);
+            return Ok(Vec::new());
+        }
+    }
+    files.sort();
+
+    if files.is_empty() {
+        eprintln!("Warning: no .jsonl files found in {}", data_dir);
+        return Ok(Vec::new());
+    }
+
+    println!("Loading sequences from {} .jsonl file(s):", files.len());
+    for p in &files { println!("  - {}", p.display()); }
+
+    let mut seqs: Vec<(Vec<usize>, Vec<f32>)> = Vec::new();
+    'outer: for path in &files {
+        let f = match fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) => { eprintln!("Warning: cannot open {}: {}", path.display(), e); continue; }
+        };
+        let r = std::io::BufReader::new(f);
+        for line in r.lines() {
+            if seqs.len() >= max_seqs { break 'outer; }
+            let line = match line { Ok(l) => l, Err(_) => continue };
+            let line = line.trim();
+            if line.is_empty() { continue; }
+            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+                    let (ids, mask) = tok.encode_dialog(text);
+                    if ids.len() >= min_len && ids.len() <= max_len {
+                        seqs.push((ids, mask));
+                    }
                 }
             }
         }

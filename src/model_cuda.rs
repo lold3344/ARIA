@@ -1449,7 +1449,6 @@ const MIN_TOKENS_PER_SEQ:  usize = 6;
 const PRETRAIN_EPOCHS:     usize = 5;
 const PRETRAIN_BATCH_SIZE: usize = 1024;
 const MAX_SEQS_PER_EPOCH:  usize = 500_000;
-const DIALOG_FILE:         &str  = "DataBase_roles.jsonl";
 
 pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str, tokenizer_path: &str) -> anyhow::Result<()> {
     let max_seqs: usize = std::env::var("ARIA_MAX_SEQS")
@@ -1468,12 +1467,25 @@ pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer,
     println!("LR: {}  Epochs: {}  Batch: {}  SeqLen: {}", LEARNING_RATE, pretrain_epochs, PRETRAIN_BATCH_SIZE, MAX_TOKENS_PER_SEQ);
     println!("===============================================\n");
 
-    // Use only the dialog JSONL; cache holds seq+mask pairs.
-    let data_path = path.join(DIALOG_FILE);
-    if !data_path.exists() {
-        println!("Dialog file not found: {:?}", data_path);
+    // Collect all .jsonl files from data_dir
+    let mut jsonl_files: Vec<std::path::PathBuf> = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let p = entry.path();
+        if p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+            jsonl_files.push(p);
+        }
+    }
+    jsonl_files.sort();
+
+    if jsonl_files.is_empty() {
+        println!("No .jsonl files found in: {:?}", path);
         return Ok(());
     }
+
+    println!("Found {} .jsonl file(s):", jsonl_files.len());
+    for p in &jsonl_files { println!("  - {}", p.display()); }
+
     let cache_path = format!("{}/sequences_cache_masked_v{}_len{}.bin", data_dir, tokenizer.vocab_size(), MAX_TOKENS_PER_SEQ);
     let _ = fs::remove_file(format!("{}/sequences_cache.bin", data_dir));
     let _ = fs::remove_file(format!("{}/sequences_cache_v{}.bin", data_dir, tokenizer.vocab_size()));
@@ -1486,32 +1498,34 @@ pub fn pretrain_from_files(model: &mut LSTMModelCuda, tokenizer: &mut Tokenizer,
         #[derive(serde::Deserialize)]
         struct DialogRecord { text: String }
 
-        let text = fs::read_to_string(&data_path)?;
         println!("Streaming dialog sequences to masked cache...");
         let cache_file = fs::File::create(&cache_path)?;
         let mut w = BufWriter::new(cache_file);
         w.write_all(&0u32.to_le_bytes())?;
 
         let mut count: u32 = 0;
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() { continue; }
-            let rec: DialogRecord = match serde_json::from_str(line) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            if rec.text.trim().len() <= 5 { continue; }
-            let (mut seq, mut mask) = tokenizer.encode_dialog(&rec.text);
-            if seq.len() < MIN_TOKENS_PER_SEQ { continue; }
-            if seq.len() > MAX_TOKENS_PER_SEQ { seq.truncate(MAX_TOKENS_PER_SEQ); mask.truncate(MAX_TOKENS_PER_SEQ.saturating_sub(1)); }
-            let len = seq.len().min(u32::MAX as usize) as u32;
-            w.write_all(&len.to_le_bytes())?;
-            for &tok in &seq { w.write_all(&(tok as u32).to_le_bytes())?; }
-            let mlen = mask.len().min(len as usize) as u32;
-            w.write_all(&mlen.to_le_bytes())?;
-            for &v in &mask[..mlen as usize] { w.write_all(&v.to_le_bytes())?; }
-            count = count.saturating_add(1);
-            if count >= max_seqs as u32 { break; }
+        'outer: for json_path in &jsonl_files {
+            let text = fs::read_to_string(json_path)?;
+            for line in text.lines() {
+                if count >= max_seqs as u32 { break 'outer; }
+                let line = line.trim();
+                if line.is_empty() { continue; }
+                let rec: DialogRecord = match serde_json::from_str(line) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                if rec.text.trim().len() <= 5 { continue; }
+                let (mut seq, mut mask) = tokenizer.encode_dialog(&rec.text);
+                if seq.len() < MIN_TOKENS_PER_SEQ { continue; }
+                if seq.len() > MAX_TOKENS_PER_SEQ { seq.truncate(MAX_TOKENS_PER_SEQ); mask.truncate(MAX_TOKENS_PER_SEQ.saturating_sub(1)); }
+                let len = seq.len().min(u32::MAX as usize) as u32;
+                w.write_all(&len.to_le_bytes())?;
+                for &tok in &seq { w.write_all(&(tok as u32).to_le_bytes())?; }
+                let mlen = mask.len().min(len as usize) as u32;
+                w.write_all(&mlen.to_le_bytes())?;
+                for &v in &mask[..mlen as usize] { w.write_all(&v.to_le_bytes())?; }
+                count = count.saturating_add(1);
+            }
         }
         w.flush()?;
         drop(w);

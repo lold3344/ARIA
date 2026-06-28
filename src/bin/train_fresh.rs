@@ -4,33 +4,56 @@ use aria::transformer_cuda::TransformerModel;
 use aria::tokenizer::Tokenizer;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
 
 #[derive(serde::Deserialize)]
 struct DialogRecord { text: String }
 
-fn feed_tokenizer(path: &str, tokenizer: &mut Tokenizer, max_lines: usize) -> anyhow::Result<()> {
-    let f = File::open(path)?;
-    let r = BufReader::new(f);
+fn list_jsonl_files(dir: &str) -> anyhow::Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let p = entry.path();
+        if p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+            files.push(p);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn feed_tokenizer(data_dir: &str, tokenizer: &mut Tokenizer, max_lines: usize) -> anyhow::Result<()> {
+    let files = list_jsonl_files(data_dir)?;
+    if files.is_empty() {
+        anyhow::bail!("No .jsonl files found in {}", data_dir);
+    }
+    println!("Found {} .jsonl file(s) for vocab:", files.len());
+    for p in &files { println!("  - {}", p.display()); }
 
     const CHUNK: usize = 50_000;
     let mut batch: Vec<String> = Vec::with_capacity(CHUNK);
     let mut count = 0usize;
 
-    for line in r.lines().take(max_lines) {
-        let line = line?;
-        if line.trim().is_empty() { continue; }
-        let rec: DialogRecord = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        batch.push(rec.text);
-        count += 1;
+    'outer: for path in &files {
+        let f = File::open(path)?;
+        let r = BufReader::new(f);
+        for line in r.lines() {
+            if count >= max_lines { break 'outer; }
+            let line = line?;
+            if line.trim().is_empty() { continue; }
+            let rec: DialogRecord = match serde_json::from_str(&line) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            batch.push(rec.text);
+            count += 1;
 
-        if batch.len() >= CHUNK {
-            tokenizer.feed_batch(&batch);
-            batch.clear();
-            if count % 200_000 == 0 {
-                println!("  vocab: processed {} records", count);
+            if batch.len() >= CHUNK {
+                tokenizer.feed_batch(&batch);
+                batch.clear();
+                if count % 200_000 == 0 {
+                    println!("  vocab: processed {} records", count);
+                }
             }
         }
     }
@@ -43,7 +66,6 @@ fn feed_tokenizer(path: &str, tokenizer: &mut Tokenizer, max_lines: usize) -> an
 
 fn main() -> anyhow::Result<()> {
     let data_dir = "data base";
-    let dialog_path = "data base/DataBase_roles.jsonl";
     let checkpoint_path = "aria json/aria_checkpoint.json";
     let tokenizer_path = "aria json/aria_tokenizer.json";
 
@@ -59,7 +81,7 @@ fn main() -> anyhow::Result<()> {
 
     println!("Building vocabulary from dialog file (max {} records)...", vocab_lines);
     let mut tokenizer = Tokenizer::new();
-    feed_tokenizer(dialog_path, &mut tokenizer, vocab_lines)?;
+    feed_tokenizer(data_dir, &mut tokenizer, vocab_lines)?;
     tokenizer.freeze();
     let vocab_size = tokenizer.vocab_size();
     println!("Vocab size: {}\n", vocab_size);
