@@ -3,6 +3,7 @@
 use aria::transformer_cuda::TransformerModel;
 use aria::tokenizer::Tokenizer;
 use std::env;
+use std::time::Instant;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -12,41 +13,49 @@ fn main() -> anyhow::Result<()> {
     let tokenizer_path = "aria json/aria_tokenizer.json";
 
     println!("Loading tokenizer from {}...", tokenizer_path);
-    let mut tokenizer = Tokenizer::load(tokenizer_path)?;
+    let tokenizer = Tokenizer::load(tokenizer_path)?;
     let vocab = tokenizer.vocab_size();
 
     println!("Loading checkpoint from {}...", model_path);
-    let model = TransformerModel::load_checkpoint(model_path)?;
-    println!("Model ready. vocab={}", vocab);
+    let mut model = TransformerModel::load_checkpoint(model_path)?;
+    model.free_training_buffers();
+    println!("Model ready (inference mode). vocab={}", vocab);
 
     let max_tokens = 50usize;
     let k = 20usize;
     let temperature = 0.7f32;
+    let repeat_penalty = 1.3f32;
 
     println!("Prompt: {}", prompt);
-    let ids = tokenizer.encode_prompt(&prompt);
-    let (mut logits, mut kv) = model.forward_seq(&ids);
-    let repeat_penalty = 1.3f32;
-    let mut generated = vec![];
+    let mut ids = tokenizer.encode_prompt(&prompt);
+    let mut generated: Vec<usize> = Vec::new();
+
+    let t0 = Instant::now();
     for step in 0..max_tokens {
+        let mut logits = model.forward_gpu(&ids);
         tokenizer.mask_logits(&mut logits);
-        // Apply repetition penalty
+
         for &prev in &generated {
             if prev < logits.len() {
                 if logits[prev] > 0.0 { logits[prev] /= repeat_penalty; }
                 else { logits[prev] *= repeat_penalty; }
             }
         }
+
         let token = model.sample_top_k(&logits, temperature, k);
-        if token >= tokenizer.vocab_size() { break; }
+        if token >= vocab { break; }
         if (token == 0 || token == 3) && step >= 3 { break; }
         if token == 1 { continue; }
+
         generated.push(token);
-        let (nl, nkv) = model.step(token, &kv);
-        kv = nkv;
-        logits = nl;
+        ids.push(token);
+        if ids.len() >= 256 { break; }
     }
+    let elapsed = t0.elapsed().as_secs_f32();
+    let tps = generated.len() as f32 / elapsed.max(0.001);
+
     println!("Response: {}", tokenizer.decode(&generated));
+    println!("[{} tokens in {:.2}s = {:.1} tok/s]", generated.len(), elapsed, tps);
 
     Ok(())
 }

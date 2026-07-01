@@ -997,6 +997,305 @@ impl TransformerModel {
     }
 
     // ─────────────────────────────────────────────────────────────
+    //  Free training-only buffers to reduce VRAM for inference.
+    //  After calling this, training methods (train_batch_*) will crash —
+    //  use only inference methods (forward_gpu, generate_gpu, forward_seq, step).
+    // ─────────────────────────────────────────────────────────────
+    pub fn free_training_buffers(&mut self) {
+        let stream = self.stream.clone();
+        let tiny_f32 = |s: &Arc<CudaStream>| s.clone_htod(&vec![0.0f32; 1]).unwrap();
+        let tiny_f16 = |s: &Arc<CudaStream>| s.clone_htod(&vec![f16::ZERO; 1]).unwrap();
+        let tiny_i32 = |s: &Arc<CudaStream>| s.clone_htod(&vec![0i32; 1]).unwrap();
+
+        // Adam moments (biggest — ~1 GB for 124M model)
+        self.m_embed = tiny_f32(&stream); self.v_embed = tiny_f32(&stream);
+        self.m_pos   = tiny_f32(&stream); self.v_pos   = tiny_f32(&stream);
+        self.m_ln_f_g = tiny_f32(&stream); self.v_ln_f_g = tiny_f32(&stream);
+        self.m_ln_f_b = tiny_f32(&stream); self.v_ln_f_b = tiny_f32(&stream);
+        for l in &mut self.layers {
+            l.m_w_qkv = tiny_f32(&stream); l.v_w_qkv = tiny_f32(&stream);
+            l.m_b_qkv = tiny_f32(&stream); l.v_b_qkv = tiny_f32(&stream);
+            l.m_w_out  = tiny_f32(&stream); l.v_w_out  = tiny_f32(&stream);
+            l.m_b_out  = tiny_f32(&stream); l.v_b_out  = tiny_f32(&stream);
+            l.m_w_ff1  = tiny_f32(&stream); l.v_w_ff1  = tiny_f32(&stream);
+            l.m_b_ff1  = tiny_f32(&stream); l.v_b_ff1  = tiny_f32(&stream);
+            l.m_w_ff2  = tiny_f32(&stream); l.v_w_ff2  = tiny_f32(&stream);
+            l.m_b_ff2  = tiny_f32(&stream); l.v_b_ff2  = tiny_f32(&stream);
+            l.m_ln1_g = tiny_f32(&stream); l.v_ln1_g = tiny_f32(&stream);
+            l.m_ln1_b = tiny_f32(&stream); l.v_ln1_b = tiny_f32(&stream);
+            l.m_ln2_g = tiny_f32(&stream); l.v_ln2_g = tiny_f32(&stream);
+            l.m_ln2_b = tiny_f32(&stream); l.v_ln2_b = tiny_f32(&stream);
+        }
+
+        // Gradient buffers
+        self.g_embed  = tiny_f32(&stream);
+        self.g_pos    = tiny_f32(&stream);
+        self.g_embed_head_f16 = tiny_f16(&stream);
+        self.g_ln_f_g = tiny_f32(&stream);
+        self.g_ln_f_b = tiny_f32(&stream);
+        for g in &mut self.grads {
+            g.g_w_qkv = tiny_f16(&stream); g.g_w_out = tiny_f16(&stream);
+            g.g_w_ff1 = tiny_f16(&stream); g.g_w_ff2 = tiny_f16(&stream);
+            g.g_b_qkv = tiny_f32(&stream); g.g_b_out = tiny_f32(&stream);
+            g.g_b_ff1 = tiny_f32(&stream); g.g_b_ff2 = tiny_f32(&stream);
+            g.g_ln1_g = tiny_f32(&stream); g.g_ln1_b = tiny_f32(&stream);
+            g.g_ln2_g = tiny_f32(&stream); g.g_ln2_b = tiny_f32(&stream);
+        }
+
+        // Backward-only working buffers
+        self.d_logits   = tiny_f16(&stream);
+        self.dx_buf     = tiny_f16(&stream);
+        self.tmp_buf    = tiny_f16(&stream);
+        self.dq_buf     = tiny_f16(&stream);
+        self.dk_buf     = tiny_f16(&stream);
+        self.dv_buf     = tiny_f16(&stream);
+        self.dk_f32_buf = tiny_f32(&stream);
+        self.dv_f32_buf = tiny_f32(&stream);
+        self.lse_buf    = tiny_f32(&stream);
+        self.d_attn_buf = tiny_f16(&stream);
+        self.d_ctx_buf  = tiny_f16(&stream);
+
+        // Training-only host-to-device staging
+        self.tgt_buf    = tiny_i32(&stream);
+        self.msk_buf    = tiny_f32(&stream);
+
+        // Clipping scratch
+        self.grad_norm_sq     = tiny_f32(&stream);
+        self.partial_norm_buf = tiny_f32(&stream);
+
+        stream.synchronize().ok();
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    //  GPU forward pass for inference (batch = 1).
+    //  Returns logits [vocab_size] for the LAST token only.
+    // ─────────────────────────────────────────────────────────────
+    pub fn forward_gpu(&mut self, tokens: &[usize]) -> Vec<f32> {
+        let d   = self.d_model;
+        let ff  = self.ffn_dim;
+        let h   = self.num_heads;
+        let dh  = self.head_dim;
+        let nl  = self.num_layers;
+        let vs  = self.vocab_size;
+        let mt  = self.max_seq_len;
+
+        let t = tokens.len().min(mt);
+        if t == 0 { return vec![0.0; vs]; }
+        let nt = t;               // batch = 1, so nt == t
+        let nh = h;                // nh == h
+        let one = f16::from_f32(1.0);
+
+        // Upload token ids
+        let mut ids_flat = vec![0i32; mt];
+        for i in 0..t { ids_flat[i] = tokens[i].min(vs - 1) as i32; }
+        self.stream.memcpy_htod(&ids_flat, &mut self.ids_buf).unwrap();
+
+        // embed + pos → x_buf[nt, d]
+        {
+            let bx = (d + 255) / 256;
+            let cfg = LaunchConfig { grid_dim: (nt as u32, bx as u32, 1), block_dim: (256.min(d) as u32, 1, 1), shared_mem_bytes: 0 };
+            unsafe { self.stream.launch_builder(&self.fns.emb_pos_fwd_nb)
+                .arg(&mut self.x_buf).arg(&self.embed).arg(&self.pos_embed)
+                .arg(&self.ids_buf).arg(&(nt as i32)).arg(&(t as i32)).arg(&(d as i32))
+                .launch(cfg).unwrap(); }
+        }
+
+        for li in 0..nl {
+            // copy x_buf → x_pre
+            {
+                let n = nt * d;
+                let acts_ptr = &mut self.acts[li].x_pre as *mut CudaSlice<f16>;
+                let x_ptr    = &self.x_buf as *const CudaSlice<f16>;
+                unsafe { self.stream.launch_builder(&self.fns.copy_f16)
+                    .arg(&mut *acts_ptr).arg(&*x_ptr).arg(&(n as i32))
+                    .launch(cfg1d(n)).unwrap(); }
+            }
+
+            // LN1
+            {
+                let acts_ptr  = &mut self.acts[li] as *mut GpuLayerActs;
+                let layer_ptr = &self.layers[li] as *const TransformerLayer;
+                let x_ptr     = &self.x_buf as *const CudaSlice<f16>;
+                let cfg = cfg_ln(nt);
+                unsafe {
+                    let acts  = &mut *acts_ptr;
+                    let layer = &*layer_ptr;
+                    self.stream.launch_builder(&self.fns.layer_norm_fwd)
+                        .arg(&mut acts.xn1).arg(&mut acts.ln1_mean).arg(&mut acts.ln1_rstd)
+                        .arg(&*x_ptr).arg(&layer.ln1_g).arg(&layer.ln1_b)
+                        .arg(&(nt as i32)).arg(&(d as i32)).arg(&1e-5f32)
+                        .launch(cfg).unwrap();
+                }
+            }
+
+            // QKV projection
+            {
+                let acts_ptr  = &mut self.acts[li] as *mut GpuLayerActs;
+                let layer_ptr = &self.layers[li] as *const TransformerLayer;
+                unsafe {
+                    let acts  = &mut *acts_ptr;
+                    let layer = &*layer_ptr;
+                    gemm(&self.blas, &acts.xn1, &layer.w_qkv, &mut acts.qkv,
+                         nt, d, 3*d, false, false, one, f16::from_f32(0.0));
+                    let n = nt * 3 * d;
+                    self.stream.launch_builder(&self.fns.add_bias)
+                        .arg(&mut acts.qkv).arg(&layer.b_qkv).arg(&(nt as i32)).arg(&((3*d) as i32))
+                        .launch(cfg1d(n)).unwrap();
+                }
+            }
+
+            // split heads
+            {
+                let acts_ptr = &mut self.acts[li] as *mut GpuLayerActs;
+                let cfg = LaunchConfig { grid_dim: (nt as u32, h as u32, 1), block_dim: (dh as u32, 1, 1), shared_mem_bytes: 0 };
+                unsafe {
+                    let acts = &mut *acts_ptr;
+                    self.stream.launch_builder(&self.fns.qkv_split_nb)
+                        .arg(&acts.qkv).arg(&mut acts.q).arg(&mut acts.k).arg(&mut acts.v)
+                        .arg(&(nt as i32)).arg(&(t as i32)).arg(&(h as i32)).arg(&(dh as i32))
+                        .launch(cfg).unwrap();
+                }
+            }
+
+            // Q @ K^T (batched)
+            {
+                let acts_ptr = &mut self.acts[li] as *mut GpuLayerActs;
+                let scale_attn = f16::from_f32(1.0f32 / (dh as f32).sqrt());
+                unsafe {
+                    let acts = &mut *acts_ptr;
+                    gemm_batched_f16(&self.blas,
+                        &acts.q, &acts.k, &mut acts.scores,
+                        nh, t, dh, t,
+                        true, scale_attn, f16::from_f32(0.0));
+                }
+            }
+
+            // causal softmax
+            {
+                let acts_ptr = &mut self.acts[li] as *mut GpuLayerActs;
+                let cfg = cfg_attn_sfx(nh, t);
+                unsafe {
+                    let acts = &mut *acts_ptr;
+                    self.stream.launch_builder(&self.fns.causal_sfx)
+                        .arg(&mut acts.scores).arg(&(nh as i32)).arg(&(t as i32))
+                        .launch(cfg).unwrap();
+                }
+            }
+
+            // scores @ V
+            {
+                let acts_ptr = &mut self.acts[li] as *mut GpuLayerActs;
+                unsafe {
+                    let acts = &mut *acts_ptr;
+                    gemm_batched_f16(&self.blas,
+                        &acts.scores, &acts.v, &mut acts.ctx,
+                        nh, t, t, dh,
+                        false, f16::from_f32(1.0), f16::from_f32(0.0));
+                }
+            }
+
+            // merge heads
+            {
+                let acts_ptr = &mut self.acts[li] as *mut GpuLayerActs;
+                let cfg = LaunchConfig { grid_dim: (nt as u32, h as u32, 1), block_dim: (dh as u32, 1, 1), shared_mem_bytes: 0 };
+                unsafe {
+                    let acts = &mut *acts_ptr;
+                    self.stream.launch_builder(&self.fns.heads_merge_nb)
+                        .arg(&acts.ctx).arg(&mut acts.attn_out)
+                        .arg(&(nt as i32)).arg(&(t as i32)).arg(&(h as i32)).arg(&(dh as i32))
+                        .launch(cfg).unwrap();
+                }
+            }
+
+            // attn_out @ w_out + b_out + residual
+            {
+                let acts_ptr  = &mut self.acts[li] as *mut GpuLayerActs;
+                let layer_ptr = &self.layers[li] as *const TransformerLayer;
+                let n = nt * d;
+                unsafe {
+                    let acts  = &mut *acts_ptr;
+                    let layer = &*layer_ptr;
+                    gemm(&self.blas, &acts.attn_out, &layer.w_out, &mut acts.x_mid,
+                         nt, d, d, false, false, one, f16::from_f32(0.0));
+                    self.stream.launch_builder(&self.fns.add_bias)
+                        .arg(&mut acts.x_mid).arg(&layer.b_out).arg(&(nt as i32)).arg(&(d as i32))
+                        .launch(cfg1d(n)).unwrap();
+                    self.stream.launch_builder(&self.fns.add_inplace)
+                        .arg(&mut acts.x_mid).arg(&self.x_buf).arg(&(n as i32))
+                        .launch(cfg1d(n)).unwrap();
+                }
+            }
+
+            // LN2
+            {
+                let acts_ptr  = &mut self.acts[li] as *mut GpuLayerActs;
+                let layer_ptr = &self.layers[li] as *const TransformerLayer;
+                let cfg = cfg_ln(nt);
+                unsafe {
+                    let acts  = &mut *acts_ptr;
+                    let layer = &*layer_ptr;
+                    self.stream.launch_builder(&self.fns.layer_norm_fwd)
+                        .arg(&mut acts.xn2).arg(&mut acts.ln2_mean).arg(&mut acts.ln2_rstd)
+                        .arg(&acts.x_mid).arg(&layer.ln2_g).arg(&layer.ln2_b)
+                        .arg(&(nt as i32)).arg(&(d as i32)).arg(&1e-5f32)
+                        .launch(cfg).unwrap();
+                }
+            }
+
+            // FFN
+            {
+                let acts_ptr  = &mut self.acts[li] as *mut GpuLayerActs;
+                let layer_ptr = &self.layers[li] as *const TransformerLayer;
+                let n_ff = nt * ff;
+                let n_d  = nt * d;
+                unsafe {
+                    let acts  = &mut *acts_ptr;
+                    let layer = &*layer_ptr;
+                    gemm(&self.blas, &acts.xn2, &layer.w_ff1, &mut acts.ff1,
+                         nt, d, ff, false, false, one, f16::from_f32(0.0));
+                    self.stream.launch_builder(&self.fns.add_bias)
+                        .arg(&mut acts.ff1).arg(&layer.b_ff1).arg(&(nt as i32)).arg(&(ff as i32))
+                        .launch(cfg1d(n_ff)).unwrap();
+                    self.stream.launch_builder(&self.fns.gelu_fwd)
+                        .arg(&mut acts.ff1_act).arg(&acts.ff1).arg(&(n_ff as i32))
+                        .launch(cfg1d(n_ff)).unwrap();
+                    gemm(&self.blas, &acts.ff1_act, &layer.w_ff2, &mut self.x_buf,
+                         nt, ff, d, false, false, one, f16::from_f32(0.0));
+                    self.stream.launch_builder(&self.fns.add_bias)
+                        .arg(&mut self.x_buf).arg(&layer.b_ff2).arg(&(nt as i32)).arg(&(d as i32))
+                        .launch(cfg1d(n_d)).unwrap();
+                    self.stream.launch_builder(&self.fns.add_inplace)
+                        .arg(&mut self.x_buf).arg(&acts.x_mid).arg(&(n_d as i32))
+                        .launch(cfg1d(n_d)).unwrap();
+                }
+            }
+        }
+
+        // Final LN
+        {
+            let cfg = cfg_ln(nt);
+            unsafe {
+                self.stream.launch_builder(&self.fns.layer_norm_fwd)
+                    .arg(&mut self.x_norm_buf).arg(&mut self.lnf_mean).arg(&mut self.lnf_rstd)
+                    .arg(&self.x_buf).arg(&self.ln_f_g).arg(&self.ln_f_b)
+                    .arg(&(nt as i32)).arg(&(d as i32)).arg(&1e-5f32)
+                    .launch(cfg).unwrap();
+            }
+        }
+
+        // Logits for the whole nt block
+        gemm(&self.blas, &self.x_norm_buf, &self.embed, &mut self.logits_buf,
+             nt, d, vs, false, true, one, f16::from_f32(0.0));
+
+        self.stream.synchronize().unwrap();
+
+        // Read only last-token logits (offset = (nt-1) * vocab)
+        let all_logits: Vec<f16> = self.stream.clone_dtoh(&self.logits_buf).unwrap();
+        let offset = (nt - 1) * vs;
+        all_logits[offset..offset + vs].iter().map(|x| x.to_f32()).collect()
+    }
+
+    // ─────────────────────────────────────────────────────────────
     //  Training: forward + backward + Adam — fully on GPU
     // ─────────────────────────────────────────────────────────────
     pub fn train_batch_masked(&mut self, seqs: &[Vec<usize>], masks: &[Vec<f32>], lr: f32) -> f32 {

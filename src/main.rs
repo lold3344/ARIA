@@ -104,6 +104,9 @@ fn main() -> anyhow::Result<()> {
         (m, t)
     };
 
+    // Chat is inference-only from here on — drop training buffers.
+    model.free_training_buffers();
+
     println!("Vocabulary: {}", tokenizer.vocab_size());
     println!("\nCommands:");
     println!("  stats            - show statistics");
@@ -246,10 +249,11 @@ fn main() -> anyhow::Result<()> {
         print!("ARIA: ");
         io::stdout().flush()?;
 
-        let (mut current_logits, mut current_state) = model.forward_seq(&tokens);
+        let mut ids = tokens.clone();
         let mut generated_tokens: Vec<usize> = Vec::new();
 
         for step in 0..120 {
+            let mut current_logits = model.forward_gpu(&ids);
             tokenizer.mask_logits(&mut current_logits);
 
             let action = match mode {
@@ -263,10 +267,8 @@ fn main() -> anyhow::Result<()> {
             if action == 1 { continue; }
 
             generated_tokens.push(action);
-
-            let (nl, ns) = model.step(action, &current_state);
-            current_state = ns;
-            current_logits = nl;
+            ids.push(action);
+            if ids.len() >= 256 { break; }
         }
 
         let response_text = tokenizer.decode(&generated_tokens);
