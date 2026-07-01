@@ -3,18 +3,28 @@
 > **Legal notice:** I have nothing to do with anyone who uses this tool for illegal purposes. If you train my AI model and use it for hacking, criminal activity, or any other unlawful actions, that is entirely your own responsibility and problem.
 
 
-# ARIA Atom 3.3.0
+# ARIA Atom 3.4.0
 
 ![LOGO](screenshots/ARIA-Logo.png)
 
-**ARIA Atom 3.3.0** — локальная языковая модель на основе GPT-style Transformer с обучением на диалоговых данных, написанная на Rust. Вычисления выполняются на NVIDIA GPU через CUDA/cuBLAS с кастомными PTX ядрами.
+**ARIA Atom 3.4.0** — локальная языковая модель на основе GPT-style Transformer с обучением на диалоговых данных, написанная на Rust. Вычисления выполняются на NVIDIA GPU через CUDA/cuBLAS с кастомными PTX ядрами.
 
 > **Важно:** ARIA поддерживает только видеокарты NVIDIA. Работа на AMD, Intel и других GPU не гарантируется.
 
 | Версия | Кодовое имя | Архитектура | Параметры |
 |---|---|---|---|
 | 3.2.0 | Wotan | LSTM (1 слой) | ~44.5M |
-| **3.3.0** | **Atom** | **Transformer (12 слоёв)** | **~124M** |
+| 3.3.0 | Atom | Transformer (12 слоёв) | ~124M |
+| **3.4.0** | **Atom** | **Transformer + warmup/clip** | **~124M** |
+
+## Что нового в 3.4.0
+
+Улучшения тренировки без изменения архитектуры:
+- **LR warmup** — линейный прогрев 1000 шагов, затем cosine decay до 0.3× lr. Оптимизатор Adam стабилизируется на старте.
+- **Global gradient clipping** (norm=1.0) — глобальная L2-норма всех градиентов считается на GPU, при превышении применяется скейл ко всем тензорам. Предотвращает застревание loss.
+- Новый CUDA-кернел `scale_f32` для скейла f32-градиентов.
+
+3.3.0 останавливался с loss ~4.65 из-за отсутствия warmup и clipping. 3.4.0 решает эту проблему.
 
 ## Архитектура (3.3.0 Atom)
 
@@ -157,12 +167,16 @@ data base/
 
 | Переменная | Описание | Значение по умолчанию |
 |---|---|---|
-| `ARIA_LR` | Learning rate | 0.0003 |
-| `ARIA_CLIP` | Gradient clipping | 1.0 |
+| `ARIA_LR` | Learning rate (max после warmup) | 0.0003 |
+| `ARIA_WARMUP` | Шагов линейного прогрева LR | 1000 |
 | `ARIA_MAX_SEQS` | Максимум последовательностей на эпоху | 500 000 |
 | `ARIA_EPOCHS` | Количество эпох | 5 |
 | `ARIA_VOCAB_LINES` | Строк для построения словаря | 500 000 |
 | `ARIA_CONTINUE_TRAIN` | Продолжить предобучение | — |
+
+Gradient clipping всегда включён (norm=1.0), это часть тренировочного цикла и не отключается.
+
+**LR schedule:** первые `ARIA_WARMUP` шагов lr растёт линейно от 0 до `ARIA_LR`. Затем cosine decay до 0.3 × `ARIA_LR` к концу обучения.
 
 Пример — тестовый запуск на 100k последовательностей:
 
@@ -215,7 +229,7 @@ $env:ARIA_EPOCHS="5"
 Убедись, что установлен драйвер NVIDIA и CUDA Toolkit 12.x. CUDA должна быть доступна через `nvcc`.
 
 **Несовместимый чекпоинт**
-Чекпоинты версии 3.2.0 (LSTM, формат `checkpoint_v1`) несовместимы с 3.3.0 (Transformer, формат `transformer_v1`). Удали старый `aria_checkpoint.json` и запусти `train_fresh.exe`.
+Чекпоинты версии 3.2.0 (LSTM, формат `checkpoint_v1`) несовместимы с 3.3.0/3.4.0 (Transformer, формат `transformer_v1`). Удали старый `aria_checkpoint.json` и запусти `train_fresh.exe`. Чекпоинты 3.3.0 совместимы с 3.4.0 — обновление касается только тренировочного цикла.
 
 **Медленное обучение**
 Используй только `cargo build --release` и запускай `.exe` напрямую. Debug-сборка в 10-20 раз медленнее.
