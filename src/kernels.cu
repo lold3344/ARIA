@@ -364,6 +364,13 @@ extern "C" __global__ void scale_f16(__half* x, float scale, int n)
     x[i] = __float2half(__half2float(x[i]) * scale);
 }
 
+extern "C" __global__ void scale_f32(float* x, float scale, int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    x[i] = x[i] * scale;
+}
+
 // ─────────────────────────────────────────────────────────────
 //  GPU gradient clipping for FP16 grads (moments stay f32)
 // ─────────────────────────────────────────────────────────────

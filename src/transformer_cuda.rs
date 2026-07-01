@@ -54,7 +54,7 @@ const KERNEL_NAMES: &[&str] = &[
     "fused_lstm_fwd", "fused_lstm_bwd",
     "asm_linear", "asm_softmax", "asm_ce_grad",
     "asm_wgrad", "asm_bgrad", "asm_igrad",
-    "reduce_sum_batch", "reduce_sum", "adam_update", "adam_update_f16", "sgd_update_f16", "scale_f16",
+    "reduce_sum_batch", "reduce_sum", "adam_update", "adam_update_f16", "sgd_update_f16", "scale_f16", "scale_f32",
     "norm_reduce", "norm_reduce_f16", "clip_if_needed", "clip_if_needed_f16",
     "zero_float",
     "layer_norm_fwd", "layer_norm_bwd",
@@ -104,8 +104,11 @@ struct TrFns {
     add_bias:         cudarc::driver::CudaFunction,
     adam_f16:         cudarc::driver::CudaFunction,
     norm_reduce_f16:  cudarc::driver::CudaFunction,
+    norm_reduce_f32:  cudarc::driver::CudaFunction,
     clip_f16:         cudarc::driver::CudaFunction,
     scale_f16:        cudarc::driver::CudaFunction,
+    scale_f32:        cudarc::driver::CudaFunction,
+    reduce_sum:       cudarc::driver::CudaFunction,
     layer_norm_fwd:   cudarc::driver::CudaFunction,
     layer_norm_bwd:   cudarc::driver::CudaFunction,
     gelu_fwd:         cudarc::driver::CudaFunction,
@@ -279,6 +282,8 @@ pub struct TransformerModel {
     logits_buf: CudaSlice<f16>,  // [max_T, vocab]
     d_logits:   CudaSlice<f16>,  // [max_T, vocab]
     loss_acc:   CudaSlice<f32>,  // [1]
+    grad_norm_sq:    CudaSlice<f32>,  // [1] — accumulated ||g||^2 across all params
+    partial_norm_buf: CudaSlice<f32>, // scratch for norm_reduce per-block partials
     ids_buf:    CudaSlice<i32>,  // [MICRO_BATCH_N * max_seq_len]
     tgt_buf:    CudaSlice<i32>,  // [MICRO_BATCH_N * max_seq_len]
     msk_buf:    CudaSlice<f32>,  // [MICRO_BATCH_N * max_seq_len]
@@ -547,8 +552,11 @@ impl TransformerModel {
             add_bias:        fn_!("add_bias"),
             adam_f16:        fn_!("adam_update_f16"),
             norm_reduce_f16: fn_!("norm_reduce_f16"),
+            norm_reduce_f32: fn_!("norm_reduce"),
             clip_f16:        fn_!("clip_if_needed_f16"),
             scale_f16:       fn_!("scale_f16"),
+            scale_f32:       fn_!("scale_f32"),
+            reduce_sum:      fn_!("reduce_sum"),
             layer_norm_fwd:  fn_!("layer_norm_fwd"),
             layer_norm_bwd:  fn_!("layer_norm_bwd"),
             gelu_fwd:        fn_!("gelu_fwd"),
@@ -718,6 +726,10 @@ impl TransformerModel {
             logits_buf:   z16!(mbn * mt * vocab_size),
             d_logits:     z16!(mbn * mt * vocab_size),
             loss_acc:     zf32!(1),
+            grad_norm_sq: zf32!(1),
+            // Sized for the largest grad tensor (embedding = vocab*d_model).
+            // norm_reduce writes one partial float per 256-thread block.
+            partial_norm_buf: zf32!((vocab_size * d_model + 255) / 256 + 16),
             ids_buf:      zi32!(mbn * mt),
             tgt_buf:      zi32!(mbn * mt),
             msk_buf:      zf32!(mbn * mt),
@@ -1715,6 +1727,120 @@ impl TransformerModel {
                 .launch(cfg).unwrap(); }
         }
 
+        // ── GRADIENT CLIPPING (global L2 norm ≤ 1.0) ─────────────
+        const MAX_GRAD_NORM: f32 = 1.0;
+
+        // Zero the accumulator scalar
+        unsafe { self.stream.launch_builder(&self.fns.zero_scalar_f32)
+            .arg(&mut self.grad_norm_sq)
+            .launch(LaunchConfig { grid_dim: (1,1,1), block_dim: (1,1,1), shared_mem_bytes: 0 }).unwrap(); }
+
+        // Accumulate ||g||^2 for each parameter tensor into grad_norm_sq
+        macro_rules! accum_norm_f16 { ($g:expr) => {{
+            let n = ($g).len();
+            if n > 0 {
+                let num_blocks = (n + 255) / 256;
+                let cfg_norm = cfg_reduce(n);
+                unsafe { self.stream.launch_builder(&self.fns.norm_reduce_f16)
+                    .arg(&($g)).arg(&mut self.partial_norm_buf).arg(&(n as i32))
+                    .launch(cfg_norm).unwrap(); }
+                let cfg_red = LaunchConfig {
+                    grid_dim: (((num_blocks + 255) / 256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: (256 * 4) as u32,
+                };
+                unsafe { self.stream.launch_builder(&self.fns.reduce_sum)
+                    .arg(&self.partial_norm_buf).arg(&mut self.grad_norm_sq).arg(&(num_blocks as i32))
+                    .launch(cfg_red).unwrap(); }
+            }
+        }}}
+        macro_rules! accum_norm_f32 { ($g:expr) => {{
+            let n = ($g).len();
+            if n > 0 {
+                let num_blocks = (n + 255) / 256;
+                let cfg_norm = cfg_reduce(n);
+                unsafe { self.stream.launch_builder(&self.fns.norm_reduce_f32)
+                    .arg(&($g)).arg(&mut self.partial_norm_buf).arg(&(n as i32))
+                    .launch(cfg_norm).unwrap(); }
+                let cfg_red = LaunchConfig {
+                    grid_dim: (((num_blocks + 255) / 256) as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: (256 * 4) as u32,
+                };
+                unsafe { self.stream.launch_builder(&self.fns.reduce_sum)
+                    .arg(&self.partial_norm_buf).arg(&mut self.grad_norm_sq).arg(&(num_blocks as i32))
+                    .launch(cfg_red).unwrap(); }
+            }
+        }}}
+
+        accum_norm_f32!(self.g_embed);
+        accum_norm_f32!(self.g_pos);
+        accum_norm_f32!(self.g_ln_f_g);
+        accum_norm_f32!(self.g_ln_f_b);
+        for li in 0..nl {
+            accum_norm_f16!(self.grads[li].g_w_qkv);
+            accum_norm_f16!(self.grads[li].g_w_out);
+            accum_norm_f16!(self.grads[li].g_w_ff1);
+            accum_norm_f16!(self.grads[li].g_w_ff2);
+            accum_norm_f32!(self.grads[li].g_b_qkv);
+            accum_norm_f32!(self.grads[li].g_b_out);
+            accum_norm_f32!(self.grads[li].g_b_ff1);
+            accum_norm_f32!(self.grads[li].g_b_ff2);
+            accum_norm_f32!(self.grads[li].g_ln1_g);
+            accum_norm_f32!(self.grads[li].g_ln1_b);
+            accum_norm_f32!(self.grads[li].g_ln2_g);
+            accum_norm_f32!(self.grads[li].g_ln2_b);
+        }
+
+        // Sync + read the global norm; compute clip scale on host
+        self.stream.synchronize().unwrap();
+        let sq: Vec<f32> = self.stream.clone_dtoh(&self.grad_norm_sq).unwrap();
+        let global_norm = sq[0].max(0.0).sqrt();
+        let clip_scale = if global_norm > MAX_GRAD_NORM && global_norm.is_finite() {
+            MAX_GRAD_NORM / global_norm
+        } else {
+            1.0
+        };
+
+        // Apply scale to every grad tensor when clip triggered
+        if clip_scale < 1.0 {
+            macro_rules! scale_g_f16 { ($g:expr) => {{
+                let n = ($g).len();
+                if n > 0 {
+                    unsafe { self.stream.launch_builder(&self.fns.scale_f16)
+                        .arg(&mut ($g)).arg(&clip_scale).arg(&(n as i32))
+                        .launch(cfg1d(n)).unwrap(); }
+                }
+            }}}
+            macro_rules! scale_g_f32 { ($g:expr) => {{
+                let n = ($g).len();
+                if n > 0 {
+                    unsafe { self.stream.launch_builder(&self.fns.scale_f32)
+                        .arg(&mut ($g)).arg(&clip_scale).arg(&(n as i32))
+                        .launch(cfg1d(n)).unwrap(); }
+                }
+            }}}
+
+            scale_g_f32!(self.g_embed);
+            scale_g_f32!(self.g_pos);
+            scale_g_f32!(self.g_ln_f_g);
+            scale_g_f32!(self.g_ln_f_b);
+            for li in 0..nl {
+                scale_g_f16!(self.grads[li].g_w_qkv);
+                scale_g_f16!(self.grads[li].g_w_out);
+                scale_g_f16!(self.grads[li].g_w_ff1);
+                scale_g_f16!(self.grads[li].g_w_ff2);
+                scale_g_f32!(self.grads[li].g_b_qkv);
+                scale_g_f32!(self.grads[li].g_b_out);
+                scale_g_f32!(self.grads[li].g_b_ff1);
+                scale_g_f32!(self.grads[li].g_b_ff2);
+                scale_g_f32!(self.grads[li].g_ln1_g);
+                scale_g_f32!(self.grads[li].g_ln1_b);
+                scale_g_f32!(self.grads[li].g_ln2_g);
+                scale_g_f32!(self.grads[li].g_ln2_b);
+            }
+        }
+
         // ── ADAM UPDATE (all on GPU) ──────────────────────────────
         macro_rules! adam16 { ($p:expr, $m:expr, $v:expr, $g:expr) => {{
             let n = $p.len();
@@ -2077,11 +2203,13 @@ pub fn pretrain_from_files(
         .ok().and_then(|s| s.parse().ok()).unwrap_or(MAX_SEQS_PER_EPOCH);
     let epochs: usize = std::env::var("ARIA_EPOCHS")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(PRETRAIN_EPOCHS);
+    let warmup_steps: usize = std::env::var("ARIA_WARMUP")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(1000);
     let batch_size = PRETRAIN_BATCH_SIZE;
     let max_len    = MAX_TOKENS_PER_SEQ;
     let min_len    = MIN_TOKENS_PER_SEQ;
 
-    println!("LR: {lr}  Epochs: {epochs}  Batch: {batch_size}  SeqLen: {max_len}  MaxSeqs: {max_seqs}");
+    println!("LR: {lr}  Epochs: {epochs}  Batch: {batch_size}  SeqLen: {max_len}  MaxSeqs: {max_seqs}  Warmup: {warmup_steps}");
 
     // Load or build sequence cache
     let cache_path = format!("{}/sequences_cache_transformer_v{}_len{}.bin",
@@ -2128,11 +2256,17 @@ pub fn pretrain_from_files(
             let batch_seqs: Vec<Vec<usize>> = batch.iter().map(|&i| seqs[i].0.clone()).collect();
             let batch_masks: Vec<Vec<f32>>  = batch.iter().map(|&i| seqs[i].1.clone()).collect();
 
-            // Cosine decay: lr → lr * 0.3 over all epochs
+            // Linear warmup → cosine decay to 0.3 × lr
             let total_steps = epochs * n_batches;
             let current_step = epoch * n_batches + step;
-            let cos = (std::f32::consts::PI * current_step as f32 / total_steps as f32).cos();
-            let step_lr = lr * (0.3 + 0.7 * (cos * 0.5 + 0.5));
+            let step_lr = if current_step < warmup_steps {
+                lr * (current_step as f32 + 1.0) / warmup_steps as f32
+            } else {
+                let progress = (current_step - warmup_steps) as f32
+                             / (total_steps.saturating_sub(warmup_steps)).max(1) as f32;
+                let cos = (std::f32::consts::PI * progress).cos();
+                lr * (0.3 + 0.7 * (cos * 0.5 + 0.5))
+            };
 
             let loss = model.train_batch_masked(&batch_seqs, &batch_masks, step_lr);
             epoch_loss += loss;
@@ -2152,7 +2286,16 @@ pub fn pretrain_from_files(
 
         let elapsed = t0.elapsed().as_secs_f32();
         let avg_loss = epoch_loss / epoch_batches as f32;
-        let final_lr = lr * (0.3 + 0.7 * (((std::f32::consts::PI * (epoch * n_batches + n_batches - 1) as f32) / (epochs * n_batches) as f32).cos() * 0.5 + 0.5));
+        let final_step = epoch * n_batches + n_batches - 1;
+        let final_lr = if final_step < warmup_steps {
+            lr * (final_step as f32 + 1.0) / warmup_steps as f32
+        } else {
+            let total_steps = epochs * n_batches;
+            let progress = (final_step - warmup_steps) as f32
+                         / (total_steps.saturating_sub(warmup_steps)).max(1) as f32;
+            let cos = (std::f32::consts::PI * progress).cos();
+            lr * (0.3 + 0.7 * (cos * 0.5 + 0.5))
+        };
         println!("\nEpoch {}/{}  done  |  loss={:.6}  |  {:.1}s  |  lr={:.6}",
             epoch+1, epochs, avg_loss, elapsed, final_lr);
 
