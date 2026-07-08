@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+mod lora;
 mod transformer_cuda;
 mod tokenizer;
 mod storage;

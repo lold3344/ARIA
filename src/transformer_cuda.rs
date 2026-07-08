@@ -13,7 +13,7 @@ use rand::Rng;
 use rand::seq::SliceRandom;
 
 use crate::tokenizer::Tokenizer;
-use crate::lora::{LoraConfig, LayerLoraAdapters, ModelLoraAdapters};
+use crate::lora::{LoraConfig, LayerLoraAdapters};
 use cudarc::driver::CudaContext;
 
 
@@ -295,6 +295,7 @@ pub struct TransformerModel {
     msk_buf:    CudaSlice<f32>,  // [MICRO_BATCH_N * max_seq_len]
     dx_buf:     CudaSlice<f16>,  // [max_T, D] backward pass
     tmp_buf:    CudaSlice<f16>,  // [max_T, max(3D,ff)] temp
+    lora_tmp:   CudaSlice<f16>,  // [max_T, rank] LoRA intermediate (A(x))
     dq_buf:     CudaSlice<f16>,  // [NH, max_T, dh]
     dk_buf:     CudaSlice<f16>,  // [NH, max_T, dh] — kept for old path
     dv_buf:     CudaSlice<f16>,  // [NH, max_T, dh] — kept for old path
@@ -742,6 +743,7 @@ impl TransformerModel {
             msk_buf:      zf32!(mbn * mt),
             dx_buf:       z16!(mbn * mt * d_model),
             tmp_buf:      z16!(mbn * mt * max_3d_ff),
+            lora_tmp:     z16!(mbn * mt * 16),  // [batch, seq, rank] — intermediate for LoRA
             dq_buf:       z16!(mbn * num_heads * mt * head_dim),
             dk_buf:       z16!(mbn * num_heads * mt * head_dim),
             dv_buf:       z16!(mbn * num_heads * mt * head_dim),
@@ -1053,6 +1055,7 @@ impl TransformerModel {
         self.d_logits   = tiny_f16(&stream);
         self.dx_buf     = tiny_f16(&stream);
         self.tmp_buf    = tiny_f16(&stream);
+        self.lora_tmp   = tiny_f16(&stream);
         self.dq_buf     = tiny_f16(&stream);
         self.dk_buf     = tiny_f16(&stream);
         self.dv_buf     = tiny_f16(&stream);
@@ -1151,6 +1154,29 @@ impl TransformerModel {
                 }
             }
 
+            // LoRA adapter for QKV
+            if let Some(lora_cfg) = &self.lora_config {
+                if let Some(lora_adapters) = &self.layers[li].lora {
+                    let rank = lora_cfg.rank;
+                    let scale = lora_cfg.scale();
+                    let acts_ptr = &mut self.acts[li] as *mut GpuLayerActs;
+                    unsafe {
+                        let acts = &mut *acts_ptr;
+                        // temp = xn1 @ a_qkv^T  [nt, d] @ [d, rank] → [nt, rank]
+                        gemm(&self.blas, &acts.xn1, &lora_adapters.a_qkv, &mut self.lora_tmp,
+                             nt, d, rank, false, true, one, f16::from_f32(0.0));
+                        // adapter = scale * (temp @ b_qkv^T)  [nt, rank] @ [rank, 3*d] → [nt, 3*d]
+                        gemm(&self.blas, &self.lora_tmp, &lora_adapters.b_qkv, &mut self.tmp_buf,
+                             nt, rank, 3*d, false, true, f16::from_f32(scale), f16::from_f32(0.0));
+                        // qkv += adapter
+                        let n = nt * 3 * d;
+                        self.stream.launch_builder(&self.fns.add_inplace)
+                            .arg(&mut acts.qkv).arg(&self.tmp_buf).arg(&(n as i32))
+                            .launch(cfg1d(n)).unwrap();
+                    }
+                }
+            }
+
             // split heads
             {
                 let acts_ptr = &mut self.acts[li] as *mut GpuLayerActs;
@@ -1227,6 +1253,38 @@ impl TransformerModel {
                     self.stream.launch_builder(&self.fns.add_bias)
                         .arg(&mut acts.x_mid).arg(&layer.b_out).arg(&(nt as i32)).arg(&(d as i32))
                         .launch(cfg1d(n)).unwrap();
+                }
+            }
+
+            // LoRA adapter for output projection
+            if let Some(lora_cfg) = &self.lora_config {
+                if let Some(lora_adapters) = &self.layers[li].lora {
+                    let rank = lora_cfg.rank;
+                    let scale = lora_cfg.scale();
+                    let acts_ptr = &mut self.acts[li] as *mut GpuLayerActs;
+                    let n = nt * d;
+                    unsafe {
+                        let acts = &mut *acts_ptr;
+                        // temp = attn_out @ a_out^T  [nt, d] @ [d, rank] → [nt, rank]
+                        gemm(&self.blas, &acts.attn_out, &lora_adapters.a_out, &mut self.lora_tmp,
+                             nt, d, rank, false, true, one, f16::from_f32(0.0));
+                        // adapter = scale * (temp @ b_out^T)  [nt, rank] @ [rank, d] → [nt, d]
+                        gemm(&self.blas, &self.lora_tmp, &lora_adapters.b_out, &mut self.tmp_buf,
+                             nt, rank, d, false, true, f16::from_f32(scale), f16::from_f32(0.0));
+                        // x_mid += adapter
+                        self.stream.launch_builder(&self.fns.add_inplace)
+                            .arg(&mut acts.x_mid).arg(&self.tmp_buf).arg(&(n as i32))
+                            .launch(cfg1d(n)).unwrap();
+                    }
+                }
+            }
+
+            // Residual connection
+            {
+                let acts_ptr = &mut self.acts[li] as *mut GpuLayerActs;
+                let n = nt * d;
+                unsafe {
+                    let acts = &mut *acts_ptr;
                     self.stream.launch_builder(&self.fns.add_inplace)
                         .arg(&mut acts.x_mid).arg(&self.x_buf).arg(&(n as i32))
                         .launch(cfg1d(n)).unwrap();
@@ -1249,25 +1307,102 @@ impl TransformerModel {
                 }
             }
 
-            // FFN
+            // FFN layer 1: xn2 @ w_ff1 + LoRA + bias + GELU
             {
                 let acts_ptr  = &mut self.acts[li] as *mut GpuLayerActs;
                 let layer_ptr = &self.layers[li] as *const TransformerLayer;
                 let n_ff = nt * ff;
-                let n_d  = nt * d;
                 unsafe {
                     let acts  = &mut *acts_ptr;
                     let layer = &*layer_ptr;
                     gemm(&self.blas, &acts.xn2, &layer.w_ff1, &mut acts.ff1,
                          nt, d, ff, false, false, one, f16::from_f32(0.0));
+                }
+            }
+
+            // LoRA adapter for FFN layer 1
+            if let Some(lora_cfg) = &self.lora_config {
+                if let Some(lora_adapters) = &self.layers[li].lora {
+                    let rank = lora_cfg.rank;
+                    let scale = lora_cfg.scale();
+                    let acts_ptr = &mut self.acts[li] as *mut GpuLayerActs;
+                    let n_ff = nt * ff;
+                    unsafe {
+                        let acts = &mut *acts_ptr;
+                        // temp = xn2 @ a_ff1^T  [nt, d] @ [d, rank] → [nt, rank]
+                        gemm(&self.blas, &acts.xn2, &lora_adapters.a_ff1, &mut self.lora_tmp,
+                             nt, d, rank, false, true, one, f16::from_f32(0.0));
+                        // adapter = scale * (temp @ b_ff1^T)  [nt, rank] @ [rank, ff] → [nt, ff]
+                        gemm(&self.blas, &self.lora_tmp, &lora_adapters.b_ff1, &mut self.tmp_buf,
+                             nt, rank, ff, false, true, f16::from_f32(scale), f16::from_f32(0.0));
+                        // ff1 += adapter
+                        self.stream.launch_builder(&self.fns.add_inplace)
+                            .arg(&mut acts.ff1).arg(&self.tmp_buf).arg(&(n_ff as i32))
+                            .launch(cfg1d(n_ff)).unwrap();
+                    }
+                }
+            }
+
+            // Add bias and GELU activation
+            {
+                let acts_ptr  = &mut self.acts[li] as *mut GpuLayerActs;
+                let layer_ptr = &self.layers[li] as *const TransformerLayer;
+                let n_ff = nt * ff;
+                unsafe {
+                    let acts  = &mut *acts_ptr;
+                    let layer = &*layer_ptr;
                     self.stream.launch_builder(&self.fns.add_bias)
                         .arg(&mut acts.ff1).arg(&layer.b_ff1).arg(&(nt as i32)).arg(&(ff as i32))
                         .launch(cfg1d(n_ff)).unwrap();
                     self.stream.launch_builder(&self.fns.gelu_fwd)
                         .arg(&mut acts.ff1_act).arg(&acts.ff1).arg(&(n_ff as i32))
                         .launch(cfg1d(n_ff)).unwrap();
+                }
+            }
+
+            // FFN layer 2: ff1_act @ w_ff2 + LoRA + bias + residual
+            {
+                let acts_ptr  = &mut self.acts[li] as *mut GpuLayerActs;
+                let layer_ptr = &self.layers[li] as *const TransformerLayer;
+                unsafe {
+                    let acts  = &mut *acts_ptr;
+                    let layer = &*layer_ptr;
                     gemm(&self.blas, &acts.ff1_act, &layer.w_ff2, &mut self.x_buf,
                          nt, ff, d, false, false, one, f16::from_f32(0.0));
+                }
+            }
+
+            // LoRA adapter for FFN layer 2
+            if let Some(lora_cfg) = &self.lora_config {
+                if let Some(lora_adapters) = &self.layers[li].lora {
+                    let rank = lora_cfg.rank;
+                    let scale = lora_cfg.scale();
+                    let acts_ptr = &mut self.acts[li] as *mut GpuLayerActs;
+                    let n_d = nt * d;
+                    unsafe {
+                        let acts = &mut *acts_ptr;
+                        // temp = ff1_act @ a_ff2^T  [nt, ff] @ [ff, rank] → [nt, rank]
+                        gemm(&self.blas, &acts.ff1_act, &lora_adapters.a_ff2, &mut self.lora_tmp,
+                             nt, ff, rank, false, true, one, f16::from_f32(0.0));
+                        // adapter = scale * (temp @ b_ff2^T)  [nt, rank] @ [rank, d] → [nt, d]
+                        gemm(&self.blas, &self.lora_tmp, &lora_adapters.b_ff2, &mut self.tmp_buf,
+                             nt, rank, d, false, true, f16::from_f32(scale), f16::from_f32(0.0));
+                        // x_buf += adapter
+                        self.stream.launch_builder(&self.fns.add_inplace)
+                            .arg(&mut self.x_buf).arg(&self.tmp_buf).arg(&(n_d as i32))
+                            .launch(cfg1d(n_d)).unwrap();
+                    }
+                }
+            }
+
+            // Add bias and residual
+            {
+                let acts_ptr  = &mut self.acts[li] as *mut GpuLayerActs;
+                let layer_ptr = &self.layers[li] as *const TransformerLayer;
+                let n_d  = nt * d;
+                unsafe {
+                    let acts  = &mut *acts_ptr;
+                    let layer = &*layer_ptr;
                     self.stream.launch_builder(&self.fns.add_bias)
                         .arg(&mut self.x_buf).arg(&layer.b_ff2).arg(&(nt as i32)).arg(&(d as i32))
                         .launch(cfg1d(n_d)).unwrap();
