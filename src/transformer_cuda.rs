@@ -2336,8 +2336,13 @@ impl TransformerModel {
             let gp = &mut self.grads[li] as *mut GpuLayerGrad;
             unsafe {
                 macro_rules! adam_w { ($w:ident, $m:ident, $v:ident, $g:ident) => {{
-                    let n = (*lp).$w.len();
-                    self.stream.launch_builder(&self.fns.adam_f16).arg(&mut (*lp).$w).arg(&mut (*lp).$m).arg(&mut (*lp).$v).arg(&(*gp).$g).arg(&lr).arg(&0.9f32).arg(&0.999f32).arg(&eps).arg(&bc1).arg(&bc2).arg(&(n as i32)).launch(cfg1d(n)).unwrap();
+                    // Skip base weight updates if LoRA enabled (weights are frozen)
+                    if self.lora_config.is_some() && (*lp).lora.is_some() {
+                        // Don't update base weights when LoRA is active
+                    } else {
+                        let n = (*lp).$w.len();
+                        self.stream.launch_builder(&self.fns.adam_f16).arg(&mut (*lp).$w).arg(&mut (*lp).$m).arg(&mut (*lp).$v).arg(&(*gp).$g).arg(&lr).arg(&0.9f32).arg(&0.999f32).arg(&eps).arg(&bc1).arg(&bc2).arg(&(n as i32)).launch(cfg1d(n)).unwrap();
+                    }
                 }}}
                 macro_rules! adam_b { ($w:ident, $m:ident, $v:ident, $g:ident) => {{
                     let n = (*lp).$w.len();
