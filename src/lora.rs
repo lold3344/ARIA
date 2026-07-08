@@ -91,3 +91,78 @@ impl ModelLoraAdapters {
         per_layer * self.layers.len()
     }
 }
+
+impl LayerLoraAdapters {
+    /// Initialize LoRA adapters: A matrices with Kaiming uniform, B matrices with zeros
+    pub fn init_kaiming_zeros(
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        d_model: usize,
+        ffn_dim: usize,
+        rank: usize,
+    ) -> Self {
+        use rand::Rng;
+
+        let mut rng = rand::thread_rng();
+
+        // Kaiming uniform: scale = sqrt(6 / fan_in)
+        let kaiming_scale = |fan_in: usize| (6.0 / fan_in as f32).sqrt();
+
+        // A matrices: Kaiming uniform initialization
+        let a_qkv_data: Vec<f32> = (0..rank * d_model)
+            .map(|_| rng.gen_range(-1.0..1.0) * kaiming_scale(d_model))
+            .collect();
+        let a_out_data: Vec<f32> = (0..rank * d_model)
+            .map(|_| rng.gen_range(-1.0..1.0) * kaiming_scale(d_model))
+            .collect();
+        let a_ff1_data: Vec<f32> = (0..rank * d_model)
+            .map(|_| rng.gen_range(-1.0..1.0) * kaiming_scale(d_model))
+            .collect();
+        let a_ff2_data: Vec<f32> = (0..rank * ffn_dim)
+            .map(|_| rng.gen_range(-1.0..1.0) * kaiming_scale(ffn_dim))
+            .collect();
+
+        // B matrices: zero initialization
+        let b_qkv_data = vec![0.0f32; 3 * d_model * rank];
+        let b_out_data = vec![0.0f32; d_model * rank];
+        let b_ff1_data = vec![0.0f32; ffn_dim * rank];
+        let b_ff2_data = vec![0.0f32; d_model * rank];
+
+        // Convert to f16 and upload to GPU
+        let to_f16 = |v: &[f32]| v.iter().map(|&x| half::f16::from_f32(x)).collect::<Vec<_>>();
+        let upload = |data: Vec<f16>| stream.clone_htod(&data).unwrap();
+
+        // Adam moments (FP32): initialize to zero
+        let zeros_f32 = |n: usize| vec![0.0f32; n];
+        let upload_f32 = |data: Vec<f32>| stream.clone_htod(&data).unwrap();
+
+        Self {
+            a_qkv: upload(to_f16(&a_qkv_data)),
+            b_qkv: upload(to_f16(&b_qkv_data)),
+            m_a_qkv: upload_f32(zeros_f32(rank * d_model)),
+            v_a_qkv: upload_f32(zeros_f32(rank * d_model)),
+            m_b_qkv: upload_f32(zeros_f32(3 * d_model * rank)),
+            v_b_qkv: upload_f32(zeros_f32(3 * d_model * rank)),
+
+            a_out: upload(to_f16(&a_out_data)),
+            b_out: upload(to_f16(&b_out_data)),
+            m_a_out: upload_f32(zeros_f32(rank * d_model)),
+            v_a_out: upload_f32(zeros_f32(rank * d_model)),
+            m_b_out: upload_f32(zeros_f32(d_model * rank)),
+            v_b_out: upload_f32(zeros_f32(d_model * rank)),
+
+            a_ff1: upload(to_f16(&a_ff1_data)),
+            b_ff1: upload(to_f16(&b_ff1_data)),
+            m_a_ff1: upload_f32(zeros_f32(rank * d_model)),
+            v_a_ff1: upload_f32(zeros_f32(rank * d_model)),
+            m_b_ff1: upload_f32(zeros_f32(ffn_dim * rank)),
+            v_b_ff1: upload_f32(zeros_f32(ffn_dim * rank)),
+
+            a_ff2: upload(to_f16(&a_ff2_data)),
+            b_ff2: upload(to_f16(&b_ff2_data)),
+            m_a_ff2: upload_f32(zeros_f32(rank * ffn_dim)),
+            v_a_ff2: upload_f32(zeros_f32(rank * ffn_dim)),
+            m_b_ff2: upload_f32(zeros_f32(d_model * rank)),
+            v_b_ff2: upload_f32(zeros_f32(d_model * rank)),
+        }
+    }
+}

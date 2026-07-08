@@ -1077,6 +1077,33 @@ impl TransformerModel {
     }
 
     // ─────────────────────────────────────────────────────────────
+    //  Enable LoRA: initialize adapters for all layers
+    //  Adapters: A matrices (Kaiming), B matrices (zeros)
+    // ─────────────────────────────────────────────────────────────
+    pub fn enable_lora(&mut self, rank: usize) {
+        if self.lora_config.is_some() {
+            println!("[LoRA] Already enabled");
+            return;
+        }
+
+        let config = LoraConfig::new(rank as usize, rank as f32);
+        println!("[LoRA] Enabling with rank={}, alpha={}", rank, config.alpha);
+
+        for li in 0..self.num_layers {
+            let adapters = LayerLoraAdapters::init_kaiming_zeros(
+                &self.stream,
+                self.d_model,
+                self.ffn_dim,
+                rank,
+            );
+            self.layers[li].lora = Some(Box::new(adapters));
+        }
+
+        self.lora_config = Some(config);
+        println!("[LoRA] Initialized for all {} layers", self.num_layers);
+    }
+
+    // ─────────────────────────────────────────────────────────────
     //  GPU forward pass for inference (batch = 1).
     //  Returns logits [vocab_size] for the LAST token only.
     // ─────────────────────────────────────────────────────────────
