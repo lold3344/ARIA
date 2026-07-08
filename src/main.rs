@@ -334,7 +334,7 @@ fn train_fresh(tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str,
     let actual_vocab = tokenizer.vocab_size();
     println!("Vocabulary built: {} tokens", actual_vocab);
 
-    let mut model = TransformerModel::new(actual_vocab, 768, 12, 12, 3072, 256);
+    let mut model = TransformerModel::new(actual_vocab, 512, 8, 6, 2048, 256);
 
     println!("Pre-training...");
     crate::transformer_cuda::pretrain_from_files(&mut model, tokenizer, data_dir, checkpoint_path, tokenizer_path).ok();

@@ -13,6 +13,7 @@ use rand::Rng;
 use rand::seq::SliceRandom;
 
 use crate::tokenizer::Tokenizer;
+use crate::lora::{LoraConfig, LayerLoraAdapters, ModelLoraAdapters};
 use cudarc::driver::CudaContext;
 
 
@@ -231,6 +232,8 @@ struct TransformerLayer {
     m_ln1_b:  CudaSlice<f32>, v_ln1_b:  CudaSlice<f32>,
     m_ln2_g:  CudaSlice<f32>, v_ln2_g:  CudaSlice<f32>,
     m_ln2_b:  CudaSlice<f32>, v_ln2_b:  CudaSlice<f32>,
+    // LoRA adapters (optional, only if training with LoRA)
+    lora: Option<Box<LayerLoraAdapters>>,
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -263,6 +266,9 @@ pub struct TransformerModel {
     pub ffn_dim:     usize,
     pub max_seq_len: usize,
     head_dim: usize,
+
+    // LoRA configuration
+    pub lora_config: Option<LoraConfig>,
 
     adam_step: i32,
 
@@ -525,6 +531,7 @@ fn make_layer(stream: &Arc<CudaStream>, d: usize, _h: usize, ff: usize) -> Trans
         m_ln1_b:  z32!(d),        v_ln1_b:  z32!(d),
         m_ln2_g:  z32!(d),        v_ln2_g:  z32!(d),
         m_ln2_b:  z32!(d),        v_ln2_b:  z32!(d),
+        lora: None,
     }
 }
 
@@ -744,7 +751,7 @@ impl TransformerModel {
             d_attn_buf:   z16!(mbn * num_heads * mt * mt),
             d_ctx_buf:    z16!(mbn * num_heads * mt * head_dim),
             cuda_graph:   None,
-
+            lora_config:  None,
         }
     }
 

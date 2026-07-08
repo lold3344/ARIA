@@ -69,11 +69,11 @@ fn main() -> anyhow::Result<()> {
     let checkpoint_path = "aria json/aria_checkpoint.json";
     let tokenizer_path = "aria json/aria_tokenizer.json";
 
-    // Transformer hyperparams
-    let d_model    = 768;
-    let num_heads  = 12;
-    let num_layers = 12;
-    let ffn_dim    = 3072;
+    // Transformer hyperparams (40M params)
+    let d_model    = 512;
+    let num_heads  = 8;
+    let num_layers = 6;
+    let ffn_dim    = 2048;
     let max_seq    = 256;
 
     let vocab_lines: usize = std::env::var("ARIA_VOCAB_LINES")

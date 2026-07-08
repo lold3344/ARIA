@@ -3,57 +3,68 @@
 > **Legal notice:** I have nothing to do with anyone who uses this tool for illegal purposes. If you train my AI model and use it for hacking, criminal activity, or any other unlawful actions, that is entirely your own responsibility and problem.
 
 
-# ARIA Atom 3.4.0
+# ARIA Atom 3.5.0
 
 ![LOGO](screenshots/ARIA-Logo.png)
 
-**ARIA Atom 3.4.0** — локальная языковая модель на основе GPT-style Transformer с обучением на диалоговых данных, написанная на Rust. Вычисления выполняются на NVIDIA GPU через CUDA/cuBLAS с кастомными PTX ядрами.
+**ARIA Atom 3.5.0** — локальная языковая модель на основе GPT-style Transformer с обучением на диалоговых данных, написанная на Rust. Вычисления выполняются на NVIDIA GPU через CUDA/cuBLAS с кастомными PTX ядрами. Версия 3.5.0 добавляет **LoRA (Low-Rank Adaptation)** для эффективного обучения на ограниченной VRAM.
 
 > **Важно:** ARIA поддерживает только видеокарты NVIDIA. Работа на AMD, Intel и других GPU не гарантируется.
 
-| Версия | Кодовое имя | Архитектура | Параметры |
-|---|---|---|---|
-| 3.2.0 | Wotan | LSTM (1 слой) | ~44.5M |
-| 3.3.0 | Atom | Transformer (12 слоёв) | ~124M |
-| **3.4.0** | **Atom** | **Transformer + warmup/clip** | **~124M** |
+| Версия | Кодовое имя | Архитектура | Параметры | VRAM | Статус |
+|---|---|---|---|---|---|
+| 3.2.0 | Wotan | LSTM (1 слой) | ~44.5M | 6GB | ✓ Архив |
+| 3.3.0 | Atom | Transformer (12 слоёв) | ~124M | 8GB | ✓ Архив |
+| 3.4.0 | Atom | Transformer + warmup/clip | ~40M | 4GB | ✓ Архив |
+| **3.5.0** | **Efkolos** (легкая) | **Transformer + LoRA** | **35M** | **~500MB** | ⏳ В разработке |
+| 3.5.0 | Varys (тяжелая) | Transformer + LoRA | 1B | ~8GB | ⏳ Планируется |
 
-## Что нового в 3.4.0
+## Что нового в 3.5.0
 
-Улучшения тренировки без изменения архитектуры:
-- **LR warmup** — линейный прогрев 1000 шагов, затем cosine decay до 0.3× lr. Оптимизатор Adam стабилизируется на старте.
-- **Global gradient clipping** (norm=1.0) — глобальная L2-норма всех градиентов считается на GPU, при превышении применяется скейл ко всем тензорам. Предотвращает застревание loss.
-- Новый CUDA-кернел `scale_f32` для скейла f32-градиентов.
+- **LoRA (Low-Rank Adaptation)** — обучение только адаптеров (~1% параметров) вместо полного набора весов
+- **INT4 quantization** базовой модели для снижения VRAM
+- **Gradient checkpointing** для сжатия активаций
+- Две версии: **Efkolos** (35M, легкая) для RTX 4060 и **Varys** (1B, тяжелая) для RTX 4080S
+- Поддержка обучения на ограниченной VRAM (500MB–8GB вместо 4GB–20GB)
 
-3.3.0 останавливался с loss ~4.65 из-за отсутствия warmup и clipping. 3.4.0 решает эту проблему.
+## Архитектура (3.5.0 Efkolos)
 
-## Архитектура (3.3.0 Atom)
+### Efkolos (35M параметров)
 
 ```
-Тип:           GPT-style decoder-only Transformer
-Слои:          12
-d_model:       768
-Головы:        12  (head_dim = 64)
-FFN dim:       3072  (4 × d_model)
+Тип:           GPT-style decoder-only Transformer + LoRA
+Слои:          6
+d_model:       512
+Головы:        8  (head_dim = 64)
+FFN dim:       2048  (4 × d_model)
 Макс. контекст: 256 токенов
 Словарь:       32 000 (BPE)
-Weight tying:  embed ↔ output projection
-Параметры:     ~124M
-Точность:      FP16 веса + FP32 моменты Adam
+Параметры:     35M (база) + 350K (LoRA адаптер)
+Точность:      INT4 (база) + FP16 (адаптер) + FP32 моменты Adam
+LoRA rank:     8
 ```
 
-### VRAM (batch=64, seq=256)
+#### VRAM (batch=1, seq=64, gradient checkpointing)
 
 | Компонент | Размер |
 |---|---|
-| Веса FP16 | ~248 МБ |
-| Моменты Adam FP32 | ~992 МБ |
-| Активации | ~2.5 ГБ |
-| Веса внимания | ~1.5 ГБ |
-| Градиенты | ~2.0 ГБ |
-| Прочее | ~200 МБ |
-| **Итого** | **~7–7.5 ГБ** |
+| Модель INT4 | 17.5 МБ |
+| LoRA адаптер | 700 КБ |
+| Adam моменты | 70 МБ |
+| Активации | ~300 МБ |
+| Буферы | ~100 МБ |
+| **Итого** | **~500 МБ** |
 
-Требует 8 ГБ VRAM. На 6 ГБ не поместится.
+Поместится в RTX 4060 (8GB).
+
+### Varys (1B параметров) — *планируется*
+
+```
+Тип:           GPT-style decoder-only Transformer + LoRA
+Параметры:     1B (база) + 10M (LoRA адаптер)
+Требуемый VRAM: ~8–10 ГБ (с INT4 + gradient checkpointing)
+Целевой GPU:   RTX 4080S (20GB)
+```
 
 ## Требования
 
