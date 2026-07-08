@@ -13,11 +13,11 @@
 
 | Версия | Кодовое имя | Архитектура | Параметры | VRAM | Статус |
 |---|---|---|---|---|---|
-| 3.2.0 | Wotan | LSTM (1 слой) | ~44.5M | 6GB | ✓ Архив |
-| 3.3.0 | Atom | Transformer (12 слоёв) | ~124M | 8GB | ✓ Архив |
-| 3.4.0 | Atom | Transformer + warmup/clip | ~40M | 4GB | ✓ Архив |
-| **3.5.0** | **Efkolos** (легкая) | **Transformer + LoRA** | **35M** | **~500MB** | ⏳ В разработке |
-| 3.5.0 | Varys (тяжелая) | Transformer + LoRA | 1B | ~8GB | ⏳ Планируется |
+| 3.2.0 | Wotan | LSTM (1 слой) | ~44.5M | 6GB | Архив |
+| 3.3.0 | Atom | Transformer (12 слоёв) | ~124M | 8GB | Архив |
+| 3.4.0 | Atom | Transformer + warmup/clip | ~40M | 4GB | Архив |
+| **3.5.0** | **Efkolos** (легкая) | **Transformer + LoRA** | **35M** | **~500MB** | В разработке |
+| 3.5.0 | Varys (тяжелая) | Transformer + LoRA | 1B | ~8GB | Планируется |
 
 ## Что нового в 3.5.0
 
