@@ -110,7 +110,7 @@ const MIN_TOKENS_PER_SEQ:  usize = 6;
 const PRETRAIN_EPOCHS:     usize = 5;
 const PRETRAIN_BATCH_SIZE: usize = 64;
 const MAX_SEQS_PER_EPOCH:  usize = 500_000;
-const MICRO_BATCH_N:       usize = 32; // sequences processed simultaneously
+const MICRO_BATCH_N:       usize = 1; // sequences processed simultaneously (batch=1 for RTX 4060)
 
 const KERNEL_NAMES: &[&str] = &[
     "embedding_fwd", "embedding_bwd", "add_bias",
@@ -778,7 +778,8 @@ impl TransformerModel {
         let m_ln_f_b = z32!(d_model); let v_ln_f_b = z32!(d_model);
 
         // ── GPU training v2 buffers ──────────────────────────────
-        let mt = max_seq_len;
+        let mt = max_seq_len;  // Use full max_seq_len for buffer allocation
+        let mbn = MICRO_BATCH_N;
         let mbn = MICRO_BATCH_N;
         macro_rules! z16  { ($n:expr) => { upload_f16(&stream, &zeros_f32_v($n)) } }
         macro_rules! zf32 { ($n:expr) => { upload_f32(&stream, &zeros_f32_v($n)) } }
