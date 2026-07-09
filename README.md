@@ -3,11 +3,11 @@
 > **Legal notice:** I have nothing to do with anyone who uses this tool for illegal purposes. If you train my AI model and use it for hacking, criminal activity, or any other unlawful actions, that is entirely your own responsibility and problem.
 
 
-# ARIA Atom 3.5.0
+# ARIA Atom 3.5.1
 
 ![LOGO](screenshots/ARIA-Logo.png)
 
-**ARIA Atom 3.5.0** — локальная языковая модель на основе GPT-style Transformer с обучением на диалоговых данных, написанная на Rust. Вычисления выполняются на NVIDIA GPU через CUDA/cuBLAS с кастомными PTX ядрами. Версия 3.5.0 добавляет **LoRA (Low-Rank Adaptation)** для эффективного обучения на ограниченной VRAM.
+**ARIA Atom 3.5.1** — локальная языковая модель на основе GPT-style Transformer с обучением на диалоговых данных, написанная на Rust. Вычисления выполняются на NVIDIA GPU через CUDA/cuBLAS с кастомными PTX ядрами. Версия 3.5+ добавляет **LoRA (Low-Rank Adaptation)** для эффективного обучения на ограниченной VRAM.
 
 > **Важно:** ARIA поддерживает только видеокарты NVIDIA. Работа на AMD, Intel и других GPU не гарантируется.
 
@@ -16,16 +16,26 @@
 | 3.2.0 | Wotan | LSTM (1 слой) | ~44.5M | 6GB | Архив |
 | 3.3.0 | Atom | Transformer (12 слоёв) | ~124M | 8GB | Архив |
 | 3.4.0 | Atom | Transformer + warmup/clip | ~40M | 4GB | Архив |
-| **3.5.0** | **Efkolos** (стандартная) | **Transformer + LoRA** | **250M** | **~4GB** | В разработке |
+| **3.5.0** | **Efkolos** (стандартная) | **Transformer + LoRA** | **250M** | **~4GB** | Stable |
+| **3.5.1** | **Efkolos** (улучшенная) | **Transformer + LoRA + INT4** | **250M** | **~3GB** | В разработке |
 | 3.5.0 | Varys (тяжелая) | Transformer + LoRA | 1B | ~8GB | Планируется |
 
-## Что нового в 3.5.0
+## Что нового в 3.5.0–3.5.1
 
+### v3.5.0 (Stable)
 - **LoRA (Low-Rank Adaptation)** — обучение только адаптеров (~1% параметров) вместо полного набора весов
-- **INT4 quantization** базовой модели для снижения VRAM
-- **Gradient checkpointing** для сжатия активаций
-- Две версии: **Efkolos** (250M, стандартная) для RTX 4060 и **Varys** (1B, тяжелая) для RTX 4080S
-- Поддержка обучения на ограниченной VRAM (~4GB–8GB вместо 4GB–20GB)
+- Forward pass с LoRA для всех слоев (QKV, output, FFN)
+- Adapter initialization (Kaiming для A, zero для B)
+- Base weight freezing при обучении
+- 250M параметров, контекст 2048 токенов
+
+### v3.5.1 (In Development)
+- **INT4 quantization** базовой модели для снижения VRAM (целевой: ~3GB вместо 4GB)
+- **Gradient checkpointing** для сжатия активаций (30-50% экономия памяти)
+- Полный backward pass с вычислением градиентов для адаптеров
+- Фиксированные баги в LoRA backward pass
+- Поддержка batch size > 1
+- Runtime configuration LoRA rank
 
 ## Архитектура (3.5.0 Efkolos)
 
@@ -37,24 +47,24 @@
 d_model:       896
 Головы:        14  (head_dim = 64)
 FFN dim:       3584  (4 × d_model)
-Макс. контекст: 2600 токенов
+Макс. контекст: 2048 токенов
 Словарь:       32 000 (BPE)
 Параметры:     250M (база) + 5M (LoRA адаптер)
 Точность:      FP16 (база) + FP16 (адаптер) + FP32 моменты Adam
 LoRA rank:     8
 ```
 
-#### VRAM (batch=1, seq=2600, текущая реализация)
+#### VRAM (batch=1, seq=2048, текущая реализация)
 
 | Компонент | Размер |
 |---|---|
 | Модель FP16 | 250 МБ |
 | LoRA адаптер | 60 МБ |
 | Adam моменты | 2000 МБ |
-| Активации | 1400 МБ |
-| Attention scores | 190 МБ |
+| Активации | 1100 МБ |
+| Attention scores | 110 МБ |
 | Буферы | 100 МБ |
-| **Итого** | **~3990 МБ** |
+| **Итого** | **~3620 МБ** |
 
 Поместится в RTX 4060 (8GB) с буфером 4GB.
 
