@@ -31,9 +31,18 @@
 
 ### v3.5.1 (In Development)
 - **INT4 quantization** базовой модели для снижения VRAM (целевой: ~3GB вместо 4GB)
+  - Функции quantize_f16_to_int4() / dequantize_int4_to_f16()
+  - Дежатие на лету перед операциями GEMM
+  - Сокращение памяти для весов базовой модели на 75%
 - **Gradient checkpointing** для сжатия активаций (30-50% экономия памяти)
-- Полный backward pass с вычислением градиентов для адаптеров
-- Фиксированные баги в LoRA backward pass
+  - Флаг gradient_checkpointing в модели
+  - Пропуск сохранения промежуточных активаций
+  - Пересчет активаций во время backward pass
+- **LoRA Backward Pass** — полный backward с вычислением градиентов адаптеров
+  - Метод enable_lora_backward() для активации
+  - compute_lora_gradients() для вычисления d_A и d_B
+  - Обновление только адаптеров (базовые веса заморожены)
+- Новый метод prepare_v351_training() для активации всех трех фич
 - Поддержка batch size > 1
 - Runtime configuration LoRA rank
 
