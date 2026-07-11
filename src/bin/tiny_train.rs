@@ -50,12 +50,10 @@ fn greedy_generate(model: &TransformerModel, tokenizer: &mut Tokenizer, prompt: 
 }
 
 fn main() -> anyhow::Result<()> {
-    let model_path = "aria json/aria_checkpoint.json";
-    let tokenizer_path = "aria json/aria_tokenizer.json";
+    let model_path = "aria json/aria_checkpoint.gguf";
     let data_path = "data base/DataBase_roles.jsonl";
 
-    let mut tokenizer = Tokenizer::load(tokenizer_path)?;
-    let mut model = TransformerModel::load_checkpoint(model_path)?;
+    let (mut model, mut tokenizer) = TransformerModel::load_checkpoint(model_path)?;
 
     println!("Loading tiny subset...");
     let (mut seqs, mut masks) = load_tiny_subset(data_path, 50_000, &mut tokenizer)?;
@@ -116,6 +114,6 @@ fn main() -> anyhow::Result<()> {
     }
 
     println!("\nSaving checkpoint...");
-    model.save_checkpoint("aria json/aria_checkpoint_tiny.json")?;
+    model.save_checkpoint("aria json/aria_checkpoint_tiny.gguf", &tokenizer)?;
     Ok(())
 }

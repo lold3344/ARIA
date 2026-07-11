@@ -75,33 +75,25 @@ fn main() -> anyhow::Result<()> {
     let session_id = Uuid::new_v4().to_string();
     println!("Session ID: {}\n", session_id);
 
-    let checkpoint_path = "aria json/aria_checkpoint.json";
-    let tokenizer_path = "aria json/aria_tokenizer.json";
-
-    let checkpoint_exists = std::path::Path::new(checkpoint_path).exists();
-    let tokenizer_exists = std::path::Path::new(tokenizer_path).exists();
+    let checkpoint_path = "aria json/aria_checkpoint.gguf";
     let continue_train = std::env::var("ARIA_CONTINUE_TRAIN").is_ok();
 
-    let (mut model, mut tokenizer) = if checkpoint_exists && tokenizer_exists && !continue_train {
-        println!("Loading checkpoint and tokenizer...");
-        let t = Tokenizer::load(tokenizer_path)?;
-        let m = TransformerModel::load_checkpoint(checkpoint_path)?;
+    let (mut model, mut tokenizer) = if std::path::Path::new(checkpoint_path).exists() && !continue_train {
+        println!("Loading checkpoint...");
+        let (m, t) = TransformerModel::load_checkpoint(checkpoint_path)?;
         println!("Checkpoint loaded. Vocabulary: {}\n", t.vocab_size());
         (m, t)
-    } else if checkpoint_exists && tokenizer_exists && continue_train {
-        println!("Loading checkpoint and tokenizer for continued training...");
-        let mut t = Tokenizer::load(tokenizer_path)?;
-        let mut m = TransformerModel::load_checkpoint(checkpoint_path)?;
+    } else if std::path::Path::new(checkpoint_path).exists() && continue_train {
+        println!("Loading checkpoint for continued training...");
+        let (mut m, mut t) = TransformerModel::load_checkpoint(checkpoint_path)?;
         println!("Checkpoint loaded. Continuing training...\n");
-        crate::transformer_cuda::pretrain_from_files(&mut m, &mut t, data_dir, checkpoint_path, tokenizer_path).ok();
-        m.save_checkpoint(checkpoint_path).ok();
-        t.save(tokenizer_path).ok();
+        crate::transformer_cuda::pretrain_from_files(&mut m, &mut t, data_dir, checkpoint_path).ok();
+        m.save_checkpoint(checkpoint_path, &t).ok();
         (m, t)
     } else {
         let mut t = Tokenizer::new();
-        let m = train_fresh(&mut t, data_dir, checkpoint_path, tokenizer_path)?;
-        m.save_checkpoint(checkpoint_path).ok();
-        t.save(tokenizer_path).ok();
+        let m = train_fresh(&mut t, data_dir, checkpoint_path)?;
+        m.save_checkpoint(checkpoint_path, &t).ok();
         (m, t)
     };
 
@@ -288,7 +280,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn train_fresh(tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str, tokenizer_path: &str) -> anyhow::Result<TransformerModel> {
+fn train_fresh(tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str) -> anyhow::Result<TransformerModel> {
     use std::io::{BufRead, BufReader};
 
     // Limit vocab building to avoid OOM — full corpus not needed for BPE
@@ -338,7 +330,7 @@ fn train_fresh(tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str,
     let mut model = TransformerModel::new(actual_vocab, 896, 14, 20, 3584, 2048);
 
     println!("Pre-training...");
-    crate::transformer_cuda::pretrain_from_files(&mut model, tokenizer, data_dir, checkpoint_path, tokenizer_path).ok();
+    crate::transformer_cuda::pretrain_from_files(&mut model, tokenizer, data_dir, checkpoint_path).ok();
 
     println!("Training complete.\n");
     Ok(model)

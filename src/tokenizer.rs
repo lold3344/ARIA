@@ -602,6 +602,24 @@ impl Tokenizer {
 
     pub fn merges_hash(&self) -> u64 { self.merges_hash }
 
+    pub fn to_json_string(&self) -> String {
+        let id_to_word_str: HashMap<String, String> = self.id_to_token.iter()
+            .map(|(k, v)| (k.to_string(), v.clone())).collect();
+        let merges_list: Vec<[String; 2]> = self.merges.iter()
+            .map(|(a, b)| [a.clone(), b.clone()]).collect();
+        serde_json::to_string(&serde_json::json!({
+            "version":     "bpe_v3_roles",
+            "merges_hash": self.merges_hash,
+            "word_to_id":  self.token_to_id,
+            "id_to_word":  id_to_word_str,
+            "merges":      merges_list,
+        })).unwrap_or_default()
+    }
+
+    pub fn from_json_string(s: &str) -> anyhow::Result<Self> {
+        Self::load_from_value(serde_json::from_str(s)?)
+    }
+
     pub fn save(&self, path: &str) -> anyhow::Result<()> {
         let id_to_word_str: HashMap<String, String> = self.id_to_token.iter()
             .map(|(k, v)| (k.to_string(), v.clone())).collect();
@@ -619,8 +637,10 @@ impl Tokenizer {
     }
 
     pub fn load(path: &str) -> anyhow::Result<Self> {
-        let data: serde_json::Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+        Self::load_from_value(serde_json::from_str(&fs::read_to_string(path)?)?)
+    }
 
+    fn load_from_value(data: serde_json::Value) -> anyhow::Result<Self> {
         // Version guard — refuse to load old tokenizers
         let ver = data["version"].as_str().unwrap_or("");
         if ver != "bpe_v3_roles" {

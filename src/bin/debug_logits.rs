@@ -1,14 +1,11 @@
 #![recursion_limit = "256"]
 
 use aria::transformer_cuda::TransformerModel;
-use aria::tokenizer::Tokenizer;
 
 fn main() -> anyhow::Result<()> {
-    let model_path = "aria json/aria_checkpoint.json";
-    let tokenizer_path = "aria json/aria_tokenizer.json";
+    let model_path = "aria json/aria_checkpoint.gguf";
 
-    let mut tokenizer = Tokenizer::load(tokenizer_path)?;
-    let model = TransformerModel::load_checkpoint(model_path)?;
+    let (model, tokenizer) = TransformerModel::load_checkpoint(model_path)?;
 
     let prompt = "привет";
     let ids = tokenizer.encode_prompt(prompt);

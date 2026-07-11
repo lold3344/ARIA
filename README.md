@@ -3,11 +3,11 @@
 > **Legal notice:** I have nothing to do with anyone who uses this tool for illegal purposes. If you train my AI model and use it for hacking, criminal activity, or any other unlawful actions, that is entirely your own responsibility and problem.
 
 
-# ARIA Atom 3.5.1
+# ARIA Atom 3.5.2
 
 ![LOGO](screenshots/ARIA-Logo.png)
 
-**ARIA Atom 3.5.1** — локальная языковая модель на основе GPT-style Transformer с обучением на диалоговых данных, написанная на Rust. Вычисления выполняются на NVIDIA GPU через CUDA/cuBLAS с кастомными PTX ядрами. Версия 3.5+ добавляет **LoRA (Low-Rank Adaptation)** для эффективного обучения на ограниченной VRAM.
+**ARIA Atom 3.5.2** — локальная языковая модель на основе GPT-style Transformer с обучением на диалоговых данных, написанная на Rust. Вычисления выполняются на NVIDIA GPU через CUDA/cuBLAS с кастомными PTX ядрами. Версия 3.5.2 переходит на **GGUF** как единственный формат хранения — модель, токенизатор и состояние оптимизатора в одном файле.
 
 > **Важно:** ARIA поддерживает только видеокарты NVIDIA. Работа на AMD, Intel и других GPU не гарантируется.
 
@@ -16,35 +16,28 @@
 | 3.2.0 | Wotan | LSTM (1 слой) | ~44.5M | 6GB | Архив |
 | 3.3.0 | Atom | Transformer (12 слоёв) | ~124M | 8GB | Архив |
 | 3.4.0 | Atom | Transformer + warmup/clip | ~40M | 4GB | Архив |
-| **3.5.0** | **Efkolos** (стандартная) | **Transformer + LoRA** | **250M** | **~4GB** | Stable |
-| **3.5.1** | **Efkolos** (улучшенная) | **Transformer + LoRA + INT4** | **250M** | **~3GB** | В разработке |
+| 3.5.0 | Efkolos (стандартная) | Transformer + LoRA | 250M | ~4GB | Архив |
+| 3.5.1 | Efkolos (улучшенная) | Transformer + LoRA + INT4 | 250M | ~3GB | Архив |
+| **3.5.2** | **Efkolos** | **Transformer + GGUF + Q4_0** | **250M** | **~3GB** | **Stable** |
 | 3.5.0 | Varys (тяжелая) | Transformer + LoRA | 1B | ~8GB | Планируется |
 
-## Что нового в 3.5.0–3.5.1
+## Что нового в 3.5.2
 
-### v3.5.0 (Stable)
-- **LoRA (Low-Rank Adaptation)** — обучение только адаптеров (~1% параметров) вместо полного набора весов
-- Forward pass с LoRA для всех слоев (QKV, output, FFN)
-- Adapter initialization (Kaiming для A, zero для B)
-- Base weight freezing при обучении
+### v3.5.2 (Stable)
+- **GGUF как единственный формат** — модель, токенизатор и Adam моменты в одном `.gguf` файле
+- **Q4_0 квантизация** — экспорт инференс-модели в 4-bit (файл в ~2× меньше чекпоинта)
+- Потоковая генерация кэша последовательностей — RAM не зависит от размера датасета
+- Удалены форматы JSON и бинарный ARIA v2 — только GGUF
+- `export_gguf` бинарь для конвертации чекпоинта в Q4_0 инференс-файл
+
+### v3.5.1
+- INT4 quantization базовой модели
+- Gradient checkpointing
+- LoRA Backward Pass
+
+### v3.5.0
+- LoRA (Low-Rank Adaptation)
 - 250M параметров, контекст 2048 токенов
-
-### v3.5.1 (In Development)
-- **INT4 quantization** базовой модели для снижения VRAM (целевой: ~3GB вместо 4GB)
-  - Функции quantize_f16_to_int4() / dequantize_int4_to_f16()
-  - Дежатие на лету перед операциями GEMM
-  - Сокращение памяти для весов базовой модели на 75%
-- **Gradient checkpointing** для сжатия активаций (30-50% экономия памяти)
-  - Флаг gradient_checkpointing в модели
-  - Пропуск сохранения промежуточных активаций
-  - Пересчет активаций во время backward pass
-- **LoRA Backward Pass** — полный backward с вычислением градиентов адаптеров
-  - Метод enable_lora_backward() для активации
-  - compute_lora_gradients() для вычисления d_A и d_B
-  - Обновление только адаптеров (базовые веса заморожены)
-- Новый метод prepare_v351_training() для активации всех трех фич
-- Поддержка batch size > 1
-- Runtime configuration LoRA rank
 
 ## Архитектура (3.5.0 Efkolos)
 
@@ -245,10 +238,11 @@ $env:ARIA_EPOCHS="5"
 
 | Файл | Описание |
 |---|---|
-| `aria json/aria_checkpoint.bin` | Веса модели, конфигурация и состояние оптимизатора (бинарный формат) |
-| `aria json/aria_tokenizer.json` | Словарь токенизатора (BPE, 32K) |
+| `aria json/aria_checkpoint.gguf` | Веса модели + токенизатор + Adam моменты (GGUF формат) |
+| `aria json/aria_inference.gguf` | Q4_0 инференс-модель без Adam моментов (создаётся через `export_gguf`) |
 | `aria json/aria_dialogs.json` | Зашифрованная история диалогов |
 | `data base/sequences_cache_transformer_v*.bin` | Кеш токенизированных последовательностей |
+| `data base/sequences_cache_transformer_v*.bin.idx` | Индекс кэша для потокового чтения |
 | `logs/validation_log.txt` | Отчёт после `test_suite` |
 
 ## Возможные проблемы
@@ -260,7 +254,12 @@ $env:ARIA_EPOCHS="5"
 Убедись, что установлен драйвер NVIDIA и CUDA Toolkit 12.x. CUDA должна быть доступна через `nvcc`.
 
 **Несовместимый чекпоинт**
-Чекпоинты версии 3.2.0 (LSTM, формат `checkpoint_v1`) несовместимы с 3.3.0/3.4.0 (Transformer, формат `transformer_v1`). Удали старый `aria_checkpoint.json` и запусти `train_fresh.exe`. Чекпоинты 3.3.0 совместимы с 3.4.0 — обновление касается только тренировочного цикла.
+3.5.2 использует только GGUF. Старые `.json` и бинарные ARIA чекпоинты не поддерживаются — удали `aria json/aria_checkpoint.json` и запусти `train_fresh.exe` заново.
+
+**Экспорт инференс-модели**
+```powershell
+.\target\release\export_gguf.exe "aria json/aria_checkpoint.gguf" "aria json/aria_inference.gguf"
+```
 
 **Медленное обучение**
 Используй только `cargo build --release` и запускай `.exe` напрямую. Debug-сборка в 10-20 раз медленнее.

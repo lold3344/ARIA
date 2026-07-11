@@ -1,15 +1,12 @@
 #![recursion_limit = "256"]
 
 use aria::transformer_cuda::TransformerModel;
-use aria::tokenizer::Tokenizer;
 use std::time::Instant;
 
 fn main() -> anyhow::Result<()> {
-    let model_path = "aria json/aria_checkpoint.json";
-    let tokenizer_path = "aria json/aria_tokenizer.json";
+    let model_path = "aria json/aria_checkpoint.gguf";
 
-    let tokenizer = Tokenizer::load(tokenizer_path)?;
-    let mut model = TransformerModel::load_checkpoint(model_path)?;
+    let (mut model, tokenizer) = TransformerModel::load_checkpoint(model_path)?;
     model.free_training_buffers();
 
     let cases = [

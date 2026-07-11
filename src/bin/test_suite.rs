@@ -26,20 +26,17 @@ fn run_case(model: &TransformerModel, tokenizer: &mut Tokenizer, name: &str, pro
 }
 
 fn main() -> anyhow::Result<()> {
-    let model_path = "aria json/aria_checkpoint.json";
-    let tokenizer_path = "aria json/aria_tokenizer.json";
+    let model_path = "aria json/aria_checkpoint.gguf";
 
-    println!("Loading tokenizer...");
-    let mut tokenizer = Tokenizer::load(tokenizer_path)?;
     println!("Loading checkpoint...");
-    let model = TransformerModel::load_checkpoint(model_path)?;
+    let (model, mut tokenizer) = TransformerModel::load_checkpoint(model_path)?;
     println!("Ready. vocab={}\n", tokenizer.vocab_size());
 
     fs::create_dir_all("logs")?;
 
     let mut log = String::new();
-    log.push_str(&format!("ARIA validation snapshot\nmodel: {}\ntokenizer: {}\nvocab: {}\n\n",
-        model_path, tokenizer_path, tokenizer.vocab_size()));
+    log.push_str(&format!("ARIA validation snapshot\nmodel: {}\nvocab: {}\n\n",
+        model_path, tokenizer.vocab_size()));
 
     let cases = vec![
         ("math_1", "сколько будет 1 плюс 1"),

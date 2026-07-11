@@ -1,7 +1,6 @@
 #![recursion_limit = "256"]
 
 use aria::transformer_cuda::TransformerModel;
-use aria::tokenizer::Tokenizer;
 use std::env;
 use std::time::Instant;
 
@@ -9,15 +8,11 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().collect();
     let prompt = args.get(1).cloned().unwrap_or_else(|| "привет".to_string());
 
-    let model_path = "aria json/aria_checkpoint.json";
-    let tokenizer_path = "aria json/aria_tokenizer.json";
-
-    println!("Loading tokenizer from {}...", tokenizer_path);
-    let tokenizer = Tokenizer::load(tokenizer_path)?;
-    let vocab = tokenizer.vocab_size();
+    let model_path = "aria json/aria_checkpoint.gguf";
 
     println!("Loading checkpoint from {}...", model_path);
-    let mut model = TransformerModel::load_checkpoint(model_path)?;
+    let (mut model, tokenizer) = TransformerModel::load_checkpoint(model_path)?;
+    let vocab = tokenizer.vocab_size();
     model.free_training_buffers();
     println!("Model ready (inference mode). vocab={}", vocab);
 

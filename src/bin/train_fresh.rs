@@ -66,7 +66,7 @@ fn feed_tokenizer(data_dir: &str, tokenizer: &mut Tokenizer, max_lines: usize) -
 
 fn main() -> anyhow::Result<()> {
     let data_dir = "data base";
-    let checkpoint_path = "aria json/aria_checkpoint.json";
+    let checkpoint_path = "aria json/aria_checkpoint.gguf";
     let tokenizer_path = "aria json/aria_tokenizer.json";
 
     // Transformer hyperparams (250M params, ARIA Medium)
@@ -98,11 +98,10 @@ fn main() -> anyhow::Result<()> {
     let mut model = TransformerModel::new(vocab_size, d_model, num_heads, num_layers, ffn_dim, max_seq);
 
     println!("Starting supervised dialog training...");
-    aria::transformer_cuda::pretrain_from_files(&mut model, &mut tokenizer, data_dir, checkpoint_path, tokenizer_path)?;
+    aria::transformer_cuda::pretrain_from_files(&mut model, &mut tokenizer, data_dir, checkpoint_path)?;
 
     println!("\nSaving final checkpoint...");
-    model.save_checkpoint(checkpoint_path)?;
-    tokenizer.save(tokenizer_path)?;
+    model.save_checkpoint(checkpoint_path, &tokenizer)?;
 
     println!("Done.");
     Ok(())
