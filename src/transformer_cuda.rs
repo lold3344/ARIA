@@ -2847,36 +2847,36 @@ pub fn pretrain_from_files(
 
     println!("LR: {lr}  Epochs: {epochs}  Batch: {batch_size}  SeqLen: {max_len}  MaxSeqs: {max_seqs}  Warmup: {warmup_steps}");
 
-    // Load or build sequence cache
+    // Load or build sequence cache + index
     let cache_path = format!("{}/sequences_cache_transformer_v{}_len{}.bin",
                              data_dir, tokenizer.vocab_size(), max_len);
-    let sequences: Vec<(Vec<usize>, Vec<f32>)> = if std::path::Path::new(&cache_path).exists() {
-        println!("Loading sequence cache from {}...", cache_path);
-        load_seq_cache(&cache_path)?
-    } else {
+    let index_path = format!("{}.idx", cache_path);
+
+    // Build cache+index if missing
+    if !std::path::Path::new(&cache_path).exists() {
         println!("Building sequence cache...");
         let seqs = build_seq_cache(tokenizer, data_dir, max_len, min_len, max_seqs)?;
         save_seq_cache(&cache_path, &seqs)?;
-        seqs
-    };
+    }
+    if !std::path::Path::new(&index_path).exists() {
+        println!("Building sequence index...");
+        build_seq_index(&cache_path, &index_path)?;
+    }
 
-    let n = sequences.len().min(max_seqs);
-    let seqs = &sequences[..n];
-    println!("Sequences: {}", n);
+    // Load only the index (u64 per seq) — tiny RAM footprint
+    let offsets = load_seq_index(&index_path)?;
+    let n = offsets.len().min(max_seqs);
+    println!("Sequences: {} (streaming from disk)", n);
 
     let mut rng = rand::thread_rng();
     let n_batches = (n + batch_size - 1) / batch_size;
 
-    // Length bucketing: group similar-length sequences so batches need minimal
-    // padding. The within-batch max length sets GPU work for the whole batch,
-    // so mixing a 20-token line with a 256-token one wastes ~12x compute.
-    // We sort by length once, then shuffle BATCH ORDER each epoch (not the
-    // global order) to keep training stochastic without re-introducing padding.
+    // Sort by stored seq length for bucketing; lengths come free from index
+    let seq_lens = load_seq_lengths(&index_path)?;
     let mut len_sorted: Vec<usize> = (0..n).collect();
-    len_sorted.sort_by_key(|&i| seqs[i].0.len());
+    len_sorted.sort_by_key(|&i| seq_lens[i]);
 
     for epoch in 0..epochs {
-        // shuffle the order in which length-buckets are visited
         let mut batch_order: Vec<usize> = (0..n_batches).collect();
         batch_order.shuffle(&mut rng);
 
@@ -2884,13 +2884,22 @@ pub fn pretrain_from_files(
         let mut epoch_batches = 0usize;
         let t0 = Instant::now();
 
+        let mut cache_file = std::io::BufReader::new(fs::File::open(&cache_path)?);
+
         for (step, &batch_idx) in batch_order.iter().enumerate() {
             let start = batch_idx * batch_size;
             let end   = (start + batch_size).min(n);
-            let batch: Vec<usize> = len_sorted[start..end].to_vec();
+            let batch_indices: Vec<usize> = len_sorted[start..end].to_vec();
 
-            let batch_seqs: Vec<Vec<usize>> = batch.iter().map(|&i| seqs[i].0.clone()).collect();
-            let batch_masks: Vec<Vec<f32>>  = batch.iter().map(|&i| seqs[i].1.clone()).collect();
+            let mut batch_seqs: Vec<Vec<usize>> = Vec::with_capacity(batch_indices.len());
+            let mut batch_masks: Vec<Vec<f32>>  = Vec::with_capacity(batch_indices.len());
+            for &i in &batch_indices {
+                let (ids, mask) = read_seq_at(&mut cache_file, offsets[i])?;
+                batch_seqs.push(ids);
+                batch_masks.push(mask);
+            }
+            let batch_seqs  = batch_seqs;
+            let batch_masks = batch_masks;
 
             // Linear warmup → cosine decay to 0.3 × lr
             let total_steps = epochs * n_batches;
@@ -3039,4 +3048,84 @@ fn load_seq_cache(path: &str) -> anyhow::Result<Vec<(Vec<usize>, Vec<f32>)>> {
         seqs.push((ids, mask));
     }
     Ok(seqs)
+}
+
+// Index format: u64 count, then per seq: u64 byte_offset, u32 seq_len
+fn build_seq_index(cache_path: &str, index_path: &str) -> anyhow::Result<()> {
+    use std::io::{Read, Write, Seek, SeekFrom};
+    let mut f = std::io::BufReader::new(fs::File::open(cache_path)?);
+    let mut idx = std::io::BufWriter::new(fs::File::create(index_path)?);
+
+    let mut buf8 = [0u8; 8];
+    f.read_exact(&mut buf8)?;
+    let n = u64::from_le_bytes(buf8) as usize;
+
+    // placeholder for count
+    idx.write_all(&(n as u64).to_le_bytes())?;
+
+    let mut buf4 = [0u8; 4];
+    for _ in 0..n {
+        let offset = f.seek(SeekFrom::Current(0))?;
+        idx.write_all(&offset.to_le_bytes())?;
+
+        f.read_exact(&mut buf4)?;
+        let len = u32::from_le_bytes(buf4) as usize;
+        idx.write_all(&(len as u32).to_le_bytes())?;
+
+        // skip ids + mask (len * 4 bytes each)
+        let skip = (len * 4 * 2) as i64;
+        f.seek(SeekFrom::Current(skip))?;
+    }
+    Ok(())
+}
+
+fn load_seq_index(index_path: &str) -> anyhow::Result<Vec<u64>> {
+    use std::io::Read;
+    let mut f = std::io::BufReader::new(fs::File::open(index_path)?);
+    let mut buf8 = [0u8; 8];
+    f.read_exact(&mut buf8)?;
+    let n = u64::from_le_bytes(buf8) as usize;
+    let mut offsets = Vec::with_capacity(n);
+    let mut buf4 = [0u8; 4];
+    for _ in 0..n {
+        f.read_exact(&mut buf8)?;
+        offsets.push(u64::from_le_bytes(buf8));
+        f.read_exact(&mut buf4)?; // skip len
+    }
+    Ok(offsets)
+}
+
+fn load_seq_lengths(index_path: &str) -> anyhow::Result<Vec<usize>> {
+    use std::io::Read;
+    let mut f = std::io::BufReader::new(fs::File::open(index_path)?);
+    let mut buf8 = [0u8; 8];
+    f.read_exact(&mut buf8)?;
+    let n = u64::from_le_bytes(buf8) as usize;
+    let mut lens = Vec::with_capacity(n);
+    let mut buf4 = [0u8; 4];
+    for _ in 0..n {
+        f.read_exact(&mut buf8)?; // skip offset
+        f.read_exact(&mut buf4)?;
+        lens.push(u32::from_le_bytes(buf4) as usize);
+    }
+    Ok(lens)
+}
+
+fn read_seq_at(f: &mut std::io::BufReader<fs::File>, offset: u64) -> anyhow::Result<(Vec<usize>, Vec<f32>)> {
+    use std::io::{Read, Seek, SeekFrom};
+    f.seek(SeekFrom::Start(offset))?;
+    let mut buf4 = [0u8; 4];
+    f.read_exact(&mut buf4)?;
+    let len = u32::from_le_bytes(buf4) as usize;
+    let mut ids = Vec::with_capacity(len);
+    let mut mask = Vec::with_capacity(len);
+    for _ in 0..len {
+        f.read_exact(&mut buf4)?;
+        ids.push(u32::from_le_bytes(buf4) as usize);
+    }
+    for _ in 0..len {
+        f.read_exact(&mut buf4)?;
+        mask.push(f32::from_bits(u32::from_le_bytes(buf4)));
+    }
+    Ok((ids, mask))
 }
