@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::fs;
 use std::io::Write;
 use std::time::Instant;
+use memmap2::Mmap;
 
 use cudarc::driver::{CudaStream, CudaSlice, CudaModule, LaunchConfig, PushKernelArg, CudaGraph};
 use cudarc::nvrtc::Ptx;
@@ -109,7 +110,7 @@ const MAX_TOKENS_PER_SEQ:  usize = 256;
 const MIN_TOKENS_PER_SEQ:  usize = 6;
 const PRETRAIN_EPOCHS:     usize = 5;
 const PRETRAIN_BATCH_SIZE: usize = 64;
-const MAX_SEQS_PER_EPOCH:  usize = 500_000;
+const MAX_SEQS_PER_EPOCH:  usize = 25_000_000;
 const MICRO_BATCH_N:       usize = 1; // sequences processed simultaneously (batch=1 for RTX 4060)
 
 const KERNEL_NAMES: &[&str] = &[
@@ -3097,49 +3098,43 @@ pub fn pretrain_from_files(
         build_seq_cache_streaming(tokenizer, data_dir, &cache_path, &index_path, max_len, min_len, max_seqs)?;
     }
 
-    // Load only the index (u64 per seq) — tiny RAM footprint
     let offsets = load_seq_index(&index_path)?;
     let n = offsets.len().min(max_seqs);
-    println!("Sequences: {} (streaming from disk)", n);
+    println!("Sequences: {}", n);
 
     let mut rng = rand::thread_rng();
     let n_batches = (n + batch_size - 1) / batch_size;
 
-    // Sort by stored seq length for bucketing; lengths come free from index
-    let seq_lens = load_seq_lengths(&index_path)?;
-    let mut len_sorted: Vec<usize> = (0..n).collect();
-    len_sorted.sort_by_key(|&i| seq_lens[i]);
+    // Pre-sort all offsets once for near-sequential disk access each epoch.
+    // This array only stores indices sorted by file offset — O(n log n) once.
+    let mut seq_by_offset: Vec<usize> = (0..n).collect();
+    seq_by_offset.sort_by_key(|&i| offsets[i]);
 
     for epoch in 0..epochs {
-        // shuffle the len_sorted order each epoch for stochasticity,
-        // but keep batches contiguous so reads are sequential (fast disk I/O)
-        let mut epoch_order = len_sorted.clone();
-        epoch_order.shuffle(&mut rng);
-
         let mut epoch_loss = 0.0f32;
         let mut epoch_batches = 0usize;
         let t0 = Instant::now();
 
-        // sort offsets for sequential disk reads within each batch
-        let mut cache_file = std::io::BufReader::with_capacity(16 * 1024 * 1024,
-            fs::File::open(&cache_path)?);
+        // Shuffle within windows of `window` sequences so the order varies each
+        // epoch but disk reads remain clustered (forward-only within each window).
+        let window = (batch_size * 512).max(32768);
+        let mut order = seq_by_offset.clone();
+        for chunk in order.chunks_mut(window) {
+            chunk.shuffle(&mut rng);
+        }
 
-        for (step, chunk) in epoch_order.chunks(batch_size).enumerate() {
-            // sort chunk by offset for sequential disk reads
-            let mut sorted_chunk = chunk.to_vec();
-            sorted_chunk.sort_by_key(|&i| offsets[i]);
+        let cache_mmap = unsafe { Mmap::map(&fs::File::open(&cache_path)?)? };
 
-            let mut batch_seqs: Vec<Vec<usize>> = Vec::with_capacity(sorted_chunk.len());
-            let mut batch_masks: Vec<Vec<f32>>  = Vec::with_capacity(sorted_chunk.len());
-            for &i in &sorted_chunk {
-                let (ids, mask) = read_seq_at(&mut cache_file, offsets[i])?;
+        for (step, batch_indices) in order.chunks(batch_size).enumerate() {
+            let mut batch_seqs:  Vec<Vec<usize>> = Vec::with_capacity(batch_indices.len());
+            let mut batch_masks: Vec<Vec<f32>>   = Vec::with_capacity(batch_indices.len());
+            for &i in batch_indices {
+                let (ids, mask) = read_seq_mmap(&cache_mmap, offsets[i]);
                 batch_seqs.push(ids);
                 batch_masks.push(mask);
             }
-            let batch_seqs  = batch_seqs;
-            let batch_masks = batch_masks;
+            if batch_seqs.is_empty() { continue; }
 
-            // Linear warmup → cosine decay to 0.3 × lr
             let total_steps = epochs * n_batches;
             let current_step = epoch * n_batches + step;
             let step_lr = if current_step < warmup_steps {
@@ -3158,8 +3153,7 @@ pub fn pretrain_from_files(
             if step % 10 == 0 {
                 let remaining = n_batches.saturating_sub(step + 1);
                 let elapsed = t0.elapsed().as_secs_f32();
-                let seqs_done = (step + 1) * batch_size;
-                let seq_per_s = seqs_done as f32 / elapsed.max(0.001);
+                let seq_per_s = ((step + 1) * batch_size) as f32 / elapsed.max(0.001);
                 print!("\r  Epoch {}/{}  |  batch {}/{}  ({} remaining)  |  loss={:.4}  |  {:.0} seq/s  |  lr={:.6}       ",
                     epoch+1, epochs, step+1, n_batches, remaining,
                     epoch_loss / epoch_batches as f32, seq_per_s, step_lr);
@@ -3402,4 +3396,20 @@ fn read_seq_at(f: &mut std::io::BufReader<fs::File>, offset: u64) -> anyhow::Res
         mask.push(f32::from_bits(u32::from_le_bytes(buf4)));
     }
     Ok((ids, mask))
+}
+
+fn read_seq_mmap(data: &[u8], offset: u64) -> (Vec<usize>, Vec<f32>) {
+    let off = offset as usize;
+    let len = u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as usize;
+    let ids_start = off + 4;
+    let mask_start = ids_start + len * 4;
+    let ids: Vec<usize> = data[ids_start..ids_start + len*4]
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes([b[0],b[1],b[2],b[3]]) as usize)
+        .collect();
+    let mask: Vec<f32> = data[mask_start..mask_start + len*4]
+        .chunks_exact(4)
+        .map(|b| f32::from_bits(u32::from_le_bytes([b[0],b[1],b[2],b[3]])))
+        .collect();
+    (ids, mask)
 }
