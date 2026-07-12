@@ -3111,23 +3111,27 @@ pub fn pretrain_from_files(
     len_sorted.sort_by_key(|&i| seq_lens[i]);
 
     for epoch in 0..epochs {
-        let mut batch_order: Vec<usize> = (0..n_batches).collect();
-        batch_order.shuffle(&mut rng);
+        // shuffle the len_sorted order each epoch for stochasticity,
+        // but keep batches contiguous so reads are sequential (fast disk I/O)
+        let mut epoch_order = len_sorted.clone();
+        epoch_order.shuffle(&mut rng);
 
         let mut epoch_loss = 0.0f32;
         let mut epoch_batches = 0usize;
         let t0 = Instant::now();
 
-        let mut cache_file = std::io::BufReader::new(fs::File::open(&cache_path)?);
+        // sort offsets for sequential disk reads within each batch
+        let mut cache_file = std::io::BufReader::with_capacity(16 * 1024 * 1024,
+            fs::File::open(&cache_path)?);
 
-        for (step, &batch_idx) in batch_order.iter().enumerate() {
-            let start = batch_idx * batch_size;
-            let end   = (start + batch_size).min(n);
-            let batch_indices: Vec<usize> = len_sorted[start..end].to_vec();
+        for (step, chunk) in epoch_order.chunks(batch_size).enumerate() {
+            // sort chunk by offset for sequential disk reads
+            let mut sorted_chunk = chunk.to_vec();
+            sorted_chunk.sort_by_key(|&i| offsets[i]);
 
-            let mut batch_seqs: Vec<Vec<usize>> = Vec::with_capacity(batch_indices.len());
-            let mut batch_masks: Vec<Vec<f32>>  = Vec::with_capacity(batch_indices.len());
-            for &i in &batch_indices {
+            let mut batch_seqs: Vec<Vec<usize>> = Vec::with_capacity(sorted_chunk.len());
+            let mut batch_masks: Vec<Vec<f32>>  = Vec::with_capacity(sorted_chunk.len());
+            for &i in &sorted_chunk {
                 let (ids, mask) = read_seq_at(&mut cache_file, offsets[i])?;
                 batch_seqs.push(ids);
                 batch_masks.push(mask);
@@ -3152,7 +3156,7 @@ pub fn pretrain_from_files(
             epoch_batches += 1;
 
             if step % 10 == 0 {
-                let remaining = n_batches - step - 1;
+                let remaining = n_batches.saturating_sub(step + 1);
                 let elapsed = t0.elapsed().as_secs_f32();
                 let seqs_done = (step + 1) * batch_size;
                 let seq_per_s = seqs_done as f32 / elapsed.max(0.001);

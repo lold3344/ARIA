@@ -520,14 +520,15 @@ impl Tokenizer {
         // trained; the final <END> is also trained so the model learns to stop.
         let mut mask = vec![0.0f32; tokens.len() - 1];
         if let Some(start) = assistant_token_start {
-            // To predict the first assistant content token, we train on the target position
-            // right after the ASSISTANT token (i.e. at index start - 1, whose target is
-            // tokens[start]). The final END target is also trained.
+            // dialog format: train only on assistant tokens
             let from = start.saturating_sub(1);
-            let to = tokens.len().saturating_sub(1); // exclusive
+            let to = tokens.len().saturating_sub(1);
             for t in from..to {
                 if t < mask.len() { mask[t] = 1.0f32; }
             }
+        } else {
+            // plain text: train on all tokens
+            for m in mask.iter_mut() { *m = 1.0f32; }
         }
         (tokens, mask)
     }
