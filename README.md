@@ -1,271 +1,214 @@
-# **This is a research tool. The author is not responsible for misuse, training data, or generated content.**
+﻿# **Research tool. The author is not responsible for misuse, training data, or generated content.**
 
-> **Legal notice:** I have nothing to do with anyone who uses this tool for illegal purposes. If you train my AI model and use it for hacking, criminal activity, or any other unlawful actions, that is entirely your own responsibility and problem.
-
+> **Legal notice:** I am not responsible for anyone who uses this tool for illegal purposes. If you train this model and use it for hacking, criminal activity, or any other unlawful actions, that is entirely your own responsibility.
 
 # ARIA Atom 3.5.2
 
 ![LOGO](screenshots/ARIA-Logo.png)
 
-**ARIA Atom 3.5.2** — локальная языковая модель на основе GPT-style Transformer с обучением на диалоговых данных, написанная на Rust. Вычисления выполняются на NVIDIA GPU через CUDA/cuBLAS с кастомными PTX ядрами. Версия 3.5.2 переходит на **GGUF** как единственный формат хранения — модель, токенизатор и состояние оптимизатора в одном файле.
+**ARIA Atom 3.5.2** is a GPT-style Transformer language model built entirely in Rust with CUDA/cuBLAS acceleration and custom PTX kernels. Version 3.5.2 introduces **GGUF** as the unified checkpoint format -- weights, tokenizer, and Adam optimizer state are stored in a single file.
 
-> **Важно:** ARIA поддерживает только видеокарты NVIDIA. Работа на AMD, Intel и других GPU не гарантируется.
+> **Note:** ARIA requires an NVIDIA GPU. AMD, Intel, and other GPUs are not supported.
 
-| Версия | Кодовое имя | Архитектура | Параметры | VRAM | Статус |
+| Version | Codename | Architecture | Parameters | VRAM | Status |
 |---|---|---|---|---|---|
-| 3.2.0 | Wotan | LSTM (1 слой) | ~44.5M | 6GB | Архив |
-| 3.3.0 | Atom | Transformer (12 слоёв) | ~124M | 8GB | Архив |
-| 3.4.0 | Atom | Transformer + warmup/clip | ~40M | 4GB | Архив |
-| 3.5.0 | Efkolos (стандартная) | Transformer + LoRA | 250M | ~4GB | Архив |
-| 3.5.1 | Efkolos (улучшенная) | Transformer + LoRA + INT4 | 250M | ~3GB | Архив |
+| 3.2.0 | Wotan | LSTM (1 layer) | ~44.5M | 6GB | Legacy |
+| 3.3.0 | Atom | Transformer (12 layers) | ~124M | 8GB | Legacy |
+| 3.4.0 | Atom | Transformer + warmup/clip | ~40M | 4GB | Legacy |
+| 3.5.0 | Efkolos (light) | Transformer + LoRA | 250M | ~4GB | Legacy |
+| 3.5.1 | Efkolos (optimized) | Transformer + LoRA + INT4 | 250M | ~3GB | Legacy |
 | **3.5.2** | **Efkolos** | **Transformer + GGUF + Q4_0** | **250M** | **~3GB** | **Stable** |
-| 3.5.0 | Varys (тяжелая) | Transformer + LoRA | 1B | ~8GB | Планируется |
+| 3.5.0 | Varys (heavy) | Transformer + LoRA | 1B | ~8GB | Experimental |
 
-## Что нового в 3.5.2
+## Changelog
 
 ### v3.5.2 (Stable)
-- **GGUF как единственный формат** — модель, токенизатор и Adam моменты в одном `.gguf` файле
-- **Q4_0 квантизация** — экспорт инференс-модели в 4-bit (файл в ~2× меньше чекпоинта)
-- Потоковая генерация кэша последовательностей — RAM не зависит от размера датасета
-- Удалены форматы JSON и бинарный ARIA v2 — только GGUF
-- `export_gguf` бинарь для конвертации чекпоинта в Q4_0 инференс-файл
+- **GGUF checkpoint format** -- weights, tokenizer, and Adam state in a single .gguf file
+- **Q4_0 quantization** -- export inference-only model at 4-bit (~2x smaller, ~2-5% quality loss)
+- Streaming sequence cache -- dataset no longer loaded fully into RAM
+- Removed JSON and ARIA v2 binary formats -- GGUF only
+- export_gguf binary for Q4_0 inference export
 
 ### v3.5.1
-- INT4 quantization базовой модели
+- INT4 quantization of base weights
 - Gradient checkpointing
-- LoRA Backward Pass
+- LoRA backward pass
 
 ### v3.5.0
 - LoRA (Low-Rank Adaptation)
-- 250M параметров, контекст 2048 токенов
+- 250M parameters, 2048-token context
 
-## Архитектура (3.5.0 Efkolos)
+## Architecture
 
-### Efkolos (250M параметров)
+### Efkolos (250M parameters)
 
-```
-Тип:           GPT-style decoder-only Transformer + LoRA
-Слои:          20
-d_model:       896
-Головы:        14  (head_dim = 64)
-FFN dim:       3584  (4 × d_model)
-Макс. контекст: 2048 токенов
-Словарь:       32 000 (BPE)
-Параметры:     250M (база) + 5M (LoRA адаптер)
-Точность:      FP16 (база) + FP16 (адаптер) + FP32 моменты Adam
-LoRA rank:     8
-```
+Type: GPT-style decoder-only Transformer + LoRA
+Layers: 20
+d_model: 896
+Heads: 14 (head_dim = 64)
+FFN dim: 3584 (4x d_model)
+Context: 2048 tokens
+Vocabulary: ~31,500 BPE tokens (Cyrillic-aware)
+Parameters: 250M base + 5M LoRA adapters
+Precision: FP16 weights + FP16 activations + FP32 Adam
+LoRA rank: 8
 
-#### VRAM (batch=1, seq=2048, текущая реализация)
+#### VRAM Usage (batch=1, seq=2048, gradient checkpointing)
 
-| Компонент | Размер |
+| Component | Size |
 |---|---|
-| Модель FP16 | 250 МБ |
-| LoRA адаптер | 60 МБ |
-| Adam моменты | 2000 МБ |
-| Активации | 1100 МБ |
-| Attention scores | 110 МБ |
-| Буферы | 100 МБ |
-| **Итого** | **~3620 МБ** |
+| Base weights FP16 | 250 MB |
+| LoRA adapters | 60 MB |
+| Adam optimizer | 2000 MB |
+| Activations | 1100 MB |
+| Attention scores | 110 MB |
+| Other | 100 MB |
+| **Total** | **~3620 MB** |
 
-Поместится в RTX 4060 (8GB) с буфером 4GB.
+Fits on RTX 4060 (8GB) with ~4GB headroom.
 
-### Varys (1B параметров) — *планируется*
+### Varys (1B parameters) -- Experimental
 
-```
-Тип:           GPT-style decoder-only Transformer + LoRA
-Параметры:     1B (база) + 10M (LoRA адаптер)
-Требуемый VRAM: ~8–10 ГБ (с INT4 + gradient checkpointing)
-Целевой GPU:   RTX 4080S (20GB)
-```
+Type: GPT-style decoder-only Transformer + LoRA
+Parameters: 1B base + 10M LoRA adapters
+Estimated VRAM: ~8-10 GB with INT4 + gradient checkpointing
+Target GPU: RTX 4080S (20GB)
 
-## Требования
+## Requirements
 
-### Обязательное ПО
-
-| Компонент | Версия | Скачать |
+| Dependency | Version | Link |
 |---|---|---|
 | Rust + Cargo | stable (2021 edition) | https://rustup.rs |
-| Visual Studio Build Tools | 2017 или новее | https://visualstudio.microsoft.com/visual-cpp-build-tools/ |
+| Visual Studio Build Tools | 2017 or later | https://visualstudio.microsoft.com/visual-cpp-build-tools/ |
 | NVIDIA CUDA Toolkit | 12.x | https://developer.nvidia.com/cuda-downloads |
-| Драйвер NVIDIA | актуальный | https://www.nvidia.com/drivers |
+| NVIDIA drivers | latest | https://www.nvidia.com/drivers |
 
-### Установка Build Tools (обязательно для Windows)
+### Visual Studio Build Tools (Windows required)
 
-1. Скачай **Build Tools for Visual Studio** по ссылке выше.
-2. В установщике выбери компонент **"Desktop development with C++"**.
-3. Установи (~3-5 ГБ).
-4. Перезапусти терминал.
+1. Download **Build Tools for Visual Studio**.
+2. Select **Desktop development with C++**.
+3. Install (~3-5 min).
+4. Restart your machine.
 
-> VS Code — это другой продукт и для компиляции **не подходит**.
+VS Code alone is **not enough** -- you need the Build Tools separately.
 
-## Запуск
+## Getting Started
 
-```bash
-# Клонировать репозиторий
 git clone https://github.com/USER/ARIA.git
 cd ARIA
-
-# Собрать (release)
 cargo build --release
-
-# Запустить чат
 .\target\release\aria.exe
-```
 
-При первом запуске ARIA автоматически:
-1. Создаёт папку `data base/` с пустыми файлами датасетов.
-2. Строит BPE-словарь (32 000 токенов) из диалоговых данных.
-3. Инициализирует Transformer модель (~124M параметров).
-4. Проводит предобучение на данных из `data base/`.
-5. Сохраняет чекпоинт в `aria json/aria_checkpoint.json` и токенизатор в `aria json/aria_tokenizer.json`.
+On first launch, ARIA will:
+1. Scan data base/ for training data
+2. Train a BPE tokenizer (~31,500 tokens)
+3. Initialize Transformer weights
+4. Train on the dataset
+5. Save checkpoint to aria json/aria_checkpoint.gguf
 
-При последующих запусках модель загружается из сохранённых файлов.
+### Train from scratch
 
-### Обучение с нуля
-
-```powershell
 .\target\release\train_fresh.exe
-```
 
-Строит словарь и обучает модель с нуля на файле `data base/DataBase_roles.jsonl`.
+Reads JSONL files from data base/. Saves GGUF checkpoint after each epoch.
 
-### Дообучение (SFT) от чекпоинта
+### Supervised Fine-Tuning (SFT)
 
-```powershell
 .\target\release\sft_train.exe
-```
 
-### Продолжение обучения через main
+### Continue training
 
-```powershell
-$env:ARIA_CONTINUE_TRAIN="1"
+Set-Item Env:ARIA_CONTINUE_TRAIN 1
 .\target\release\aria.exe
-```
 
-### Тестирование модели
+### Inference and Testing
 
-```powershell
-# Жадная генерация по набору промптов
 .\target\release\greedy_test.exe
-
-# Top-K и Top-P тесты с разными температурами
 .\target\release\sample_test.exe
-
-# Полный набор тестов с сохранением отчёта
 .\target\release\test_suite.exe
-
-# Инференс по одному промпту
-.\target\release\inference.exe "привет"
-
-# Отладка логитов
+.\target\release\inference.exe your prompt here
 .\target\release\debug_logits.exe
-```
 
-## Обучение
+### Export Q4_0 Inference Model
 
-### Что нужно для обучения
+.\target\release\export_gguf.exe aria json/aria_checkpoint.gguf aria json/aria_inference.gguf
 
-- Видеокарта **NVIDIA** (обязательно, вычисления идут через CUDA/cuBLAS).
-- VRAM: рекомендуется **8 ГБ** и более.
-- RAM: от **16 ГБ**.
-- Диалоговый датасет в формате JSONL в папке `data base/`.
+Produces a ~300MB inference-only file with no optimizer state.
 
-### Файлы датасетов
+## Dataset Format
 
-```
-data base/
-  DataBase_roles.jsonl   - основной диалоговый датасет (формат: {"text": "..."})
-  DataBase.txt           - дополнительные тексты (опционально)
-  Words.txt              - словарный запас (опционально)
-```
+Place JSONL files in data base/. Each line:
 
-Каждая строка `DataBase_roles.jsonl` — отдельный диалог в формате:
-```json
-{"text": "Пользователь: привет\nАссистент: привет, чем могу помочь?"}
-```
+{text: User: hello\nAssistant: hi, how can I help?}
 
-При обучении токенизатор автоматически вставляет ролевые токены `<USER>` / `<ASSISTANT>` и обучается только на токенах ассистента (маскирование потерь).
+Use USER / ASSISTANT tokens for dialog fine-tuning. The tokenizer is trained from scratch on your data.
 
-### Параметры обучения (переменные окружения)
+## Training Parameters
 
-| Переменная | Описание | Значение по умолчанию |
+| Variable | Description | Default |
 |---|---|---|
-| `ARIA_LR` | Learning rate (max после warmup) | 0.0003 |
-| `ARIA_WARMUP` | Шагов линейного прогрева LR | 1000 |
-| `ARIA_MAX_SEQS` | Максимум последовательностей на эпоху | 500 000 |
-| `ARIA_EPOCHS` | Количество эпох | 5 |
-| `ARIA_VOCAB_LINES` | Строк для построения словаря | 500 000 |
-| `ARIA_CONTINUE_TRAIN` | Продолжить предобучение | — |
+| ARIA_LR | Peak learning rate | 0.0003 |
+| ARIA_WARMUP | Warmup steps | 1000 |
+| ARIA_MAX_SEQS | Sequences per epoch | 500,000 |
+| ARIA_EPOCHS | Number of epochs | 5 |
+| ARIA_VOCAB_LINES | Lines for tokenizer training | 500,000 |
+| ARIA_CONTINUE_TRAIN | Resume from checkpoint | -- |
 
-Gradient clipping всегда включён (norm=1.0), это часть тренировочного цикла и не отключается.
+Gradient clipping is always enabled (norm=1.0).
 
-**LR schedule:** первые `ARIA_WARMUP` шагов lr растёт линейно от 0 до `ARIA_LR`. Затем cosine decay до 0.3 × `ARIA_LR` к концу обучения.
+LR schedule: linear warmup to ARIA_LR over ARIA_WARMUP steps, then cosine decay to 0.3x ARIA_LR.
 
-Пример — тестовый запуск на 100k последовательностей:
-
-```powershell
-$env:ARIA_MAX_SEQS="200000"
-$env:ARIA_EPOCHS="1"
+Quick run:
+Set-Item Env:ARIA_MAX_SEQS 200000
+Set-Item Env:ARIA_EPOCHS 1
 .\target\release\train_fresh.exe
-```
 
-Полное обучение:
+Full run (~6-7 hours on RTX 4060, ~450-550 seq/s):
+Set-Item Env:ARIA_MAX_SEQS 500000
+Set-Item Env:ARIA_EPOCHS 5
+.\target\release\train_fresh.exe
 
-```powershell
-$env:ARIA_MAX_SEQS="500000"
-$env:ARIA_EPOCHS="5"
-.\target\release\train_fresh.exe > train_transformer.log
-```
+## Interactive Commands
 
-Ожидаемое время: ~6–7 часов на эпоху на RTX 4060 (скорость ~450–550 seq/s).
-
-## Команды в диалоге
-
-| Команда | Описание |
+| Command | Description |
 |---|---|
-| `stats` | Показать статистику сессии |
-| `settings` | Показать текущие настройки генерации |
-| `mode greedy` | Жадная генерация (детерминированная) |
-| `mode topk` | Top-K сэмплинг (k=20, по умолчанию) |
-| `mode topp` | Nucleus (top-p) сэмплинг (p=0.9) |
-| `temp <0.1-2.0>` | Установить температуру генерации |
-| `topk <n>` | Установить значение K |
-| `topp <0.0-1.0>` | Установить значение P |
-| `exit` | Выйти |
+| stats | Print model statistics |
+| settings | Show current inference settings |
+| mode greedy | Greedy decoding |
+| mode topk | Top-K sampling (default k=20) |
+| mode topp | Nucleus sampling (default p=0.9) |
+| temp 0.1-2.0 | Set temperature |
+| topk n | Set K |
+| topp 0.0-1.0 | Set P |
+| exit | Quit |
 
-## Файлы, создаваемые при работе
+## Files
 
-| Файл | Описание |
+| Path | Description |
 |---|---|
-| `aria json/aria_checkpoint.gguf` | Веса модели + токенизатор + Adam моменты (GGUF формат) |
-| `aria json/aria_inference.gguf` | Q4_0 инференс-модель без Adam моментов (создаётся через `export_gguf`) |
-| `aria json/aria_dialogs.json` | Зашифрованная история диалогов |
-| `data base/sequences_cache_transformer_v*.bin` | Кеш токенизированных последовательностей |
-| `data base/sequences_cache_transformer_v*.bin.idx` | Индекс кэша для потокового чтения |
-| `logs/validation_log.txt` | Отчёт после `test_suite` |
+| aria json/aria_checkpoint.gguf | Full checkpoint (weights + tokenizer + Adam state) |
+| aria json/aria_inference.gguf | Q4_0 inference model (created by export_gguf) |
+| aria json/aria_dialogs.json | Saved dialog history |
+| data base/sequences_cache_*.bin | Tokenized sequence cache |
+| data base/sequences_cache_*.bin.idx | Cache index |
+| logs/validation_log.txt | Output from test_suite |
 
-## Возможные проблемы
+## Troubleshooting
 
-**`error: linker link.exe not found`**
-Установи Visual Studio Build Tools с компонентом C++ (см. раздел выше).
+**error: linker link.exe not found**
+Install Visual Studio Build Tools with the C++ workload.
 
-**Модель не видит GPU**
-Убедись, что установлен драйвер NVIDIA и CUDA Toolkit 12.x. CUDA должна быть доступна через `nvcc`.
+**GPU not detected**
+Check NVIDIA drivers and CUDA Toolkit 12.x are installed. nvcc must be on your PATH.
 
-**Несовместимый чекпоинт**
-3.5.2 использует только GGUF. Старые `.json` и бинарные ARIA чекпоинты не поддерживаются — удали `aria json/aria_checkpoint.json` и запусти `train_fresh.exe` заново.
+**Old checkpoints do not load**
+3.5.2 uses GGUF only. JSON and ARIA v2 binary checkpoints are not supported -- retrain with train_fresh.exe.
 
-**Экспорт инференс-модели**
-```powershell
-.\target\release\export_gguf.exe "aria json/aria_checkpoint.gguf" "aria json/aria_inference.gguf"
-```
+**Out of memory**
+Lower ARIA_MAX_SEQS. Always use cargo build --release -- debug builds are 10-20x slower.
 
-**Медленное обучение**
-Используй только `cargo build --release` и запускай `.exe` напрямую. Debug-сборка в 10-20 раз медленнее.
-
-**Низкое качество генерации**
-1. Проверь чистоту и формат данных в `data base/`.
-2. Убедись, что диалоги имеют структуру `Пользователь: ...\nАссистент: ...`.
-3. Проверь `logs/validation_log.txt` после `test_suite`.
-4. Увеличь количество эпох или объём данных.
+**Bad output quality**
+1. Check dataset format and size.
+2. Verify dialog lines follow User: ...\nAssistant: ...
+3. Run test_suite and check logs/validation_log.txt.
+4. Try more epochs or a lower learning rate.
