@@ -74,7 +74,7 @@ fn main() -> anyhow::Result<()> {
     let num_heads  = 14;
     let num_layers = 20;
     let ffn_dim    = 3584;
-    let max_seq    = 2048;
+    let max_seq    = 512; // training uses 256; 512 leaves headroom while saving VRAM
 
     let vocab_lines: usize = std::env::var("ARIA_VOCAB_LINES")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(2_000_000);
