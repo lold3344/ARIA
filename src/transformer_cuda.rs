@@ -3110,6 +3110,9 @@ pub fn pretrain_from_files(
     let mut seq_by_offset: Vec<usize> = (0..n).collect();
     seq_by_offset.sort_by_key(|&i| offsets[i]);
 
+    let mut global_batches = 0usize;
+    const CHECKPOINT_EVERY_BATCHES: usize = 50_000;
+
     for epoch in 0..epochs {
         let mut epoch_loss = 0.0f32;
         let mut epoch_batches = 0usize;
@@ -3149,6 +3152,13 @@ pub fn pretrain_from_files(
             let loss = model.train_batch_masked(&batch_seqs, &batch_masks, step_lr);
             epoch_loss += loss;
             epoch_batches += 1;
+            global_batches += 1;
+
+            if global_batches % CHECKPOINT_EVERY_BATCHES == 0 {
+                let periodic_path = format!("{}.{}_batches.gguf", checkpoint_path, global_batches);
+                println!("\n  Saving periodic checkpoint at {} batches -> {}", global_batches, periodic_path);
+                model.save_checkpoint(&periodic_path, tokenizer).ok();
+            }
 
             if step % 10 == 0 {
                 let remaining = n_batches.saturating_sub(step + 1);
