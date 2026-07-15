@@ -2,77 +2,72 @@
 
 > **Legal notice:** I am not responsible for anyone who uses this tool for illegal purposes. If you train this model and use it for hacking, criminal activity, or any other unlawful actions, that is entirely your own responsibility.
 
-# ARIA Atom 3.5.2
+# ARIA Atom 3.6.0
 
 ![LOGO](screenshots/ARIA-Logo.png)
 
-**ARIA Atom 3.5.2** is a GPT-style Transformer language model built entirely in Rust with CUDA/cuBLAS acceleration and custom PTX kernels. Version 3.5.2 introduces **GGUF** as the unified checkpoint format -- weights, tokenizer, and Adam optimizer state are stored in a single file.
+**ARIA Atom 3.6.0** is a GPT-style Transformer language model built entirely in Rust with CUDA/cuBLAS acceleration and custom PTX kernels. Checkpoints use the **GGUF** format -- weights, tokenizer, and Adam optimizer state are stored in a single file.
 
 > **Note:** ARIA requires an NVIDIA GPU. AMD, Intel, and other GPUs are not supported.
 
 | Version | Codename | Architecture | Parameters | VRAM | Status |
-|---|---|---|---|---|---|
+|---|---|---|---|---|---|---|
 | 3.2.0 | Wotan | LSTM (1 layer) | ~44.5M | 6GB | Legacy |
 | 3.3.0 | Atom | Transformer (12 layers) | ~124M | 8GB | Legacy |
 | 3.4.0 | Atom | Transformer + warmup/clip | ~40M | 4GB | Legacy |
 | 3.5.0 | Efkolos (light) | Transformer + LoRA | 250M | ~4GB | Legacy |
 | 3.5.1 | Efkolos (optimized) | Transformer + LoRA + INT4 | 250M | ~3GB | Legacy |
-| **3.5.2** | **Efkolos** | **Transformer + GGUF + Q4_0** | **250M** | **~3GB** | **Stable** |
-| 3.5.0 | Varys (heavy) | Transformer + LoRA | 1B | ~8GB | Experimental |
+| 3.5.2 | Efkolos | Transformer + GGUF + Q4_0 | 250M | ~3GB | Legacy |
+| **3.6.0** | **Efkolos** | **Transformer + code cleanup** | **~223M** | **~2.1GB** | **Stable** |
 
 ## Changelog
 
-### v3.5.2 (Stable)
+### v3.6.0
+- Removed dead code from `src/transformer_cuda.rs`:
+  - Unused v3.5.1 feature toggles (INT4 quantization, gradient checkpointing, LoRA backward)
+  - Unused CUDA kernels (flash attention, ASM kernels, SGD, FP16 Adam, KV-cache helpers)
+  - Removed `src/lstm_cuda.rs`
+- Training verified on RTX 4060:
+  - `MICRO_BATCH_N = 4`
+  - `PRETRAIN_BATCH_SIZE = 512`
+  - `max_seq_len = 512` (reduced from 2048)
+  - Speed: ~180 seq/s
+  - Stable loss decrease confirmed
+
+### v3.5.2
 - **GGUF checkpoint format** -- weights, tokenizer, and Adam state in a single .gguf file
 - **Q4_0 quantization** -- export inference-only model at 4-bit (~2x smaller, ~2-5% quality loss)
 - Streaming sequence cache -- dataset no longer loaded fully into RAM
 - Removed JSON and ARIA v2 binary formats -- GGUF only
 - export_gguf binary for Q4_0 inference export
 
-### v3.5.1
-- INT4 quantization of base weights
-- Gradient checkpointing
-- LoRA backward pass
-
-### v3.5.0
-- LoRA (Low-Rank Adaptation)
-- 250M parameters, 2048-token context
-
 ## Architecture
 
-### Efkolos (250M parameters)
+### Efkolos (223M parameters)
 
-Type: GPT-style decoder-only Transformer + LoRA
+Type: GPT-style decoder-only Transformer
 Layers: 20
 d_model: 896
 Heads: 14 (head_dim = 64)
 FFN dim: 3584 (4x d_model)
-Context: 2048 tokens
+Context: 2048 tokens (training uses `max_seq_len = 512` for VRAM efficiency)
 Vocabulary: ~31,500 BPE tokens (Cyrillic-aware)
-Parameters: 250M base + 5M LoRA adapters
-Precision: FP16 weights + FP16 activations + FP32 Adam
-LoRA rank: 8
+Parameters: ~223M base
+Precision: FP16 weights + FP16 activations + FP32 Adam state
+Optimizer: Adam (beta1=0.9, beta2=0.999, eps=1e-8)
 
-#### VRAM Usage (batch=1, seq=2048, gradient checkpointing)
+#### VRAM Usage (RTX 4060, training)
 
 | Component | Size |
 |---|---|
-| Base weights FP16 | 250 MB |
-| LoRA adapters | 60 MB |
-| Adam optimizer | 2000 MB |
-| Activations | 1100 MB |
-| Attention scores | 110 MB |
-| Other | 100 MB |
-| **Total** | **~3620 MB** |
+| Base weights FP16 | ~450 MB |
+| Adam optimizer (f32) | ~900 MB |
+| Activations / grads | ~600 MB |
+| Attention scores | ~200 MB |
+| Other | ~150 MB |
+| **Total** | **~2.1 GB** |
 
-Fits on RTX 4060 (8GB) with ~4GB headroom.
-
-### Varys (1B parameters) -- Experimental
-
-Type: GPT-style decoder-only Transformer + LoRA
-Parameters: 1B base + 10M LoRA adapters
-Estimated VRAM: ~8-10 GB with INT4 + gradient checkpointing
-Target GPU: RTX 4080S (20GB)
+Leaves ~6GB headroom on RTX 4060 (8GB).
 
 ## Requirements
 
@@ -110,7 +105,7 @@ On first launch, ARIA will:
 
 .\target\release\train_fresh.exe
 
-Reads JSONL files from data base/. Saves GGUF checkpoint after each epoch.
+Reads JSONL files from data base/. Saves GGUF checkpoint after each epoch. Use `"data base"` as the argument (with quotes because of the space).
 
 ### Supervised Fine-Tuning (SFT)
 
@@ -159,14 +154,14 @@ Gradient clipping is always enabled (norm=1.0).
 LR schedule: linear warmup to ARIA_LR over ARIA_WARMUP steps, then cosine decay to 0.3x ARIA_LR.
 
 Quick run:
-Set-Item Env:ARIA_MAX_SEQS 200000
+Set-Item Env:ARIA_MAX_SEQS 1000
 Set-Item Env:ARIA_EPOCHS 1
-.\target\release\train_fresh.exe
+.\target\release\train_fresh.exe "data base"
 
-Full run (~6-7 hours on RTX 4060, ~450-550 seq/s):
+Full run (RTX 4060, batch=512, micro-batch=4, max_seq_len=512, ~180 seq/s):
 Set-Item Env:ARIA_MAX_SEQS 500000
 Set-Item Env:ARIA_EPOCHS 5
-.\target\release\train_fresh.exe
+.\target\release\train_fresh.exe "data base"
 
 ## Interactive Commands
 
