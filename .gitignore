@@ -24,3 +24,4 @@ convert_txt.py
 aria json/aria_key.hex
 src/fp8_gemm.cu
 *.py
+aria json/aria_checkpoint.gguf

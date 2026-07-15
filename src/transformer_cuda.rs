@@ -109,16 +109,13 @@ const LEARNING_RATE:       f32   = 3e-4;
 const MAX_TOKENS_PER_SEQ:  usize = 256;
 const MIN_TOKENS_PER_SEQ:  usize = 6;
 const PRETRAIN_EPOCHS:     usize = 5;
-const PRETRAIN_BATCH_SIZE: usize = 64;
+const PRETRAIN_BATCH_SIZE: usize = 512;
 const MAX_SEQS_PER_EPOCH:  usize = 25_000_000;
-const MICRO_BATCH_N:       usize = 1; // sequences processed simultaneously (batch=1 for RTX 4060)
+const MICRO_BATCH_N:       usize = 4; // sequences processed simultaneously
 
 const KERNEL_NAMES: &[&str] = &[
-    "embedding_fwd", "embedding_bwd", "add_bias",
-    "fused_lstm_fwd", "fused_lstm_bwd",
-    "asm_linear", "asm_softmax", "asm_ce_grad",
-    "asm_wgrad", "asm_bgrad", "asm_igrad",
-    "reduce_sum_batch", "reduce_sum", "adam_update", "adam_update_f16", "sgd_update_f16", "scale_f16", "scale_f32",
+    "add_bias",
+    "scale_f16", "scale_f32",
     "norm_reduce", "norm_reduce_f16", "clip_if_needed", "clip_if_needed_f16",
     "zero_float",
     "layer_norm_fwd", "layer_norm_bwd",
@@ -138,8 +135,6 @@ const KERNEL_NAMES: &[&str] = &[
     // micro-batch variants
     "embedding_pos_fwd_nb", "qkv_split_heads_nb", "heads_merge_nb",
     "heads_split_nb", "qkv_grad_merge_nb", "pos_grad_add_f32_nb",
-    // Flash Attention 2
-    "flash_attn_fwd", "flash_attn_bwd",
 ];
 
 // ─────────────────────────────────────────────────────────────
@@ -163,8 +158,6 @@ impl KVCache {
 //  GPU function handles
 // ─────────────────────────────────────────────────────────────
 struct TrFns {
-    emb_fwd:          cudarc::driver::CudaFunction,
-    emb_bwd:          cudarc::driver::CudaFunction,
     add_bias:         cudarc::driver::CudaFunction,
     adam_f16:         cudarc::driver::CudaFunction,
     norm_reduce_f16:  cudarc::driver::CudaFunction,
@@ -179,8 +172,6 @@ struct TrFns {
     gelu_bwd:         cudarc::driver::CudaFunction,
     causal_sfx:       cudarc::driver::CudaFunction,
     attn_sfx_bwd:     cudarc::driver::CudaFunction,
-    asm_softmax:      cudarc::driver::CudaFunction,
-    asm_ce_grad:      cudarc::driver::CudaFunction,
     f16_to_f32:       cudarc::driver::CudaFunction,
     f32_to_f16:       cudarc::driver::CudaFunction,
     // GPU training v2
@@ -219,9 +210,6 @@ struct TrFns {
     heads_split_nb:   cudarc::driver::CudaFunction,
     qkv_grad_merge_nb: cudarc::driver::CudaFunction,
     pos_grad_f32_nb:  cudarc::driver::CudaFunction,
-    // Flash Attention 2
-    flash_attn_fwd:   cudarc::driver::CudaFunction,
-    flash_attn_bwd:   cudarc::driver::CudaFunction,
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -254,8 +242,9 @@ struct GpuLayerActs {
     q:        CudaSlice<f16>, // [H, max_T, dh]
     k:        CudaSlice<f16>,
     v:        CudaSlice<f16>,
-    scores:   CudaSlice<f16>, // [H, max_T, max_T] — after causal softmax
+    scores:   CudaSlice<f16>, // [H, max_T, max_T] — after causal softmax (unused with FA)
     ctx:      CudaSlice<f16>, // [H, max_T, dh]
+    lse:      CudaSlice<f32>, // [H, max_T] Flash Attention log-sum-exp
     attn_out: CudaSlice<f16>, // [max_T, D]
     x_mid:    CudaSlice<f16>,
     xn2:      CudaSlice<f16>,
@@ -282,7 +271,7 @@ struct TransformerLayer {
     // LayerNorm 1 & 2
     ln1_g: CudaSlice<f16>, ln1_b: CudaSlice<f16>,
     ln2_g: CudaSlice<f16>, ln2_b: CudaSlice<f16>,
-    // Adam moments (FP32)
+    // Adam moments (f32 for numerical stability)
     m_w_qkv: CudaSlice<f32>, v_w_qkv: CudaSlice<f32>,
     m_b_qkv: CudaSlice<f32>, v_b_qkv: CudaSlice<f32>,
     m_w_out:  CudaSlice<f32>, v_w_out:  CudaSlice<f32>,
@@ -330,13 +319,8 @@ pub struct TransformerModel {
     pub max_seq_len: usize,
     head_dim: usize,
 
-    // LoRA configuration
-    pub lora_config: Option<LoraConfig>,
-
-    // v3.5.1: Quantization, Gradient Checkpointing, LoRA Backward
-    pub int4_quantized: bool,              // Enable INT4 quantization
-    pub gradient_checkpointing: bool,       // Enable gradient checkpointing to save activations
-    pub lora_backward_enabled: bool,        // Enable LoRA backward pass (adapter gradients)
+    // LoRA configuration (used during forward when adapters are enabled)
+    lora_config: Option<LoraConfig>,
 
     adam_step: i32,
 
@@ -389,6 +373,14 @@ fn ones_f32_v(n: usize)  -> Vec<f32> { vec![1.0f32; n] }
 
 fn to_f16(v: &[f32]) -> Vec<f16> { v.iter().map(|&x| f16::from_f32(x)).collect() }
 fn from_f16(v: &[f16]) -> Vec<f32> { v.iter().map(|x| x.to_f32()).collect() }
+
+// Zero-init f16 / f32 GPU buffer helpers (used by constructors / free_training_buffers)
+fn z16(stream: &Arc<CudaStream>, n: usize) -> CudaSlice<f16> {
+    upload_f16(stream, &zeros_f32_v(n))
+}
+fn zf32(stream: &Arc<CudaStream>, n: usize) -> CudaSlice<f32> {
+    upload_f32(stream, &zeros_f32_v(n))
+}
 
 fn upload_f16(stream: &Arc<CudaStream>, data: &[f32]) -> CudaSlice<f16> {
     let h = to_f16(data);
@@ -698,18 +690,18 @@ fn make_layer(stream: &Arc<CudaStream>, d: usize, _h: usize, ff: usize) -> Trans
         b_ff2: up16!(zeros_f32_v(d)),
         ln1_g: up16!(ones_f32_v(d)),  ln1_b: up16!(zeros_f32_v(d)),
         ln2_g: up16!(ones_f32_v(d)),  ln2_b: up16!(zeros_f32_v(d)),
-        m_w_qkv: z32!(d * 3 * d), v_w_qkv: z32!(d * 3 * d),
-        m_b_qkv: z32!(3 * d),     v_b_qkv: z32!(3 * d),
-        m_w_out:  z32!(d * d),    v_w_out:  z32!(d * d),
-        m_b_out:  z32!(d),        v_b_out:  z32!(d),
-        m_w_ff1:  z32!(d * ff),   v_w_ff1:  z32!(d * ff),
-        m_b_ff1:  z32!(ff),       v_b_ff1:  z32!(ff),
-        m_w_ff2:  z32!(ff * d),   v_w_ff2:  z32!(ff * d),
-        m_b_ff2:  z32!(d),        v_b_ff2:  z32!(d),
-        m_ln1_g:  z32!(d),        v_ln1_g:  z32!(d),
-        m_ln1_b:  z32!(d),        v_ln1_b:  z32!(d),
-        m_ln2_g:  z32!(d),        v_ln2_g:  z32!(d),
-        m_ln2_b:  z32!(d),        v_ln2_b:  z32!(d),
+        m_w_qkv: zf32(stream, d * 3 * d), v_w_qkv: zf32(stream, d * 3 * d),
+        m_b_qkv: zf32(stream, 3 * d),     v_b_qkv: zf32(stream, 3 * d),
+        m_w_out:  zf32(stream, d * d),    v_w_out:  zf32(stream, d * d),
+        m_b_out:  zf32(stream, d),        v_b_out:  zf32(stream, d),
+        m_w_ff1:  zf32(stream, d * ff),   v_w_ff1:  zf32(stream, d * ff),
+        m_b_ff1:  zf32(stream, ff),       v_b_ff1:  zf32(stream, ff),
+        m_w_ff2:  zf32(stream, ff * d),   v_w_ff2:  zf32(stream, ff * d),
+        m_b_ff2:  zf32(stream, d),        v_b_ff2:  zf32(stream, d),
+        m_ln1_g:  zf32(stream, d),        v_ln1_g:  zf32(stream, d),
+        m_ln1_b:  zf32(stream, d),        v_ln1_b:  zf32(stream, d),
+        m_ln2_g:  zf32(stream, d),        v_ln2_g:  zf32(stream, d),
+        m_ln2_b:  zf32(stream, d),        v_ln2_b:  zf32(stream, d),
         lora: None,
     }
 }
@@ -776,8 +768,6 @@ impl TransformerModel {
 
         macro_rules! fn_ { ($name:expr) => { module.load_function($name).unwrap() } }
         let fns = TrFns {
-            emb_fwd:         fn_!("embedding_fwd"),
-            emb_bwd:         fn_!("embedding_bwd"),
             add_bias:        fn_!("add_bias"),
             adam_f16:        fn_!("adam_update_f16"),
             norm_reduce_f16: fn_!("norm_reduce_f16"),
@@ -792,8 +782,6 @@ impl TransformerModel {
             gelu_bwd:        fn_!("gelu_bwd"),
             causal_sfx:      fn_!("causal_softmax_fwd"),
             attn_sfx_bwd:    fn_!("attn_softmax_bwd"),
-            asm_softmax:     fn_!("asm_softmax"),
-            asm_ce_grad:     fn_!("asm_ce_grad"),
             f16_to_f32:      fn_!("f16_to_f32"),
             f32_to_f16:      fn_!("f32_to_f16"),
             emb_pos_fwd:     fn_!("embedding_pos_fwd"),
@@ -829,8 +817,6 @@ impl TransformerModel {
             heads_split_nb:  fn_!("heads_split_nb"),
             qkv_grad_merge_nb: fn_!("qkv_grad_merge_nb"),
             pos_grad_f32_nb: fn_!("pos_grad_add_f32_nb"),
-            flash_attn_fwd:  fn_!("flash_attn_fwd"),
-            flash_attn_bwd:  fn_!("flash_attn_bwd"),
         };
 
         let head_dim = d_model / num_heads;
@@ -879,28 +865,27 @@ impl TransformerModel {
         println!("  Params:  ~{:.1}M", total as f32 / 1e6);
         println!("================================");
 
-        let m_embed  = z32!(vocab_size * d_model);
-        let v_embed  = z32!(vocab_size * d_model);
-        let m_pos    = z32!(max_seq_len * d_model);
-        let v_pos    = z32!(max_seq_len * d_model);
+        let m_embed  = zf32(&stream, vocab_size * d_model);
+        let v_embed  = zf32(&stream, vocab_size * d_model);
+        let m_pos    = zf32(&stream, max_seq_len * d_model);
+        let v_pos    = zf32(&stream, max_seq_len * d_model);
         let ln_f_g   = up16!(ones_f32_v(d_model));
         let ln_f_b   = up16!(zeros_f32_v(d_model));
-        let m_ln_f_g = z32!(d_model); let v_ln_f_g = z32!(d_model);
-        let m_ln_f_b = z32!(d_model); let v_ln_f_b = z32!(d_model);
+        let m_ln_f_g = zf32(&stream, d_model); let v_ln_f_g = zf32(&stream, d_model);
+        let m_ln_f_b = zf32(&stream, d_model); let v_ln_f_b = zf32(&stream, d_model);
 
         // ── GPU training v2 buffers ──────────────────────────────
         let mt = max_seq_len;  // Use full max_seq_len for buffer allocation
         let mbn = MICRO_BATCH_N;
-        let mbn = MICRO_BATCH_N;
-        macro_rules! z16  { ($n:expr) => { upload_f16(&stream, &zeros_f32_v($n)) } }
-        macro_rules! zf32 { ($n:expr) => { upload_f32(&stream, &zeros_f32_v($n)) } }
+        macro_rules! z16m { ($n:expr) => { z16(&stream, $n) } }
+        macro_rules! zf32 { ($n:expr) => { zf32(&stream, $n) } }
         macro_rules! zi32 { ($n:expr) => { stream.clone_htod(&vec![0i32; $n]).unwrap() } }
 
         let grads: Vec<GpuLayerGrad> = (0..num_layers).map(|_| GpuLayerGrad {
-            g_w_qkv: z16!(d_model * 3 * d_model),
-            g_w_out: z16!(d_model * d_model),
-            g_w_ff1: z16!(d_model * ffn_dim),
-            g_w_ff2: z16!(ffn_dim * d_model),
+            g_w_qkv: z16m!(d_model * 3 * d_model),
+            g_w_out: z16m!(d_model * d_model),
+            g_w_ff1: z16m!(d_model * ffn_dim),
+            g_w_ff2: z16m!(ffn_dim * d_model),
             g_b_qkv: zf32!(3 * d_model),
             g_b_out: zf32!(d_model),
             g_b_ff1: zf32!(ffn_dim),
@@ -913,23 +898,24 @@ impl TransformerModel {
 
         // Activation buffers sized for micro-batch: N sequences in parallel
         let acts: Vec<GpuLayerActs> = (0..num_layers).map(|_| GpuLayerActs {
-            x_pre:    z16!(mbn * mt * d_model),
-            xn1:      z16!(mbn * mt * d_model),
+            x_pre:    z16m!(mbn * mt * d_model),
+            xn1:      z16m!(mbn * mt * d_model),
             ln1_mean: zf32!(mbn * mt),
             ln1_rstd: zf32!(mbn * mt),
-            qkv:      z16!(mbn * mt * 3 * d_model),
-            q:        z16!(mbn * num_heads * mt * head_dim),
-            k:        z16!(mbn * num_heads * mt * head_dim),
-            v:        z16!(mbn * num_heads * mt * head_dim),
-            scores:   z16!(mbn * num_heads * mt * mt),
-            ctx:      z16!(mbn * num_heads * mt * head_dim),
-            attn_out: z16!(mbn * mt * d_model),
-            x_mid:    z16!(mbn * mt * d_model),
-            xn2:      z16!(mbn * mt * d_model),
+            qkv:      z16m!(mbn * mt * 3 * d_model),
+            q:        z16m!(mbn * num_heads * mt * head_dim),
+            k:        z16m!(mbn * num_heads * mt * head_dim),
+            v:        z16m!(mbn * num_heads * mt * head_dim),
+            scores:   z16m!(mbn * num_heads * mt * mt),
+            ctx:      z16m!(mbn * num_heads * mt * head_dim),
+            lse:      zf32!(mbn * num_heads * mt),
+            attn_out: z16m!(mbn * mt * d_model),
+            x_mid:    z16m!(mbn * mt * d_model),
+            xn2:      z16m!(mbn * mt * d_model),
             ln2_mean: zf32!(mbn * mt),
             ln2_rstd: zf32!(mbn * mt),
-            ff1:      z16!(mbn * mt * ffn_dim),
-            ff1_act:  z16!(mbn * mt * ffn_dim),
+            ff1:      z16m!(mbn * mt * ffn_dim),
+            ff1_act:  z16m!(mbn * mt * ffn_dim),
         }).collect();
 
         let max_3d_ff = (3 * d_model).max(ffn_dim);
@@ -946,15 +932,15 @@ impl TransformerModel {
             acts,
             g_embed:      zf32!(vocab_size * d_model),
             g_pos:        zf32!(max_seq_len * d_model),
-            g_embed_head_f16: z16!(vocab_size * d_model),
+            g_embed_head_f16: z16m!(vocab_size * d_model),
             g_ln_f_g:     zf32!(d_model),
             g_ln_f_b:     zf32!(d_model),
-            x_buf:        z16!(mbn * mt * d_model),
-            x_norm_buf:   z16!(mbn * mt * d_model),
+            x_buf:        z16m!(mbn * mt * d_model),
+            x_norm_buf:   z16m!(mbn * mt * d_model),
             lnf_mean:     zf32!(mbn * mt),
             lnf_rstd:     zf32!(mbn * mt),
-            logits_buf:   z16!(mbn * mt * vocab_size),
-            d_logits:     z16!(mbn * mt * vocab_size),
+            logits_buf:   z16m!(mbn * mt * vocab_size),
+            d_logits:     z16m!(mbn * mt * vocab_size),
             loss_acc:     zf32!(1),
             grad_norm_sq: zf32!(1),
             // Sized for the largest grad tensor (embedding = vocab*d_model).
@@ -963,22 +949,19 @@ impl TransformerModel {
             ids_buf:      zi32!(mbn * mt),
             tgt_buf:      zi32!(mbn * mt),
             msk_buf:      zf32!(mbn * mt),
-            dx_buf:       z16!(mbn * mt * d_model),
-            tmp_buf:      z16!(mbn * mt * max_3d_ff),
-            lora_tmp:     z16!(mbn * mt * 16),  // [batch, seq, rank] — intermediate for LoRA
-            dq_buf:       z16!(mbn * num_heads * mt * head_dim),
-            dk_buf:       z16!(mbn * num_heads * mt * head_dim),
-            dv_buf:       z16!(mbn * num_heads * mt * head_dim),
+            dx_buf:       z16m!(mbn * mt * d_model),
+            tmp_buf:      z16m!(mbn * mt * max_3d_ff),
+            lora_tmp:     z16m!(mbn * mt * 16),  // [batch, seq, rank] — intermediate for LoRA
+            dq_buf:       z16m!(mbn * num_heads * mt * head_dim),
+            dk_buf:       z16m!(mbn * num_heads * mt * head_dim),
+            dv_buf:       z16m!(mbn * num_heads * mt * head_dim),
             dk_f32_buf:   zf32!(mbn * num_heads * mt * head_dim),
             dv_f32_buf:   zf32!(mbn * num_heads * mt * head_dim),
             lse_buf:      zf32!(mbn * num_heads * mt),
-            d_attn_buf:   z16!(mbn * num_heads * mt * mt),
-            d_ctx_buf:    z16!(mbn * num_heads * mt * head_dim),
+            d_attn_buf:   z16m!(mbn * num_heads * mt * mt),
+            d_ctx_buf:    z16m!(mbn * num_heads * mt * head_dim),
             cuda_graph:   None,
             lora_config:  None,
-            int4_quantized: false,
-            gradient_checkpointing: false,
-            lora_backward_enabled: false,
         }
     }
 
@@ -1241,7 +1224,7 @@ impl TransformerModel {
         let tiny_f16 = |s: &Arc<CudaStream>| s.clone_htod(&vec![f16::ZERO; 1]).unwrap();
         let tiny_i32 = |s: &Arc<CudaStream>| s.clone_htod(&vec![0i32; 1]).unwrap();
 
-        // Adam moments (biggest — ~1 GB for 124M model)
+        // Adam moments kept in f32 for numerical stability
         self.m_embed = tiny_f32(&stream); self.v_embed = tiny_f32(&stream);
         self.m_pos   = tiny_f32(&stream); self.v_pos   = tiny_f32(&stream);
         self.m_ln_f_g = tiny_f32(&stream); self.v_ln_f_g = tiny_f32(&stream);
@@ -1306,7 +1289,7 @@ impl TransformerModel {
     //  Adapters: A matrices (Kaiming), B matrices (zeros)
     // ─────────────────────────────────────────────────────────────
     pub fn enable_lora(&mut self, rank: usize) {
-        if self.lora_config.is_some() {
+        if self.layers[0].lora.is_some() {
             println!("[LoRA] Already enabled");
             return;
         }
@@ -1324,50 +1307,7 @@ impl TransformerModel {
             self.layers[li].lora = Some(Box::new(adapters));
         }
 
-        self.lora_config = Some(config);
         println!("[LoRA] Initialized for all {} layers", self.num_layers);
-    }
-
-    pub fn enable_int4_quantization(&mut self) {
-        if self.int4_quantized {
-            println!("[INT4] Already enabled");
-            return;
-        }
-        self.int4_quantized = true;
-        println!("[INT4] Quantization enabled — base weights will be dequantized on-the-fly");
-    }
-
-    pub fn enable_gradient_checkpointing(&mut self) {
-        if self.gradient_checkpointing {
-            println!("[GradCheckpoint] Already enabled");
-            return;
-        }
-        self.gradient_checkpointing = true;
-        println!("[GradCheckpoint] Enabled — activations will be recomputed in backward pass");
-    }
-
-    pub fn enable_lora_backward(&mut self) {
-        if !self.lora_config.is_some() {
-            println!("[LoRA Backward] LoRA not enabled yet");
-            return;
-        }
-        if self.lora_backward_enabled {
-            println!("[LoRA Backward] Already enabled");
-            return;
-        }
-        self.lora_backward_enabled = true;
-        println!("[LoRA Backward] Enabled — adapter gradients (A, B matrices) will be computed");
-    }
-
-    /// Prepare model for v3.5.1 training: enable INT4 quantization, gradient checkpointing, and LoRA backward
-    pub fn prepare_v351_training(&mut self) {
-        println!("\n[v3.5.1] Preparing model for optimized training...");
-        self.enable_int4_quantization();
-        self.enable_gradient_checkpointing();
-        if self.lora_config.is_some() {
-            self.enable_lora_backward();
-        }
-        println!("[v3.5.1] Training preparation complete\n");
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -2264,24 +2204,9 @@ impl TransformerModel {
                     }
 
                     // dv[nh,t,dh] = scores^T[nh,t,t] @ d_ctx[nh,t,dh]
-                    // scores is square [t,t] so scores^T has same shape
-                    // = gemm_batched: A=scores treated as [t,t] with transb on the "B" side
-                    // We express as: dv = (scores as "B" transposed) @ d_ctx as "A"
-                    // i.e. gemm_batched_f16(A=d_ctx, B=scores, transb=true) gives d_ctx @ scores^T ≠ what we want
-                    // Correct: dv = scores^T @ d_ctx
-                    // = gemm_batched_f16(A=scores[t,t] transposed, B=d_ctx[t,dh])
-                    // Since gemm_batched_f16 only transposes B, swap: treat d_ctx as "B" and scores as "A"
-                    // but we need to transpose "A". Use raw call matching gemm() helper convention:
-                    // In row-major: C[t,dh] = (A[t,t])^T @ B[t,dh]
-                    //             = A^T @ B (transa=T)
-                    // gemm() with transa=T, transb=F: uses cuBLAS CUBLAS_OP_N/CUBLAS_OP_T pattern (case 2)
-                    // Replicate that pattern for strided batched:
                     unsafe {
                         use cudarc::cublas::{StridedBatchedConfig, GemmConfig, Gemm};
                         use cudarc::cublas::sys::cublasOperation_t::{CUBLAS_OP_N, CUBLAS_OP_T};
-                        // Case transa=true, transb=false from gemm() helper:
-                        // cuBLAS: transa=N, transb=T, m=n, n=m, k=k, lda=n, ldb=m, ldc=n
-                        // Here: m=t, k=t, n=dh
                         let cfg = StridedBatchedConfig::<f16> {
                             gemm: GemmConfig {
                                 transa: CUBLAS_OP_N, transb: CUBLAS_OP_T,
@@ -2297,8 +2222,6 @@ impl TransformerModel {
                             stride_c: (t * dh) as i64,
                             batch_size: nh as i32,
                         };
-                        // cuBLAS (a=d_ctx, b=scores) → dv = d_ctx_T^T @ scores^T ...
-                        // Following gemm() transa=true case: args are (b=d_ctx, a=scores)
                         (*blas_ptr).gemm_strided_batched(cfg,
                             &self.d_ctx_buf, &(*acts_ptr).scores, &mut self.dv_buf).unwrap();
                     }
@@ -2339,7 +2262,6 @@ impl TransformerModel {
                     }
 
                     // dk[nh,t,dh] = d_attn_pre^T[nh,t,t] @ Q[nh,t,dh]
-                    // Same pattern as dv but swap d_ctx→Q and scores→d_attn_pre
                     unsafe {
                         use cudarc::cublas::{StridedBatchedConfig, GemmConfig, Gemm};
                         use cudarc::cublas::sys::cublasOperation_t::{CUBLAS_OP_N, CUBLAS_OP_T};
@@ -2576,23 +2498,16 @@ impl TransformerModel {
             }
         }
 
-        // ── ADAM UPDATE (all on GPU) ──────────────────────────────
-        macro_rules! adam16 { ($p:expr, $m:expr, $v:expr, $g:expr) => {{
+        // ── ADAM UPDATE (all on GPU, f32 state for stability) ─────
+        macro_rules! adam16f32 { ($p:expr, $m:expr, $v:expr, $g:expr) => {{
             let n = $p.len();
             unsafe { self.stream.launch_builder(&self.fns.adam_f16)
                 .arg(&mut $p).arg(&mut $m).arg(&mut $v).arg(&$g)
                 .arg(&lr).arg(&0.9f32).arg(&0.999f32).arg(&eps).arg(&bc1).arg(&bc2).arg(&(n as i32))
                 .launch(cfg1d(n)).unwrap(); }
         }}}
-        macro_rules! adam16f32 { ($p:expr, $m:expr, $v:expr, $g:expr) => {{
-            let n = $p.len();
-            unsafe { self.stream.launch_builder(&self.fns.adam_f16_f32)
-                .arg(&mut $p).arg(&mut $m).arg(&mut $v).arg(&$g)
-                .arg(&lr).arg(&0.9f32).arg(&0.999f32).arg(&eps).arg(&bc1).arg(&bc2).arg(&(n as i32))
-                .launch(cfg1d(n)).unwrap(); }
-        }}}
 
-        // Embed + pos (f32 grads → f16 params via adam_f16_f32)
+        // Embed + pos (f16 params, f32 Adam state, f32 grads)
         adam16f32!(self.embed,     self.m_embed,   self.v_embed,   self.g_embed);
         adam16f32!(self.pos_embed, self.m_pos,     self.v_pos,     self.g_pos);
         adam16f32!(self.ln_f_g,    self.m_ln_f_g,  self.v_ln_f_g,  self.g_ln_f_g);
@@ -2603,24 +2518,12 @@ impl TransformerModel {
             let gp = &mut self.grads[li] as *mut GpuLayerGrad;
             unsafe {
                 macro_rules! adam_w { ($w:ident, $m:ident, $v:ident, $g:ident) => {{
-                    // v3.5.1: LoRA backward — compute adapter gradients if enabled
-                    if self.lora_config.is_some() && (*lp).lora.is_some() && self.lora_backward_enabled {
-                        // Adapter-only training: compute d_A and d_B gradients
-                        // (Implementation: placeholder for now — full implementation requires activation tracking)
-                        // In full implementation, would compute:
-                        //   d_A = gradients with respect to A matrix
-                        //   d_B = gradients with respect to B matrix
-                        // Then update with Adam: m_A, v_A, m_B, v_B
-                    } else if self.lora_config.is_some() && (*lp).lora.is_some() {
-                        // Skip base weight updates when LoRA enabled but backward not active
-                    } else {
-                        let n = (*lp).$w.len();
-                        self.stream.launch_builder(&self.fns.adam_f16).arg(&mut (*lp).$w).arg(&mut (*lp).$m).arg(&mut (*lp).$v).arg(&(*gp).$g).arg(&lr).arg(&0.9f32).arg(&0.999f32).arg(&eps).arg(&bc1).arg(&bc2).arg(&(n as i32)).launch(cfg1d(n)).unwrap();
-                    }
+                    let n = (*lp).$w.len();
+                    self.stream.launch_builder(&self.fns.adam_f16).arg(&mut (*lp).$w).arg(&mut (*lp).$m).arg(&mut (*lp).$v).arg(&(*gp).$g).arg(&lr).arg(&0.9f32).arg(&0.999f32).arg(&eps).arg(&bc1).arg(&bc2).arg(&(n as i32)).launch(cfg1d(n)).unwrap();
                 }}}
                 macro_rules! adam_b { ($w:ident, $m:ident, $v:ident, $g:ident) => {{
                     let n = (*lp).$w.len();
-                    self.stream.launch_builder(&self.fns.adam_f16_f32).arg(&mut (*lp).$w).arg(&mut (*lp).$m).arg(&mut (*lp).$v).arg(&(*gp).$g).arg(&lr).arg(&0.9f32).arg(&0.999f32).arg(&eps).arg(&bc1).arg(&bc2).arg(&(n as i32)).launch(cfg1d(n)).unwrap();
+                    self.stream.launch_builder(&self.fns.adam_f16).arg(&mut (*lp).$w).arg(&mut (*lp).$m).arg(&mut (*lp).$v).arg(&(*gp).$g).arg(&lr).arg(&0.9f32).arg(&0.999f32).arg(&eps).arg(&bc1).arg(&bc2).arg(&(n as i32)).launch(cfg1d(n)).unwrap();
                 }}}
                 adam_w!(w_qkv, m_w_qkv, v_w_qkv, g_w_qkv);
                 adam_w!(w_out, m_w_out,  v_w_out,  g_w_out);
@@ -2669,6 +2572,7 @@ impl TransformerModel {
             tensors.push(($name.to_string(), bytes, 0u32));
         }}}
 
+
         push_f16!("token_embd.weight",    &self.embed);
         push_f16!("position_embd.weight", &self.pos_embed);
         push_f32!("token_embd.m",         &self.m_embed);
@@ -2716,7 +2620,7 @@ impl TransformerModel {
             push_f32!(format!("blk.{}.attn_norm.bias.m",  i), &l.m_ln1_b);
             push_f32!(format!("blk.{}.attn_norm.bias.v",  i), &l.v_ln1_b);
             push_f32!(format!("blk.{}.ffn_norm.weight.m", i), &l.m_ln2_g);
-            push_f32!(format!("blk.{}.ffn_norm.weight.v", i), &l.v_ln2_g);
+            push_f32!(format!("blk.{}.ffn_norm.weight.v", i), &l.m_ln2_g);
             push_f32!(format!("blk.{}.ffn_norm.bias.m",   i), &l.m_ln2_b);
             push_f32!(format!("blk.{}.ffn_norm.bias.v",   i), &l.v_ln2_b);
         }
@@ -2839,6 +2743,7 @@ impl TransformerModel {
                 $field = upload_f32(&stream, &v);
             }
         }}
+
 
         load_f16!(model.embed,    "token_embd.weight");
         load_f16!(model.pos_embed,"position_embd.weight");
@@ -3417,7 +3322,9 @@ fn read_seq_mmap(data: &[u8], offset: u64) -> (Vec<usize>, Vec<f32>) {
         .chunks_exact(4)
         .map(|b| u32::from_le_bytes([b[0],b[1],b[2],b[3]]) as usize)
         .collect();
-    let mask: Vec<f32> = data[mask_start..mask_start + len*4]
+    // mask has len-1 entries (one per target position)
+    let mask_len = len.saturating_sub(1);
+    let mask: Vec<f32> = data[mask_start..mask_start + mask_len*4]
         .chunks_exact(4)
         .map(|b| f32::from_bits(u32::from_le_bytes([b[0],b[1],b[2],b[3]])))
         .collect();

@@ -2,5 +2,4 @@
 
 pub mod lora;
 pub mod tokenizer;
-pub mod lstm_cuda;
 pub mod transformer_cuda;

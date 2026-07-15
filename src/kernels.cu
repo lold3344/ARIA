@@ -357,6 +357,27 @@ extern "C" __global__ void sgd_update_f16(
     param[i] = __float2half(p);
 }
 
+extern "C" __global__ void adam_update_f16_f16(
+    __half*       param,
+    __half*       m,
+    __half*       v,
+    const __half* grad,
+    float lr, float b1, float b2, float eps, float bc1, float bc2,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g  = __half2float(grad[i]);
+    if (!isfinite(g)) return;
+    float m_ = b1 * __half2float(m[i]) + (1.0f - b1) * g;
+    float v_ = b2 * __half2float(v[i]) + (1.0f - b2) * g * g;
+    m[i] = __float2half(m_);
+    v[i] = __float2half(v_);
+    float p = __half2float(param[i]) - lr * (m_ / bc1) / (__fsqrt_rn(v_ / bc2) + eps);
+    if (!isfinite(p)) return;
+    param[i] = __float2half(p);
+}
+
 extern "C" __global__ void scale_f16(__half* x, float scale, int n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1537,6 +1558,204 @@ extern "C" __global__ void flash_attn_bwd(
     }
 
     // Write dq (no atomics needed — each query tile written by exactly one block)
+    for (int r = 0; r < Br_actual; r++) {
+        int qi = qi_start + r;
+        float old = __half2float(dq_head[qi * dh + tid]);
+        dq_head[qi * dh + tid] = __float2half(old + dq_acc[r]);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Flash Attention 2 — Backward (correct, with D_i)
+//
+//  Recomputes attention scores from q,k (no scores buffer needed).
+//  Input:
+//    q,k,v   : [NH, T, dh]
+//    do_      : [NH, T, dh]  upstream gradient
+//    lse      : [NH, T]      saved from forward
+//  Output (accumulate +=):
+//    dq, dk, dv : [NH, T, dh]
+//
+//  Algorithm per query tile (Br queries, processed by one block):
+//    1. First pass over KV tiles: compute D_i = sum_j p_ij * dot(do_i, v_j)
+//    2. Second pass over KV tiles: compute dp_ij and accumulate dq, dk, dv
+//
+//  Grid: (NH, ceil(T/Br), 1)   Block: (dh, 1, 1)
+// ─────────────────────────────────────────────────────────────
+extern "C" __global__ void flash_attn_bwd_v2(
+    const __half* __restrict__ q,
+    const __half* __restrict__ k,
+    const __half* __restrict__ v,
+    const __half* __restrict__ do_,
+    const float*  __restrict__ lse,
+    __half*                    dq,
+    float*                     dk,
+    float*                     dv,
+    int NH, int T, int dh, float scale)
+{
+    int h  = blockIdx.x;
+    int qi_tile = blockIdx.y;
+    if (h >= NH) return;
+    int qi_start = qi_tile * FA_Br;
+    if (qi_start >= T) return;
+    int qi_end = min(qi_start + FA_Br, T);
+    int Br_actual = qi_end - qi_start;
+
+    int tid = threadIdx.x;
+    if (tid >= dh) return;
+
+    extern __shared__ __half smem[];
+    __half* q_tile  = smem;
+    __half* k_tile  = smem + FA_Br * dh;
+    __half* v_tile  = smem + FA_Br * dh + FA_Bc * dh;
+    __half* do_tile = smem + FA_Br * dh + 2 * FA_Bc * dh; // [Br, dh]
+    float*  D_i     = (float*)(&smem[(FA_Br * 2 + 2 * FA_Bc) * dh]); // [Br]
+    float*  warp_s  = D_i + FA_Br;
+
+    const __half* q_head  = q  + (long)h * T * dh;
+    const __half* k_head  = k  + (long)h * T * dh;
+    const __half* v_head  = v  + (long)h * T * dh;
+    const __half* do_head = do_ + (long)h * T * dh;
+    const float*  lse_head = lse + h * T;
+    __half* dq_head = dq + (long)h * T * dh;
+    float*  dk_head = dk + (long)h * T * dh;
+    float*  dv_head = dv + (long)h * T * dh;
+
+    // Load q tile and do tile
+    for (int r = 0; r < Br_actual; r++) {
+        int qi = qi_start + r;
+        q_tile[r * dh + tid]  = q_head[qi * dh + tid];
+        do_tile[r * dh + tid] = do_head[qi * dh + tid];
+    }
+    __syncthreads();
+
+    // Initialize D_i
+    for (int r = 0; r < Br_actual; r++) D_i[r] = 0.0f;
+
+    // First pass: compute D_i = sum_j p_ij * dot(do_i, v_j)
+    for (int kv_start = 0; kv_start < T; kv_start += FA_Bc) {
+        int kv_end = min(kv_start + FA_Bc, T);
+        int Bc_actual = kv_end - kv_start;
+
+        for (int c = 0; c < Bc_actual; c++) {
+            int ki = kv_start + c;
+            k_tile[c * dh + tid] = k_head[ki * dh + tid];
+            v_tile[c * dh + tid] = v_head[ki * dh + tid];
+        }
+        __syncthreads();
+
+        for (int r = 0; r < Br_actual; r++) {
+            int qi = qi_start + r;
+            float lse_r = lse_head[qi];
+
+            for (int c = 0; c < Bc_actual; c++) {
+                int ki = kv_start + c;
+                if (ki > qi) continue;
+
+                // Recompute score
+                float dot = __half2float(q_tile[r * dh + tid])
+                          * __half2float(k_tile[c * dh + tid]);
+                dot += __shfl_xor_sync(0xffffffff, dot, 16);
+                dot += __shfl_xor_sync(0xffffffff, dot, 8);
+                dot += __shfl_xor_sync(0xffffffff, dot, 4);
+                dot += __shfl_xor_sync(0xffffffff, dot, 2);
+                dot += __shfl_xor_sync(0xffffffff, dot, 1);
+                if ((tid & 31) == 0) warp_s[tid >> 5] = dot;
+                __syncthreads();
+                if (tid == 0) warp_s[0] += warp_s[1];
+                __syncthreads();
+                float s = warp_s[0] * scale;
+
+                float p = __expf(s - lse_r);
+
+                float do_v = __half2float(do_tile[r * dh + tid])
+                           * __half2float(v_tile[c * dh + tid]);
+                do_v += __shfl_xor_sync(0xffffffff, do_v, 16);
+                do_v += __shfl_xor_sync(0xffffffff, do_v, 8);
+                do_v += __shfl_xor_sync(0xffffffff, do_v, 4);
+                do_v += __shfl_xor_sync(0xffffffff, do_v, 2);
+                do_v += __shfl_xor_sync(0xffffffff, do_v, 1);
+                if ((tid & 31) == 0) warp_s[tid >> 5] = do_v;
+                __syncthreads();
+                if (tid == 0) warp_s[0] += warp_s[1];
+                __syncthreads();
+                if (tid == 0) D_i[r] += p * warp_s[0];
+                __syncthreads();
+            }
+        }
+        __syncthreads();
+    }
+
+    // Second pass: compute gradients with D_i correction
+    float dq_acc[FA_Br];
+    for (int r = 0; r < Br_actual; r++) dq_acc[r] = 0.0f;
+
+    for (int kv_start = 0; kv_start < T; kv_start += FA_Bc) {
+        int kv_end = min(kv_start + FA_Bc, T);
+        int Bc_actual = kv_end - kv_start;
+
+        for (int c = 0; c < Bc_actual; c++) {
+            int ki = kv_start + c;
+            k_tile[c * dh + tid] = k_head[ki * dh + tid];
+            v_tile[c * dh + tid] = v_head[ki * dh + tid];
+        }
+        __syncthreads();
+
+        float dk_acc[FA_Bc], dv_acc[FA_Bc];
+        for (int c = 0; c < Bc_actual; c++) { dk_acc[c] = 0.0f; dv_acc[c] = 0.0f; }
+
+        for (int r = 0; r < Br_actual; r++) {
+            int qi = qi_start + r;
+            float lse_r = lse_head[qi];
+
+            for (int c = 0; c < Bc_actual; c++) {
+                int ki = kv_start + c;
+                if (ki > qi) continue;
+
+                float dot = __half2float(q_tile[r * dh + tid])
+                          * __half2float(k_tile[c * dh + tid]);
+                dot += __shfl_xor_sync(0xffffffff, dot, 16);
+                dot += __shfl_xor_sync(0xffffffff, dot, 8);
+                dot += __shfl_xor_sync(0xffffffff, dot, 4);
+                dot += __shfl_xor_sync(0xffffffff, dot, 2);
+                dot += __shfl_xor_sync(0xffffffff, dot, 1);
+                if ((tid & 31) == 0) warp_s[tid >> 5] = dot;
+                __syncthreads();
+                if (tid == 0) warp_s[0] += warp_s[1];
+                __syncthreads();
+                float s = warp_s[0] * scale;
+
+                float p = __expf(s - lse_r);
+
+                float do_v = __half2float(do_tile[r * dh + tid])
+                           * __half2float(v_tile[c * dh + tid]);
+                do_v += __shfl_xor_sync(0xffffffff, do_v, 16);
+                do_v += __shfl_xor_sync(0xffffffff, do_v, 8);
+                do_v += __shfl_xor_sync(0xffffffff, do_v, 4);
+                do_v += __shfl_xor_sync(0xffffffff, do_v, 2);
+                do_v += __shfl_xor_sync(0xffffffff, do_v, 1);
+                if ((tid & 31) == 0) warp_s[tid >> 5] = do_v;
+                __syncthreads();
+                if (tid == 0) warp_s[0] += warp_s[1];
+                __syncthreads();
+                float dov = warp_s[0];
+
+                float dp = p * (dov - D_i[r]) * scale;
+
+                dv_acc[c] += p * __half2float(do_tile[r * dh + tid]);
+                dq_acc[r] += dp * __half2float(k_tile[c * dh + tid]);
+                dk_acc[c] += dp * __half2float(q_tile[r * dh + tid]);
+            }
+        }
+
+        for (int c = 0; c < Bc_actual; c++) {
+            int ki = kv_start + c;
+            atomicAdd(&dk_head[ki * dh + tid], dk_acc[c]);
+            atomicAdd(&dv_head[ki * dh + tid], dv_acc[c]);
+        }
+        __syncthreads();
+    }
+
     for (int r = 0; r < Br_actual; r++) {
         int qi = qi_start + r;
         float old = __half2float(dq_head[qi * dh + tid]);
