@@ -1745,8 +1745,11 @@ impl TransformerModel {
                 .map(|i| seqs[i].len().min(mt))
                 .max().unwrap_or(0);
             if t < 2 { chunk_start = chunk_end; continue; }
+            // Guard against sequences that claim to be longer than allowed
+            if t > MAX_TOKENS_PER_SEQ { chunk_start = chunk_end; continue; }
 
             let nt = cn * t;  // total tokens: cn sequences × t each
+            if nt > micro_n * mt { chunk_start = chunk_end; continue; }
             let nh = cn * h;  // total heads:  cn sequences × h each
             let buf_nt = micro_n * mt; // fixed upload size matching pre-alloc buffers
 
@@ -3037,7 +3040,7 @@ pub fn pretrain_from_files(
             let mut batch_seqs:  Vec<Vec<usize>> = Vec::with_capacity(batch_indices.len());
             let mut batch_masks: Vec<Vec<f32>>   = Vec::with_capacity(batch_indices.len());
             for &i in batch_indices {
-                let (ids, mask) = read_seq_mmap(&cache_mmap, offsets[i]);
+                let (ids, mask) = read_seq_mmap(&cache_mmap, offsets[i], max_len);
                 batch_seqs.push(ids);
                 batch_masks.push(mask);
             }
@@ -3313,11 +3316,14 @@ fn read_seq_at(f: &mut std::io::BufReader<fs::File>, offset: u64) -> anyhow::Res
     Ok((ids, mask))
 }
 
-fn read_seq_mmap(data: &[u8], offset: u64) -> (Vec<usize>, Vec<f32>) {
+fn read_seq_mmap(data: &[u8], offset: u64, max_len: usize) -> (Vec<usize>, Vec<f32>) {
     let off = offset as usize;
+    if off + 4 > data.len() { return (Vec::new(), Vec::new()); }
     let len = u32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as usize;
+    if len == 0 || len > max_len { return (Vec::new(), Vec::new()); }
     let ids_start = off + 4;
     let mask_start = ids_start + len * 4;
+    if mask_start + (len.saturating_sub(1)) * 4 > data.len() { return (Vec::new(), Vec::new()); }
     let ids: Vec<usize> = data[ids_start..ids_start + len*4]
         .chunks_exact(4)
         .map(|b| u32::from_le_bytes([b[0],b[1],b[2],b[3]]) as usize)
