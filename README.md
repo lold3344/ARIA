@@ -11,7 +11,7 @@
 > **Note:** ARIA requires an NVIDIA GPU. AMD, Intel, and other GPUs are not supported.
 
 | Version | Codename | Architecture | Parameters | VRAM | Status |
-|---|---|---|---|---|---|---|
+|---|---|---|---|---|---|
 | 3.2.0 | Wotan | LSTM (1 layer) | ~44.5M | 6GB | Legacy |
 | 3.3.0 | Atom | Transformer (12 layers) | ~124M | 8GB | Legacy |
 | 3.4.0 | Atom | Transformer + warmup/clip | ~40M | 4GB | Legacy |
