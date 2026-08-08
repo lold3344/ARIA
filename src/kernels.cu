@@ -1002,6 +1002,27 @@ extern "C" __global__ void adam_update_f16_from_f32(
     param[i] = __float2half(p);
 }
 
+// Adam update: f32 grad → f32 param (master weights), f32 moments
+extern "C" __global__ void adam_update_f32_from_f32(
+    float*       param,
+    float*       m,
+    float*       v,
+    const float* grad,
+    float lr, float b1, float b2, float eps, float bc1, float bc2,
+    int n)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float g  = grad[i];
+    if (!isfinite(g)) return;
+    float m_ = b1*m[i] + (1.0f-b1)*g;
+    float v_ = b2*v[i] + (1.0f-b2)*g*g;
+    m[i] = m_; v[i] = v_;
+    float p = param[i] - lr*(m_/bc1)/(__fsqrt_rn(v_/bc2)+eps);
+    if (!isfinite(p)) return;
+    param[i] = p;
+}
+
 // Scatter-add embedding grad (f32): g_embed[ids[t],d] += dx[t,d]
 // Grid: (T, ceil(D/256), 1)  Block: (256, 1, 1)
 extern "C" __global__ void embedding_bwd_f32(

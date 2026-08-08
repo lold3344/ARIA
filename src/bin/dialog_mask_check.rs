@@ -1,10 +1,9 @@
 #![recursion_limit = "256"]
 
-use aria::tokenizer::Tokenizer;
-
 fn main() -> anyhow::Result<()> {
-    let tokenizer_path = "aria json/aria_tokenizer.json";
-    let mut tokenizer = Tokenizer::load(tokenizer_path)?;
+    let checkpoint_path = "aria json/aria_checkpoint.gguf";
+    println!("Loading tokenizer from embedded GGUF checkpoint: {}", checkpoint_path);
+    let (_, mut tokenizer) = aria::transformer_cuda::TransformerModel::load_checkpoint(checkpoint_path)?;
 
     let samples = [
         "Пользователь: привет\nАссистент: привет",

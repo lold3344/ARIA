@@ -67,7 +67,7 @@ fn feed_tokenizer(data_dir: &str, tokenizer: &mut Tokenizer, max_lines: usize) -
 fn main() -> anyhow::Result<()> {
     let data_dir = "data base";
     let checkpoint_path = "aria json/aria_checkpoint.gguf";
-    let tokenizer_path = "aria json/aria_tokenizer.json";
+    // Tokenizer is now embedded in the GGUF checkpoint; no separate JSON file needed.
 
     // Transformer hyperparams (250M params, ARIA Medium)
     let d_model    = 896;

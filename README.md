@@ -2,11 +2,11 @@
 
 > **Legal notice:** I am not responsible for anyone who uses this tool for illegal purposes. If you train this model and use it for hacking, criminal activity, or any other unlawful actions, that is entirely your own responsibility.
 
-# ARIA Atom 3.6.0
+# ARIA Atom 3.6.0 stable
 
 ![LOGO](screenshots/ARIA-Logo.png)
 
-**ARIA Atom 3.6.0** is a GPT-style Transformer language model built entirely in Rust with CUDA/cuBLAS acceleration and custom PTX kernels. Checkpoints use the **GGUF** format -- weights, tokenizer, and Adam optimizer state are stored in a single file.
+**ARIA Atom 3.6.0 stable** is a GPT-style Transformer language model built entirely in Rust with CUDA/cuBLAS acceleration and custom PTX kernels. Checkpoints use the **GGUF** format -- weights, tokenizer, Adam optimizer state, and FP32 master weights are stored in a single file.
 
 > **Note:** ARIA requires an NVIDIA GPU. AMD, Intel, and other GPUs are not supported.
 
@@ -18,21 +18,35 @@
 | 3.5.0 | Efkolos (light) | Transformer + LoRA | 250M | ~4GB | Legacy |
 | 3.5.1 | Efkolos (optimized) | Transformer + LoRA + INT4 | 250M | ~3GB | Legacy |
 | 3.5.2 | Efkolos | Transformer + GGUF + Q4_0 | 250M | ~3GB | Legacy |
-| **3.6.0** | **Efkolos** | **Transformer + code cleanup** | **~223M** | **~2.1GB** | **Stable** |
+| **3.6.0 stable** | **Efkolos** | **Transformer + training stability + restored LoRA/INT4/grad-checkpoint toggles** | **~223M** | **~3GB training / ~0.7GB inference** | **Stable** |
 
 ## Changelog
 
-### v3.6.0
-- Removed dead code from `src/transformer_cuda.rs`:
-  - Unused v3.5.1 feature toggles (INT4 quantization, gradient checkpointing, LoRA backward)
-  - Unused CUDA kernels (flash attention, ASM kernels, SGD, FP16 Adam, KV-cache helpers)
-  - Removed `src/lstm_cuda.rs`
+### v3.6.0 stable
+- Restored v3.5.1 feature toggles in `TransformerModel`:
+  - `int4_quantized`
+  - `gradient_checkpointing`
+  - `lora_backward_enabled`
+- Added FP32 master weights for mixed-precision training stability:
+  - Adam updates run on FP32 master copies, then copy back to FP16 working weights
+  - Prevents delayed loss explosion from FP16-only Adam updates
+  - Master weights are saved inside the GGUF checkpoint and freed in inference mode
+- Added new CUDA kernel `adam_update_f32_from_f32` for FP32 master weight updates
+- Fixed weight initialization:
+  - `randn_f16` now uses true Gaussian (Box-Muller) instead of uniform noise
+  - Added depth-dependent residual scaling (`1/sqrt(2*L)`) on `attn_out` and `ffn_down` projections
+- Made gradient clipping NaN/inf-safe:
+  - If `global_grad_norm` is not finite, gradients are zeroed and the step is skipped
+- Split checkpoint loading:
+  - `load_checkpoint()` -- inference mode: loads weights + tokenizer only (no optimizer state, no OOM)
+  - `load_checkpoint_for_training()` -- training resume: loads weights + Adam state + FP32 master weights
+- Removed obsolete separate `aria_tokenizer.json` save path; tokenizer is always embedded in GGUF
 - Training verified on RTX 4060:
   - `MICRO_BATCH_N = 4`
   - `PRETRAIN_BATCH_SIZE = 512`
-  - `max_seq_len = 512` (reduced from 2048)
-  - Speed: ~180 seq/s
-  - Stable loss decrease confirmed
+  - `max_seq_len = 512`
+  - Speed: ~170 seq/s
+  - Stable loss decrease confirmed on 5000-sequence smoke test
 
 ### v3.5.2
 - **GGUF checkpoint format** -- weights, tokenizer, and Adam state in a single .gguf file
@@ -53,21 +67,23 @@ FFN dim: 3584 (4x d_model)
 Context: 2048 tokens (training uses `max_seq_len = 512` for VRAM efficiency)
 Vocabulary: ~31,500 BPE tokens (Cyrillic-aware)
 Parameters: ~223M base
-Precision: FP16 weights + FP16 activations + FP32 Adam state
+Precision: FP16 weights + FP16 activations + FP32 Adam state + FP32 master weights
 Optimizer: Adam (beta1=0.9, beta2=0.999, eps=1e-8)
+Gradient clipping: global L2 norm <= 1.0 with NaN/inf fallback
 
-#### VRAM Usage (RTX 4060, training)
+#### VRAM Usage (RTX 4060)
 
-| Component | Size |
-|---|---|
-| Base weights FP16 | ~450 MB |
-| Adam optimizer (f32) | ~900 MB |
-| Activations / grads | ~600 MB |
-| Attention scores | ~200 MB |
-| Other | ~150 MB |
-| **Total** | **~2.1 GB** |
+| Component | Training | Inference |
+|---|---|---|
+| Base weights FP16 | ~450 MB | ~450 MB |
+| FP32 master weights | ~900 MB | -- |
+| Adam optimizer (f32) | ~1.8 GB | -- |
+| Activations / grads | ~600 MB | ~100 MB |
+| Attention scores | ~200 MB | ~50 MB |
+| Other | ~150 MB | ~50 MB |
+| **Total** | **~3.1 GB** | **~650 MB** |
 
-Leaves ~6GB headroom on RTX 4060 (8GB).
+Leaves ~5GB headroom on RTX 4060 (8GB) during training.
 
 ## Requirements
 
@@ -103,15 +119,21 @@ On first launch, ARIA will:
 
 ### Train from scratch
 
-.\target\release\train_fresh.exe
+.\target\release\train_fresh.exe "data base"
 
-Reads JSONL files from data base/. Saves GGUF checkpoint after each epoch. Use `"data base"` as the argument (with quotes because of the space).
+Reads JSONL files from `data base/`. Saves GGUF checkpoint after each epoch. Use `"data base"` as the argument (with quotes because of the space).
+
+### Continue training (resume from checkpoint)
+
+.\target\release\train_fresh.exe "data base"
+
+`train_fresh.exe` automatically resumes from `aria json/aria_checkpoint.gguf` when the checkpoint exists, loading optimizer state and FP32 master weights.
 
 ### Supervised Fine-Tuning (SFT)
 
 .\target\release\sft_train.exe
 
-### Continue training
+### Interactive training
 
 Set-Item Env:ARIA_CONTINUE_TRAIN 1
 .\target\release\aria.exe
@@ -128,7 +150,7 @@ Set-Item Env:ARIA_CONTINUE_TRAIN 1
 
 .\target\release\export_gguf.exe aria json/aria_checkpoint.gguf aria json/aria_inference.gguf
 
-Produces a ~300MB inference-only file with no optimizer state.
+Produces a ~300MB inference-only file with no optimizer state or master weights.
 
 ## Dataset Format
 
@@ -147,9 +169,9 @@ Use USER / ASSISTANT tokens for dialog fine-tuning. The tokenizer is trained fro
 | ARIA_MAX_SEQS | Sequences per epoch | 500,000 |
 | ARIA_EPOCHS | Number of epochs | 5 |
 | ARIA_VOCAB_LINES | Lines for tokenizer training | 500,000 |
-| ARIA_CONTINUE_TRAIN | Resume from checkpoint | -- |
+| ARIA_CONTINUE_TRAIN | Resume from checkpoint in interactive mode | -- |
 
-Gradient clipping is always enabled (norm=1.0).
+Gradient clipping is always enabled (norm=1.0) with NaN/inf fallback.
 
 LR schedule: linear warmup to ARIA_LR over ARIA_WARMUP steps, then cosine decay to 0.3x ARIA_LR.
 
@@ -158,8 +180,13 @@ Set-Item Env:ARIA_MAX_SEQS 1000
 Set-Item Env:ARIA_EPOCHS 1
 .\target\release\train_fresh.exe "data base"
 
-Full run (RTX 4060, batch=512, micro-batch=4, max_seq_len=512, ~180 seq/s):
+Full run (RTX 4060, batch=512, micro-batch=4, max_seq_len=512, ~170 seq/s):
 Set-Item Env:ARIA_MAX_SEQS 500000
+Set-Item Env:ARIA_EPOCHS 5
+.\target\release\train_fresh.exe "data base"
+
+Smoke test (used for stability validation):
+Set-Item Env:ARIA_MAX_SEQS 5000
 Set-Item Env:ARIA_EPOCHS 5
 .\target\release\train_fresh.exe "data base"
 
@@ -181,7 +208,7 @@ Set-Item Env:ARIA_EPOCHS 5
 
 | Path | Description |
 |---|---|
-| aria json/aria_checkpoint.gguf | Full checkpoint (weights + tokenizer + Adam state) |
+| aria json/aria_checkpoint.gguf | Full checkpoint (weights + tokenizer + Adam state + FP32 master weights) |
 | aria json/aria_inference.gguf | Q4_0 inference model (created by export_gguf) |
 | aria json/aria_dialogs.json | Saved dialog history |
 | data base/sequences_cache_*.bin | Tokenized sequence cache |
@@ -200,7 +227,18 @@ Check NVIDIA drivers and CUDA Toolkit 12.x are installed. nvcc must be on your P
 3.5.2 uses GGUF only. JSON and ARIA v2 binary checkpoints are not supported -- retrain with train_fresh.exe.
 
 **Out of memory**
-Lower ARIA_MAX_SEQS. Always use cargo build --release -- debug builds are 10-20x slower.
+Lower `ARIA_MAX_SEQS` or reduce batch size in source. Use `cargo build --release` -- debug builds are 10-20x slower and use more memory.
+
+**Old checkpoints do not load**
+- 3.5.2+ uses GGUF only. JSON and ARIA v2 binary checkpoints are not supported -- retrain with `train_fresh.exe`.
+- 3.6.0 stable can load 3.5.2/3.6.0 GGUF checkpoints; legacy checkpoints without FP32 master weights are automatically upgraded in training mode.
+
+**Loss explosion during long training**
+- 3.6.0 stable fixes the most common cause: FP16-only Adam updates accumulating rounding errors.
+- If loss still explodes after many hours, check:
+  1. Dataset quality (no extremely long sequences or corrupted JSONL lines)
+  2. Learning rate is not too high for your data
+  3. GPU memory is not overheating / throttling
 
 **Bad output quality**
 1. Check dataset format and size.

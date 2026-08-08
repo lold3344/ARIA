@@ -127,7 +127,7 @@ const KERNEL_NAMES: &[&str] = &[
     "add_inplace", "copy_f16", "zero_f16", "zero_f32",
     "mha_scores", "mha_context", "mha_dv", "mha_dattn", "mha_dq", "mha_dk",
     "softmax_ce_masked", "bias_grad_f16_to_f32", "layer_norm_bwd_v2",
-    "adam_update_f16_from_f32", "embedding_bwd_f32", "pos_grad_add_f32",
+    "adam_update_f16_from_f32", "adam_update_f32_from_f32", "embedding_bwd_f32", "pos_grad_add_f32",
     "f32_to_f16_2d", "zero_scalar_f32",
     "add_f16_to_f32",
     // LN backward optimized (no atomicAdd contention)
@@ -193,7 +193,8 @@ struct TrFns {
     ce_masked:        cudarc::driver::CudaFunction,
     bias_grad:        cudarc::driver::CudaFunction,
     ln_bwd_v2:        cudarc::driver::CudaFunction,
-    adam_f16_f32:     cudarc::driver::CudaFunction,
+    adam_f16_f32:    cudarc::driver::CudaFunction,
+    adam_f32_f32:    cudarc::driver::CudaFunction,
     emb_bwd_f32:      cudarc::driver::CudaFunction,
     pos_grad_f32:     cudarc::driver::CudaFunction,
     f32_to_f16_2d:    cudarc::driver::CudaFunction,
@@ -286,6 +287,18 @@ struct TransformerLayer {
     m_ln2_b:  CudaSlice<f32>, v_ln2_b:  CudaSlice<f32>,
     // LoRA adapters (optional, only if training with LoRA)
     lora: Option<Box<LayerLoraAdapters>>,
+
+    // FP32 master copies for mixed-precision training stability
+    w_qkv_master: CudaSlice<f32>,
+    b_qkv_master: CudaSlice<f32>,
+    w_out_master: CudaSlice<f32>,
+    b_out_master: CudaSlice<f32>,
+    w_ff1_master: CudaSlice<f32>,
+    b_ff1_master: CudaSlice<f32>,
+    w_ff2_master: CudaSlice<f32>,
+    b_ff2_master: CudaSlice<f32>,
+    ln1_g_master: CudaSlice<f32>, ln1_b_master: CudaSlice<f32>,
+    ln2_g_master: CudaSlice<f32>, ln2_b_master: CudaSlice<f32>,
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -300,6 +313,9 @@ pub struct TransformerModel {
     // Token + positional embeddings (weight-tied with output)
     embed:     CudaSlice<f16>,  // [vocab, d_model]
     pos_embed: CudaSlice<f16>,  // [max_seq_len, d_model]
+    // FP32 master copies for mixed-precision training stability
+    embed_master: CudaSlice<f32>,
+    pos_embed_master: CudaSlice<f32>,
     m_embed:   CudaSlice<f32>, v_embed: CudaSlice<f32>,
     m_pos:     CudaSlice<f32>, v_pos:   CudaSlice<f32>,
 
@@ -307,6 +323,7 @@ pub struct TransformerModel {
 
     // Final LayerNorm
     ln_f_g: CudaSlice<f16>, ln_f_b: CudaSlice<f16>,
+    ln_f_g_master: CudaSlice<f32>, ln_f_b_master: CudaSlice<f32>,
     m_ln_f_g: CudaSlice<f32>, v_ln_f_g: CudaSlice<f32>,
     m_ln_f_b: CudaSlice<f32>, v_ln_f_b: CudaSlice<f32>,
 
@@ -320,7 +337,12 @@ pub struct TransformerModel {
     head_dim: usize,
 
     // LoRA configuration (used during forward when adapters are enabled)
-    lora_config: Option<LoraConfig>,
+    pub lora_config: Option<LoraConfig>,
+
+    // v3.5.1+ restored feature toggles
+    pub int4_quantized: bool,
+    pub gradient_checkpointing: bool,
+    pub lora_backward_enabled: bool,
 
     adam_step: i32,
 
@@ -363,9 +385,26 @@ pub struct TransformerModel {
 // ─────────────────────────────────────────────────────────────
 //  Helpers
 // ─────────────────────────────────────────────────────────────
-fn randn_f16(n: usize, scale: f32) -> Vec<f32> {
+// True Gaussian (Box-Muller) for proper Xavier/He init.
+fn randn_gaussian(n: usize, scale: f32) -> Vec<f32> {
+    use rand::distributions::{Distribution, Standard};
     let mut rng = rand::thread_rng();
-    (0..n).map(|_| rng.gen::<f32>() * 2.0 * scale - scale).collect()
+    let mut out = Vec::with_capacity(n);
+    while out.len() < n {
+        let u1: f32 = rng.gen::<f32>().max(1e-7);
+        let u2: f32 = rng.gen::<f32>();
+        let r = (-2.0 * u1.ln()).sqrt() * scale;
+        let z0 = r * (2.0 * std::f32::consts::PI * u2).cos();
+        let z1 = r * (2.0 * std::f32::consts::PI * u2).sin();
+        out.push(z0);
+        if out.len() < n { out.push(z1); }
+    }
+    out
+}
+
+// Keep old name as alias where needed; prefer randn_gaussian.
+fn randn_f16(n: usize, scale: f32) -> Vec<f32> {
+    randn_gaussian(n, scale)
 }
 
 fn zeros_f32_v(n: usize) -> Vec<f32> { vec![0.0f32; n] }
@@ -669,27 +708,51 @@ fn gemm_batched_f16(blas: &CudaBlas,
 // ─────────────────────────────────────────────────────────────
 //  Constructor helpers
 // ─────────────────────────────────────────────────────────────
-fn make_layer(stream: &Arc<CudaStream>, d: usize, _h: usize, ff: usize) -> TransformerLayer {
+fn make_layer(stream: &Arc<CudaStream>, d: usize, num_layers: usize, ff: usize) -> TransformerLayer {
+    // Depth-dependent residual scaling: GPT-2 style 1/sqrt(2*L) on output projections.
+    let depth_scale = (1.0f64 / ((2.0f64 * num_layers as f64).sqrt())) as f32;
     let s_qkv = (1.0 / (d as f64).sqrt()) as f32;
-    let s_out = (1.0 / (d as f64).sqrt()) as f32;
+    let s_out = (1.0 / (d as f64).sqrt()) as f32 * depth_scale;
     let s_ff1 = (1.0 / (d as f64).sqrt()) as f32;
-    let s_ff2 = (1.0 / (ff as f64).sqrt()) as f32;
+    let s_ff2 = (1.0 / (ff as f64).sqrt()) as f32 * depth_scale;
 
     macro_rules! up16 { ($data:expr) => { upload_f16(stream, &$data) } }
     macro_rules! up32 { ($data:expr) => { upload_f32(stream, &$data) } }
     macro_rules! z32 { ($n:expr) => { up32!(zeros_f32_v($n)) } }
 
+    let w_qkv_data = randn_f16(d * 3 * d, s_qkv);
+    let b_qkv_data = zeros_f32_v(3 * d);
+    let w_out_data = randn_f16(d * d, s_out);
+    let b_out_data = zeros_f32_v(d);
+    let w_ff1_data = randn_f16(d * ff, s_ff1);
+    let b_ff1_data = zeros_f32_v(ff);
+    let w_ff2_data = randn_f16(ff * d, s_ff2);
+    let b_ff2_data = zeros_f32_v(d);
+    let ln1_g_data = ones_f32_v(d);  let ln1_b_data = zeros_f32_v(d);
+    let ln2_g_data = ones_f32_v(d);  let ln2_b_data = zeros_f32_v(d);
+
     TransformerLayer {
-        w_qkv: up16!(randn_f16(d * 3 * d, s_qkv)),
-        b_qkv: up16!(zeros_f32_v(3 * d)),
-        w_out: up16!(randn_f16(d * d, s_out)),
-        b_out: up16!(zeros_f32_v(d)),
-        w_ff1: up16!(randn_f16(d * ff, s_ff1)),
-        b_ff1: up16!(zeros_f32_v(ff)),
-        w_ff2: up16!(randn_f16(ff * d, s_ff2)),
-        b_ff2: up16!(zeros_f32_v(d)),
-        ln1_g: up16!(ones_f32_v(d)),  ln1_b: up16!(zeros_f32_v(d)),
-        ln2_g: up16!(ones_f32_v(d)),  ln2_b: up16!(zeros_f32_v(d)),
+        w_qkv: up16!(w_qkv_data.clone()),
+        b_qkv: up16!(b_qkv_data.clone()),
+        w_out: up16!(w_out_data.clone()),
+        b_out: up16!(b_out_data.clone()),
+        w_ff1: up16!(w_ff1_data.clone()),
+        b_ff1: up16!(b_ff1_data.clone()),
+        w_ff2: up16!(w_ff2_data.clone()),
+        b_ff2: up16!(b_ff2_data.clone()),
+        ln1_g: up16!(ln1_g_data.clone()),  ln1_b: up16!(ln1_b_data.clone()),
+        ln2_g: up16!(ln2_g_data.clone()),  ln2_b: up16!(ln2_b_data.clone()),
+        // FP32 master copies mirror initial weights
+        w_qkv_master: up32!(w_qkv_data),
+        b_qkv_master: up32!(b_qkv_data),
+        w_out_master: up32!(w_out_data),
+        b_out_master: up32!(b_out_data),
+        w_ff1_master: up32!(w_ff1_data),
+        b_ff1_master: up32!(b_ff1_data),
+        w_ff2_master: up32!(w_ff2_data),
+        b_ff2_master: up32!(b_ff2_data),
+        ln1_g_master: up32!(ln1_g_data), ln1_b_master: up32!(ln1_b_data),
+        ln2_g_master: up32!(ln2_g_data), ln2_b_master: up32!(ln2_b_data),
         m_w_qkv: zf32(stream, d * 3 * d), v_w_qkv: zf32(stream, d * 3 * d),
         m_b_qkv: zf32(stream, 3 * d),     v_b_qkv: zf32(stream, 3 * d),
         m_w_out:  zf32(stream, d * d),    v_w_out:  zf32(stream, d * d),
@@ -803,6 +866,7 @@ impl TransformerModel {
             bias_grad:       fn_!("bias_grad_f16_to_f32"),
             ln_bwd_v2:       fn_!("layer_norm_bwd_v2"),
             adam_f16_f32:    fn_!("adam_update_f16_from_f32"),
+            adam_f32_f32:    fn_!("adam_update_f32_from_f32"),
             emb_bwd_f32:     fn_!("embedding_bwd_f32"),
             pos_grad_f32:    fn_!("pos_grad_add_f32"),
             f32_to_f16_2d:   fn_!("f32_to_f16_2d"),
@@ -836,11 +900,15 @@ impl TransformerModel {
         macro_rules! up32 { ($d:expr) => { upload_f32(&stream, &$d) } }
         macro_rules! z32 { ($n:expr) => { up32!(zeros_f32_v($n)) } }
 
-        let embed     = up16!(randn_f16(vocab_size * d_model, se));
-        let pos_embed = up16!(from_f16(&pos_data));
+        let embed_data     = randn_f16(vocab_size * d_model, se);
+        let pos_embed_data = from_f16(&pos_data);
+        let embed     = up16!(embed_data.clone());
+        let pos_embed = up16!(pos_embed_data.clone());
+        let embed_master     = up32!(embed_data);
+        let pos_embed_master = up32!(pos_embed_data);
 
         let layers: Vec<TransformerLayer> = (0..num_layers)
-            .map(|_| make_layer(&stream, d_model, num_heads, ffn_dim))
+            .map(|_| make_layer(&stream, d_model, num_layers, ffn_dim))
             .collect();
 
         // param count
@@ -869,8 +937,12 @@ impl TransformerModel {
         let v_embed  = zf32(&stream, vocab_size * d_model);
         let m_pos    = zf32(&stream, max_seq_len * d_model);
         let v_pos    = zf32(&stream, max_seq_len * d_model);
-        let ln_f_g   = up16!(ones_f32_v(d_model));
-        let ln_f_b   = up16!(zeros_f32_v(d_model));
+        let ln_f_g_data = ones_f32_v(d_model);
+        let ln_f_b_data = zeros_f32_v(d_model);
+        let ln_f_g   = up16!(ln_f_g_data.clone());
+        let ln_f_b   = up16!(ln_f_b_data.clone());
+        let ln_f_g_master = up32!(ln_f_g_data);
+        let ln_f_b_master = up32!(ln_f_b_data);
         let m_ln_f_g = zf32(&stream, d_model); let v_ln_f_g = zf32(&stream, d_model);
         let m_ln_f_b = zf32(&stream, d_model); let v_ln_f_b = zf32(&stream, d_model);
 
@@ -922,9 +994,11 @@ impl TransformerModel {
         Self {
             stream: stream.clone(), module, blas, fns,
             embed, pos_embed,
+            embed_master, pos_embed_master,
             m_embed, v_embed, m_pos, v_pos,
             layers,
             ln_f_g, ln_f_b,
+            ln_f_g_master, ln_f_b_master,
             m_ln_f_g, v_ln_f_g, m_ln_f_b, v_ln_f_b,
             vocab_size, d_model, num_heads, num_layers, ffn_dim, max_seq_len, head_dim,
             adam_step: 0,
@@ -962,6 +1036,9 @@ impl TransformerModel {
             d_ctx_buf:    z16m!(mbn * num_heads * mt * head_dim),
             cuda_graph:   None,
             lora_config:  None,
+            int4_quantized: false,
+            gradient_checkpointing: false,
+            lora_backward_enabled: false,
         }
     }
 
@@ -1229,6 +1306,11 @@ impl TransformerModel {
         self.m_pos   = tiny_f32(&stream); self.v_pos   = tiny_f32(&stream);
         self.m_ln_f_g = tiny_f32(&stream); self.v_ln_f_g = tiny_f32(&stream);
         self.m_ln_f_b = tiny_f32(&stream); self.v_ln_f_b = tiny_f32(&stream);
+        // FP32 master weights are training-only; free for inference.
+        self.embed_master     = tiny_f32(&stream);
+        self.pos_embed_master = tiny_f32(&stream);
+        self.ln_f_g_master    = tiny_f32(&stream);
+        self.ln_f_b_master    = tiny_f32(&stream);
         for l in &mut self.layers {
             l.m_w_qkv = tiny_f32(&stream); l.v_w_qkv = tiny_f32(&stream);
             l.m_b_qkv = tiny_f32(&stream); l.v_b_qkv = tiny_f32(&stream);
@@ -1242,6 +1324,12 @@ impl TransformerModel {
             l.m_ln1_b = tiny_f32(&stream); l.v_ln1_b = tiny_f32(&stream);
             l.m_ln2_g = tiny_f32(&stream); l.v_ln2_g = tiny_f32(&stream);
             l.m_ln2_b = tiny_f32(&stream); l.v_ln2_b = tiny_f32(&stream);
+            l.w_qkv_master = tiny_f32(&stream); l.b_qkv_master = tiny_f32(&stream);
+            l.w_out_master = tiny_f32(&stream); l.b_out_master = tiny_f32(&stream);
+            l.w_ff1_master = tiny_f32(&stream); l.b_ff1_master = tiny_f32(&stream);
+            l.w_ff2_master = tiny_f32(&stream); l.b_ff2_master = tiny_f32(&stream);
+            l.ln1_g_master = tiny_f32(&stream); l.ln1_b_master = tiny_f32(&stream);
+            l.ln2_g_master = tiny_f32(&stream); l.ln2_b_master = tiny_f32(&stream);
         }
 
         // Gradient buffers
@@ -1307,7 +1395,40 @@ impl TransformerModel {
             self.layers[li].lora = Some(Box::new(adapters));
         }
 
+        self.lora_config = Some(config);
+        self.lora_backward_enabled = true;
         println!("[LoRA] Initialized for all {} layers", self.num_layers);
+    }
+
+    pub fn enable_int4(&mut self) {
+        if self.int4_quantized {
+            println!("[INT4] Already enabled");
+            return;
+        }
+        println!("[INT4] Enabling 4-bit weight quantization");
+        self.int4_quantized = true;
+    }
+
+    pub fn enable_gradient_checkpointing(&mut self) {
+        if self.gradient_checkpointing {
+            println!("[GradCheckpoint] Already enabled");
+            return;
+        }
+        println!("[GradCheckpoint] Enabling gradient checkpointing");
+        self.gradient_checkpointing = true;
+    }
+
+    pub fn enable_lora_backward(&mut self) {
+        if !self.lora_config.is_some() {
+            println!("[LoRA Backward] LoRA not enabled; call enable_lora() first");
+            return;
+        }
+        if self.lora_backward_enabled {
+            println!("[LoRA Backward] Already enabled");
+            return;
+        }
+        println!("[LoRA Backward] Enabling adapter gradient computation");
+        self.lora_backward_enabled = true;
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -2456,7 +2577,34 @@ impl TransformerModel {
         self.stream.synchronize().unwrap();
         let sq: Vec<f32> = self.stream.clone_dtoh(&self.grad_norm_sq).unwrap();
         let global_norm = sq[0].max(0.0).sqrt();
-        let clip_scale = if global_norm > MAX_GRAD_NORM && global_norm.is_finite() {
+
+        // NaN/inf safety: if norm is not finite, zero all gradients and skip update.
+        let grads_finite = global_norm.is_finite();
+        if !grads_finite {
+            eprintln!("[WARN] global_grad_norm is not finite ({:?}); zeroing gradients and skipping update", global_norm);
+            macro_rules! zero_g_f16 { ($g:expr) => {{
+                let n = ($g).len();
+                if n > 0 { unsafe { self.stream.launch_builder(&self.fns.zero_f16).arg(&mut ($g)).arg(&(n as i32)).launch(cfg1d(n)).unwrap(); } }
+            }}}
+            macro_rules! zero_g_f32 { ($g:expr) => {{
+                let n = ($g).len();
+                if n > 0 { unsafe { self.stream.launch_builder(&self.fns.zero_f32).arg(&mut ($g)).arg(&(n as i32)).launch(cfg1d(n)).unwrap(); } }
+            }}}
+            zero_g_f32!(self.g_embed); zero_g_f32!(self.g_pos);
+            zero_g_f32!(self.g_ln_f_g); zero_g_f32!(self.g_ln_f_b);
+            for li in 0..nl {
+                zero_g_f16!(self.grads[li].g_w_qkv); zero_g_f16!(self.grads[li].g_w_out);
+                zero_g_f16!(self.grads[li].g_w_ff1); zero_g_f16!(self.grads[li].g_w_ff2);
+                zero_g_f32!(self.grads[li].g_b_qkv); zero_g_f32!(self.grads[li].g_b_out);
+                zero_g_f32!(self.grads[li].g_b_ff1); zero_g_f32!(self.grads[li].g_b_ff2);
+                zero_g_f32!(self.grads[li].g_ln1_g); zero_g_f32!(self.grads[li].g_ln1_b);
+                zero_g_f32!(self.grads[li].g_ln2_g); zero_g_f32!(self.grads[li].g_ln2_b);
+            }
+            self.stream.synchronize().unwrap();
+            return 0.0;
+        }
+
+        let clip_scale = if global_norm > MAX_GRAD_NORM {
             MAX_GRAD_NORM / global_norm
         } else {
             1.0
@@ -2501,45 +2649,52 @@ impl TransformerModel {
             }
         }
 
-        // ── ADAM UPDATE (all on GPU, f32 state for stability) ─────
-        macro_rules! adam16f32 { ($p:expr, $m:expr, $v:expr, $g:expr) => {{
-            let n = $p.len();
-            unsafe { self.stream.launch_builder(&self.fns.adam_f16)
-                .arg(&mut $p).arg(&mut $m).arg(&mut $v).arg(&$g)
+        // ── ADAM UPDATE (FP32 master weights, f16 working copies) ─────
+        // AdamW-style: update master fp32 copy, then copy back to f16 for forward.
+        macro_rules! adamw_master { ($p16:expr, $p32:expr, $m:expr, $v:expr, $g:expr) => {{
+            let n = $p32.len();
+            unsafe { self.stream.launch_builder(&self.fns.adam_f32_f32)
+                .arg(&mut $p32).arg(&mut $m).arg(&mut $v).arg(&$g)
                 .arg(&lr).arg(&0.9f32).arg(&0.999f32).arg(&eps).arg(&bc1).arg(&bc2).arg(&(n as i32))
+                .launch(cfg1d(n)).unwrap(); }
+            // copy updated master -> f16 working weight
+            unsafe { self.stream.launch_builder(&self.fns.f32_to_f16)
+                .arg(&$p32).arg(&mut $p16).arg(&(n as i32))
                 .launch(cfg1d(n)).unwrap(); }
         }}}
 
-        // Embed + pos (f16 params, f32 Adam state, f32 grads)
-        adam16f32!(self.embed,     self.m_embed,   self.v_embed,   self.g_embed);
-        adam16f32!(self.pos_embed, self.m_pos,     self.v_pos,     self.g_pos);
-        adam16f32!(self.ln_f_g,    self.m_ln_f_g,  self.v_ln_f_g,  self.g_ln_f_g);
-        adam16f32!(self.ln_f_b,    self.m_ln_f_b,  self.v_ln_f_b,  self.g_ln_f_b);
+        // Embed + pos + final norm
+        adamw_master!(self.embed,     self.embed_master,     self.m_embed,   self.v_embed,   self.g_embed);
+        adamw_master!(self.pos_embed, self.pos_embed_master, self.m_pos,     self.v_pos,     self.g_pos);
+        adamw_master!(self.ln_f_g,    self.ln_f_g_master,    self.m_ln_f_g,  self.v_ln_f_g,  self.g_ln_f_g);
+        adamw_master!(self.ln_f_b,    self.ln_f_b_master,    self.m_ln_f_b,  self.v_ln_f_b,  self.g_ln_f_b);
 
         for li in 0..nl {
             let lp = &mut self.layers[li] as *mut TransformerLayer;
             let gp = &mut self.grads[li] as *mut GpuLayerGrad;
             unsafe {
-                macro_rules! adam_w { ($w:ident, $m:ident, $v:ident, $g:ident) => {{
-                    let n = (*lp).$w.len();
-                    self.stream.launch_builder(&self.fns.adam_f16).arg(&mut (*lp).$w).arg(&mut (*lp).$m).arg(&mut (*lp).$v).arg(&(*gp).$g).arg(&lr).arg(&0.9f32).arg(&0.999f32).arg(&eps).arg(&bc1).arg(&bc2).arg(&(n as i32)).launch(cfg1d(n)).unwrap();
+                macro_rules! adam_w { ($w:ident, $w_m:ident, $m:ident, $v:ident, $g:ident) => {{
+                    let n = (*lp).$w_m.len();
+                    self.stream.launch_builder(&self.fns.adam_f32_f32).arg(&mut (*lp).$w_m).arg(&mut (*lp).$m).arg(&mut (*lp).$v).arg(&(*gp).$g).arg(&lr).arg(&0.9f32).arg(&0.999f32).arg(&eps).arg(&bc1).arg(&bc2).arg(&(n as i32)).launch(cfg1d(n)).unwrap();
+                    self.stream.launch_builder(&self.fns.f32_to_f16).arg(&(*lp).$w_m).arg(&mut (*lp).$w).arg(&(n as i32)).launch(cfg1d(n)).unwrap();
                 }}}
-                macro_rules! adam_b { ($w:ident, $m:ident, $v:ident, $g:ident) => {{
-                    let n = (*lp).$w.len();
-                    self.stream.launch_builder(&self.fns.adam_f16).arg(&mut (*lp).$w).arg(&mut (*lp).$m).arg(&mut (*lp).$v).arg(&(*gp).$g).arg(&lr).arg(&0.9f32).arg(&0.999f32).arg(&eps).arg(&bc1).arg(&bc2).arg(&(n as i32)).launch(cfg1d(n)).unwrap();
+                macro_rules! adam_b { ($w:ident, $w_m:ident, $m:ident, $v:ident, $g:ident) => {{
+                    let n = (*lp).$w_m.len();
+                    self.stream.launch_builder(&self.fns.adam_f32_f32).arg(&mut (*lp).$w_m).arg(&mut (*lp).$m).arg(&mut (*lp).$v).arg(&(*gp).$g).arg(&lr).arg(&0.9f32).arg(&0.999f32).arg(&eps).arg(&bc1).arg(&bc2).arg(&(n as i32)).launch(cfg1d(n)).unwrap();
+                    self.stream.launch_builder(&self.fns.f32_to_f16).arg(&(*lp).$w_m).arg(&mut (*lp).$w).arg(&(n as i32)).launch(cfg1d(n)).unwrap();
                 }}}
-                adam_w!(w_qkv, m_w_qkv, v_w_qkv, g_w_qkv);
-                adam_w!(w_out, m_w_out,  v_w_out,  g_w_out);
-                adam_w!(w_ff1, m_w_ff1,  v_w_ff1,  g_w_ff1);
-                adam_w!(w_ff2, m_w_ff2,  v_w_ff2,  g_w_ff2);
-                adam_b!(b_qkv, m_b_qkv, v_b_qkv, g_b_qkv);
-                adam_b!(b_out, m_b_out,  v_b_out,  g_b_out);
-                adam_b!(b_ff1, m_b_ff1,  v_b_ff1,  g_b_ff1);
-                adam_b!(b_ff2, m_b_ff2,  v_b_ff2,  g_b_ff2);
-                adam_b!(ln1_g, m_ln1_g,  v_ln1_g,  g_ln1_g);
-                adam_b!(ln1_b, m_ln1_b,  v_ln1_b,  g_ln1_b);
-                adam_b!(ln2_g, m_ln2_g,  v_ln2_g,  g_ln2_g);
-                adam_b!(ln2_b, m_ln2_b,  v_ln2_b,  g_ln2_b);
+                adam_w!(w_qkv, w_qkv_master, m_w_qkv, v_w_qkv, g_w_qkv);
+                adam_w!(w_out, w_out_master, m_w_out,  v_w_out,  g_w_out);
+                adam_w!(w_ff1, w_ff1_master, m_w_ff1,  v_w_ff1,  g_w_ff1);
+                adam_w!(w_ff2, w_ff2_master, m_w_ff2,  v_w_ff2,  g_w_ff2);
+                adam_b!(b_qkv, b_qkv_master, m_b_qkv, v_b_qkv, g_b_qkv);
+                adam_b!(b_out, b_out_master, m_b_out,  v_b_out,  g_b_out);
+                adam_b!(b_ff1, b_ff1_master, m_b_ff1,  v_b_ff1,  g_b_ff1);
+                adam_b!(b_ff2, b_ff2_master, m_b_ff2,  v_b_ff2,  g_b_ff2);
+                adam_b!(ln1_g, ln1_g_master, m_ln1_g,  v_ln1_g,  g_ln1_g);
+                adam_b!(ln1_b, ln1_b_master, m_ln1_b,  v_ln1_b,  g_ln1_b);
+                adam_b!(ln2_g, ln2_g_master, m_ln2_g,  v_ln2_g,  g_ln2_g);
+                adam_b!(ln2_b, ln2_b_master, m_ln2_b,  v_ln2_b,  g_ln2_b);
             }
         }
 
@@ -2589,6 +2744,12 @@ impl TransformerModel {
         push_f32!("output_norm.bias.m",   &self.m_ln_f_b);
         push_f32!("output_norm.bias.v",   &self.v_ln_f_b);
 
+        // Save FP32 master weights alongside f16 weights and Adam moments.
+        push_f32!("token_embd.weight_master",    &self.embed_master);
+        push_f32!("position_embd.weight_master", &self.pos_embed_master);
+        push_f32!("output_norm.weight_master",   &self.ln_f_g_master);
+        push_f32!("output_norm.bias_master",     &self.ln_f_b_master);
+
         for (i, l) in self.layers.iter().enumerate() {
             push_f16!(format!("blk.{}.attn_qkv.weight",   i), &l.w_qkv);
             push_f16!(format!("blk.{}.attn_qkv.bias",     i), &l.b_qkv);
@@ -2623,9 +2784,22 @@ impl TransformerModel {
             push_f32!(format!("blk.{}.attn_norm.bias.m",  i), &l.m_ln1_b);
             push_f32!(format!("blk.{}.attn_norm.bias.v",  i), &l.v_ln1_b);
             push_f32!(format!("blk.{}.ffn_norm.weight.m", i), &l.m_ln2_g);
-            push_f32!(format!("blk.{}.ffn_norm.weight.v", i), &l.m_ln2_g);
+            push_f32!(format!("blk.{}.ffn_norm.weight.v", i), &l.v_ln2_g);
             push_f32!(format!("blk.{}.ffn_norm.bias.m",   i), &l.m_ln2_b);
             push_f32!(format!("blk.{}.ffn_norm.bias.v",   i), &l.v_ln2_b);
+            // master weights
+            push_f32!(format!("blk.{}.attn_qkv.weight_master", i), &l.w_qkv_master);
+            push_f32!(format!("blk.{}.attn_qkv.bias_master",   i), &l.b_qkv_master);
+            push_f32!(format!("blk.{}.attn_out.weight_master", i), &l.w_out_master);
+            push_f32!(format!("blk.{}.attn_out.bias_master",   i), &l.b_out_master);
+            push_f32!(format!("blk.{}.ffn_up.weight_master",   i), &l.w_ff1_master);
+            push_f32!(format!("blk.{}.ffn_up.bias_master",     i), &l.b_ff1_master);
+            push_f32!(format!("blk.{}.ffn_down.weight_master", i), &l.w_ff2_master);
+            push_f32!(format!("blk.{}.ffn_down.bias_master",   i), &l.b_ff2_master);
+            push_f32!(format!("blk.{}.attn_norm.weight_master",i), &l.ln1_g_master);
+            push_f32!(format!("blk.{}.attn_norm.bias_master",  i), &l.ln1_b_master);
+            push_f32!(format!("blk.{}.ffn_norm.weight_master", i), &l.ln2_g_master);
+            push_f32!(format!("blk.{}.ffn_norm.bias_master",   i), &l.ln2_b_master);
         }
 
         let tok_json = tokenizer.to_json_string();
@@ -2638,8 +2812,17 @@ impl TransformerModel {
     }
 
     pub fn load_checkpoint(path: &str) -> anyhow::Result<(Self, crate::tokenizer::Tokenizer)> {
+        Self::load_checkpoint_internal(path, false)
+    }
+
+    /// Load checkpoint including optimizer state and FP32 master weights (for training resume).
+    pub fn load_checkpoint_for_training(path: &str) -> anyhow::Result<(Self, crate::tokenizer::Tokenizer)> {
+        Self::load_checkpoint_internal(path, true)
+    }
+
+    fn load_checkpoint_internal(path: &str, load_training_state: bool) -> anyhow::Result<(Self, crate::tokenizer::Tokenizer)> {
         use std::io::{Read, Seek, SeekFrom};
-        println!("Loading checkpoint: {}", path);
+        println!("Loading checkpoint: {} (training_state={})", path, load_training_state);
 
         let file = fs::File::open(path)?;
         let mut r = std::io::BufReader::with_capacity(8 * 1024 * 1024, file);
@@ -2750,16 +2933,37 @@ impl TransformerModel {
 
         load_f16!(model.embed,    "token_embd.weight");
         load_f16!(model.pos_embed,"position_embd.weight");
-        load_f32!(model.m_embed,  "token_embd.m");
-        load_f32!(model.v_embed,  "token_embd.v");
-        load_f32!(model.m_pos,    "position_embd.m");
-        load_f32!(model.v_pos,    "position_embd.v");
         load_f16!(model.ln_f_g,   "output_norm.weight");
         load_f16!(model.ln_f_b,   "output_norm.bias");
-        load_f32!(model.m_ln_f_g, "output_norm.weight.m");
-        load_f32!(model.v_ln_f_g, "output_norm.weight.v");
-        load_f32!(model.m_ln_f_b, "output_norm.bias.m");
-        load_f32!(model.v_ln_f_b, "output_norm.bias.v");
+        if load_training_state {
+            load_f32!(model.m_embed,  "token_embd.m");
+            load_f32!(model.v_embed,  "token_embd.v");
+            load_f32!(model.m_pos,    "position_embd.m");
+            load_f32!(model.v_pos,    "position_embd.v");
+            load_f32!(model.m_ln_f_g, "output_norm.weight.m");
+            load_f32!(model.v_ln_f_g, "output_norm.weight.v");
+            load_f32!(model.m_ln_f_b, "output_norm.bias.m");
+            load_f32!(model.v_ln_f_b, "output_norm.bias.v");
+            // FP32 master weights: if checkpoint lacks them (legacy), initialize from f16 weights.
+            let top_master_present = tensor_meta.contains_key("token_embd.weight_master");
+            if top_master_present {
+                load_f32!(model.embed_master,     "token_embd.weight_master");
+                load_f32!(model.pos_embed_master, "position_embd.weight_master");
+                load_f32!(model.ln_f_g_master,    "output_norm.weight_master");
+                load_f32!(model.ln_f_b_master,    "output_norm.bias_master");
+            } else {
+                // Copy f16 -> f32 master for legacy checkpoints.
+                let copy_f16_to_f32 = |s: &Arc<CudaStream>, src: &CudaSlice<f16>, dst: &mut CudaSlice<f32>| {
+                    let v_f16: Vec<f16> = s.clone_dtoh(src).unwrap();
+                    let v_f32: Vec<f32> = v_f16.iter().map(|x| x.to_f32()).collect();
+                    *dst = s.clone_htod(&v_f32).unwrap();
+                };
+                copy_f16_to_f32(&stream, &model.embed,     &mut model.embed_master);
+                copy_f16_to_f32(&stream, &model.pos_embed, &mut model.pos_embed_master);
+                copy_f16_to_f32(&stream, &model.ln_f_g,    &mut model.ln_f_g_master);
+                copy_f16_to_f32(&stream, &model.ln_f_b,    &mut model.ln_f_b_master);
+            }
+        }
 
         for i in 0..num_layers {
             load_f16!(model.layers[i].w_qkv, &format!("blk.{}.attn_qkv.weight",   i));
@@ -2794,10 +2998,67 @@ impl TransformerModel {
             load_f32!(model.layers[i].v_ln1_g, &format!("blk.{}.attn_norm.weight.v",i));
             load_f32!(model.layers[i].m_ln1_b, &format!("blk.{}.attn_norm.bias.m",  i));
             load_f32!(model.layers[i].v_ln1_b, &format!("blk.{}.attn_norm.bias.v",  i));
-            load_f32!(model.layers[i].m_ln2_g, &format!("blk.{}.ffn_norm.weight.m", i));
-            load_f32!(model.layers[i].v_ln2_g, &format!("blk.{}.ffn_norm.weight.v", i));
-            load_f32!(model.layers[i].m_ln2_b, &format!("blk.{}.ffn_norm.bias.m",   i));
-            load_f32!(model.layers[i].v_ln2_b, &format!("blk.{}.ffn_norm.bias.v",   i));
+            if load_training_state {
+                load_f32!(model.layers[i].m_w_qkv, &format!("blk.{}.attn_qkv.weight.m", i));
+                load_f32!(model.layers[i].v_w_qkv, &format!("blk.{}.attn_qkv.weight.v", i));
+                load_f32!(model.layers[i].m_b_qkv, &format!("blk.{}.attn_qkv.bias.m",   i));
+                load_f32!(model.layers[i].v_b_qkv, &format!("blk.{}.attn_qkv.bias.v",   i));
+                load_f32!(model.layers[i].m_w_out, &format!("blk.{}.attn_out.weight.m", i));
+                load_f32!(model.layers[i].v_w_out, &format!("blk.{}.attn_out.weight.v", i));
+                load_f32!(model.layers[i].m_b_out, &format!("blk.{}.attn_out.bias.m",   i));
+                load_f32!(model.layers[i].v_b_out, &format!("blk.{}.attn_out.bias.v",   i));
+                load_f32!(model.layers[i].m_w_ff1, &format!("blk.{}.ffn_up.weight.m",   i));
+                load_f32!(model.layers[i].v_w_ff1, &format!("blk.{}.ffn_up.weight.v",   i));
+                load_f32!(model.layers[i].m_b_ff1, &format!("blk.{}.ffn_up.bias.m",     i));
+                load_f32!(model.layers[i].v_b_ff1, &format!("blk.{}.ffn_up.bias.v",     i));
+                load_f32!(model.layers[i].m_w_ff2, &format!("blk.{}.ffn_down.weight.m", i));
+                load_f32!(model.layers[i].v_w_ff2, &format!("blk.{}.ffn_down.weight.v", i));
+                load_f32!(model.layers[i].m_b_ff2, &format!("blk.{}.ffn_down.bias.m",   i));
+                load_f32!(model.layers[i].v_b_ff2, &format!("blk.{}.ffn_down.bias.v",   i));
+                load_f32!(model.layers[i].m_ln1_g, &format!("blk.{}.attn_norm.weight.m",i));
+                load_f32!(model.layers[i].v_ln1_g, &format!("blk.{}.attn_norm.weight.v",i));
+                load_f32!(model.layers[i].m_ln1_b, &format!("blk.{}.attn_norm.bias.m",  i));
+                load_f32!(model.layers[i].v_ln1_b, &format!("blk.{}.attn_norm.bias.v",  i));
+                load_f32!(model.layers[i].m_ln2_g, &format!("blk.{}.ffn_norm.weight.m", i));
+                load_f32!(model.layers[i].v_ln2_g, &format!("blk.{}.ffn_norm.weight.v", i));
+                load_f32!(model.layers[i].m_ln2_b, &format!("blk.{}.ffn_norm.bias.m",   i));
+                load_f32!(model.layers[i].v_ln2_b, &format!("blk.{}.ffn_norm.bias.v",   i));
+                // master weights: fall back to f16 weights if master not present (legacy checkpoints)
+                let master_present = tensor_meta.contains_key(&format!("blk.{}.attn_qkv.weight_master", i));
+                if master_present {
+                    load_f32!(model.layers[i].w_qkv_master, &format!("blk.{}.attn_qkv.weight_master", i));
+                    load_f32!(model.layers[i].b_qkv_master, &format!("blk.{}.attn_qkv.bias_master",   i));
+                    load_f32!(model.layers[i].w_out_master, &format!("blk.{}.attn_out.weight_master", i));
+                    load_f32!(model.layers[i].b_out_master, &format!("blk.{}.attn_out.bias_master",   i));
+                    load_f32!(model.layers[i].w_ff1_master, &format!("blk.{}.ffn_up.weight_master",   i));
+                    load_f32!(model.layers[i].b_ff1_master, &format!("blk.{}.ffn_up.bias_master",     i));
+                    load_f32!(model.layers[i].w_ff2_master, &format!("blk.{}.ffn_down.weight_master", i));
+                    load_f32!(model.layers[i].b_ff2_master, &format!("blk.{}.ffn_down.bias_master",   i));
+                    load_f32!(model.layers[i].ln1_g_master, &format!("blk.{}.attn_norm.weight_master",i));
+                    load_f32!(model.layers[i].ln1_b_master, &format!("blk.{}.attn_norm.bias_master",  i));
+                    load_f32!(model.layers[i].ln2_g_master, &format!("blk.{}.ffn_norm.weight_master", i));
+                    load_f32!(model.layers[i].ln2_b_master, &format!("blk.{}.ffn_norm.bias_master",   i));
+                } else {
+                    let copy_f16_to_f32 = |s: &Arc<CudaStream>, src: &CudaSlice<f16>, dst: &mut CudaSlice<f32>| {
+                        let v_f16: Vec<f16> = s.clone_dtoh(src).unwrap();
+                        let v_f32: Vec<f32> = v_f16.iter().map(|x| x.to_f32()).collect();
+                        *dst = s.clone_htod(&v_f32).unwrap();
+                    };
+                    let l = &mut model.layers[i];
+                    copy_f16_to_f32(&stream, &l.w_qkv, &mut l.w_qkv_master);
+                    copy_f16_to_f32(&stream, &l.b_qkv, &mut l.b_qkv_master);
+                    copy_f16_to_f32(&stream, &l.w_out, &mut l.w_out_master);
+                    copy_f16_to_f32(&stream, &l.b_out, &mut l.b_out_master);
+                    copy_f16_to_f32(&stream, &l.w_ff1, &mut l.w_ff1_master);
+                    copy_f16_to_f32(&stream, &l.b_ff1, &mut l.b_ff1_master);
+                    copy_f16_to_f32(&stream, &l.w_ff2, &mut l.w_ff2_master);
+                    copy_f16_to_f32(&stream, &l.b_ff2, &mut l.b_ff2_master);
+                    copy_f16_to_f32(&stream, &l.ln1_g, &mut l.ln1_g_master);
+                    copy_f16_to_f32(&stream, &l.ln1_b, &mut l.ln1_b_master);
+                    copy_f16_to_f32(&stream, &l.ln2_g, &mut l.ln2_g_master);
+                    copy_f16_to_f32(&stream, &l.ln2_b, &mut l.ln2_b_master);
+                }
+            }
         }
 
         let tokenizer = if let Some(json) = tokenizer_json {

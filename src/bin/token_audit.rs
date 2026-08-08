@@ -1,12 +1,12 @@
 #![recursion_limit = "256"]
 
-use aria::tokenizer::Tokenizer;
 use std::collections::HashMap;
 
 fn main() -> anyhow::Result<()> {
-    let tokenizer_path = "aria json/aria_tokenizer.json";
-    let t1 = Tokenizer::load(tokenizer_path)?;
-    let t2 = Tokenizer::load(tokenizer_path)?;
+    let checkpoint_path = "aria json/aria_checkpoint.gguf";
+    println!("Loading tokenizer from embedded GGUF checkpoint: {}", checkpoint_path);
+    let (_, t1) = aria::transformer_cuda::TransformerModel::load_checkpoint(checkpoint_path)?;
+    let (_, t2) = aria::transformer_cuda::TransformerModel::load_checkpoint(checkpoint_path)?;
 
     println!("vocab_size load1 = {}", t1.vocab_size());
     println!("vocab_size load2 = {}", t2.vocab_size());
@@ -32,7 +32,7 @@ fn main() -> anyhow::Result<()> {
         "пока, до встречи!",
     ];
     for s in &samples {
-        let mut enc = Tokenizer::load(tokenizer_path)?;
+        let (_, mut enc) = aria::transformer_cuda::TransformerModel::load_checkpoint(checkpoint_path)?;
         let ids = enc.encode(s);
         let dec = enc.decode(&ids);
         println!("in:  {}", s);
