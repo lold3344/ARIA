@@ -87,7 +87,9 @@ fn main() -> anyhow::Result<()> {
         println!("Loading checkpoint for continued training...");
         let (mut m, mut t) = TransformerModel::load_checkpoint(checkpoint_path)?;
         println!("Checkpoint loaded. Continuing training...\n");
-        crate::transformer_cuda::pretrain_from_files(&mut m, &mut t, data_dir, checkpoint_path).ok();
+        // In interactive continue mode, use all available datasets.
+        let all_files = crate::transformer_cuda::list_jsonl_files(data_dir).unwrap_or_default();
+        crate::transformer_cuda::pretrain_from_files(&mut m, &mut t, data_dir, &all_files, checkpoint_path).ok();
         m.save_checkpoint(checkpoint_path, &t).ok();
         (m, t)
     } else {
@@ -330,7 +332,8 @@ fn train_fresh(tokenizer: &mut Tokenizer, data_dir: &str, checkpoint_path: &str)
     let mut model = TransformerModel::new(actual_vocab, 896, 14, 20, 3584, 2048);
 
     println!("Pre-training...");
-    crate::transformer_cuda::pretrain_from_files(&mut model, tokenizer, data_dir, checkpoint_path).ok();
+    let all_files = crate::transformer_cuda::list_jsonl_files(data_dir).unwrap_or_default();
+    crate::transformer_cuda::pretrain_from_files(&mut model, tokenizer, data_dir, &all_files, checkpoint_path).ok();
 
     println!("Training complete.\n");
     Ok(model)

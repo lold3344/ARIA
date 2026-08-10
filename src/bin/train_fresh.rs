@@ -64,6 +64,48 @@ fn feed_tokenizer(data_dir: &str, tokenizer: &mut Tokenizer, max_lines: usize) -
     Ok(())
 }
 
+fn prompt_dataset_selection(files: &[std::path::PathBuf]) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    use std::io::{self, Write};
+
+    if files.is_empty() {
+        anyhow::bail!("No .jsonl files found");
+    }
+
+    println!("Found {} .jsonl file(s):", files.len());
+    for (i, p) in files.iter().enumerate() {
+        println!("  {:2} - {}", i + 1, p.display());
+    }
+    println!("\nChoose datasets to use:");
+    println!("  - enter numbers separated by spaces (e.g. \"1 3 7\")");
+    println!("  - or type \"all\" to use every file");
+    print!("> ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let input = input.trim();
+
+    if input.eq_ignore_ascii_case("all") || input.is_empty() {
+        return Ok(files.to_vec());
+    }
+
+    let mut selected = Vec::new();
+    for token in input.split_whitespace() {
+        let idx: usize = token.parse()
+            .map_err(|_| anyhow::anyhow!("'{}' is not a valid number", token))?;
+        if idx == 0 || idx > files.len() {
+            anyhow::bail!("number {} out of range (1..{})", idx, files.len());
+        }
+        selected.push(files[idx - 1].clone());
+    }
+
+    if selected.is_empty() {
+        anyhow::bail!("No datasets selected");
+    }
+
+    Ok(selected)
+}
+
 fn main() -> anyhow::Result<()> {
     let data_dir = "data base";
     let checkpoint_path = "aria json/aria_checkpoint.gguf";
@@ -86,19 +128,20 @@ fn main() -> anyhow::Result<()> {
     let vocab_size = tokenizer.vocab_size();
     println!("Vocab size: {}\n", vocab_size);
 
-    // Remove stale cache
-    let cache_path = format!("{}/sequences_cache_transformer_v{}_len{}.bin",
-                             data_dir, vocab_size, max_seq);
-    if std::path::Path::new(&cache_path).exists() {
-        println!("Removing stale cache: {}", cache_path);
-        std::fs::remove_file(&cache_path)?;
-    }
+    // List and choose datasets
+    let all_files = list_jsonl_files(data_dir)?;
+    let selected_files = prompt_dataset_selection(&all_files)?;
+    println!("Selected {} dataset(s):", selected_files.len());
+    for p in &selected_files { println!("  - {}", p.display()); }
+    println!();
 
     println!("Initializing fresh Transformer model...");
     let mut model = TransformerModel::new(vocab_size, d_model, num_heads, num_layers, ffn_dim, max_seq);
 
     println!("Starting supervised dialog training...");
-    aria::transformer_cuda::pretrain_from_files(&mut model, &mut tokenizer, data_dir, checkpoint_path)?;
+    aria::transformer_cuda::pretrain_from_files(
+        &mut model, &mut tokenizer, data_dir, &selected_files, checkpoint_path
+    )?;
 
     println!("\nSaving final checkpoint...");
     model.save_checkpoint(checkpoint_path, &tokenizer)?;

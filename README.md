@@ -121,13 +121,25 @@ On first launch, ARIA will:
 
 .\target\release\train_fresh.exe "data base"
 
-Reads JSONL files from `data base/`. Saves GGUF checkpoint after each epoch. Use `"data base"` as the argument (with quotes because of the space).
+Reads JSONL files from `data base/`. At startup you will see a numbered list of datasets and a prompt:
+
+```
+Choose datasets to use:
+  - enter numbers separated by spaces (e.g. "1 3 7")
+  - or type "all" to use every file
+>
+```
+
+- Type numbers separated by spaces to train only on selected files.
+- Type `all` (or press Enter) to use every `.jsonl` file.
+
+Saves GGUF checkpoint after each epoch.
 
 ### Continue training (resume from checkpoint)
 
 .\target\release\train_fresh.exe "data base"
 
-`train_fresh.exe` automatically resumes from `aria json/aria_checkpoint.gguf` when the checkpoint exists, loading optimizer state and FP32 master weights.
+`train_fresh.exe` automatically resumes from `aria json/aria_checkpoint.gguf` when the checkpoint exists, loading optimizer state and FP32 master weights. Dataset selection works the same way.
 
 ### Supervised Fine-Tuning (SFT)
 
@@ -166,26 +178,30 @@ Use USER / ASSISTANT tokens for dialog fine-tuning. The tokenizer is trained fro
 |---|---|---|
 | ARIA_LR | Peak learning rate | 0.0003 |
 | ARIA_WARMUP | Warmup steps | 1000 |
-| ARIA_MAX_SEQS | Sequences per epoch | 500,000 |
+| ARIA_MAX_SEQS | Sequences per epoch (omit to use all selected sequences) | -- |
 | ARIA_EPOCHS | Number of epochs | 5 |
 | ARIA_VOCAB_LINES | Lines for tokenizer training | 500,000 |
 | ARIA_CONTINUE_TRAIN | Resume from checkpoint in interactive mode | -- |
+| ARIA_CHECKPOINT_EVERY | Intermediate checkpoint every N batches | 80000 |
 
 Gradient clipping is always enabled (norm=1.0) with NaN/inf fallback.
 
+Intermediate checkpoints are saved as `aria json/aria_checkpoint.gguf.<N>_batches.gguf`.
+
 LR schedule: linear warmup to ARIA_LR over ARIA_WARMUP steps, then cosine decay to 0.3x ARIA_LR.
 
-Quick run:
-Set-Item Env:ARIA_MAX_SEQS 1000
+Quick run on selected datasets (e.g. only wiki + sberquad):
+# at prompt type: 14 17
 Set-Item Env:ARIA_EPOCHS 1
 .\target\release\train_fresh.exe "data base"
 
-Full run (RTX 4060, batch=512, micro-batch=4, max_seq_len=512, ~170 seq/s):
-Set-Item Env:ARIA_MAX_SEQS 500000
+Full run on all datasets (RTX 4060, batch=512, micro-batch=4, max_seq_len=512, ~170 seq/s):
+# at prompt type: all
 Set-Item Env:ARIA_EPOCHS 5
 .\target\release\train_fresh.exe "data base"
 
 Smoke test (used for stability validation):
+# at prompt type: all
 Set-Item Env:ARIA_MAX_SEQS 5000
 Set-Item Env:ARIA_EPOCHS 5
 .\target\release\train_fresh.exe "data base"

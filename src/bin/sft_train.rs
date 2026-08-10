@@ -9,7 +9,8 @@ fn main() -> anyhow::Result<()> {
     let (mut model, mut tokenizer) = TransformerModel::load_checkpoint(model_path)?;
 
     println!("Starting Transformer fine-tuning from checkpoint...");
-    aria::transformer_cuda::pretrain_from_files(&mut model, &mut tokenizer, data_dir, model_path)?;
+    let all_files = aria::transformer_cuda::list_jsonl_files(data_dir)?;
+    aria::transformer_cuda::pretrain_from_files(&mut model, &mut tokenizer, data_dir, &all_files, model_path)?;
 
     println!("\nFine-tuning complete. Running greedy test...");
     let prompts = [

@@ -709,7 +709,7 @@ fn gemm_batched_f16(blas: &CudaBlas,
 //  Constructor helpers
 // ─────────────────────────────────────────────────────────────
 fn make_layer(stream: &Arc<CudaStream>, d: usize, num_layers: usize, ff: usize) -> TransformerLayer {
-    // Depth-dependent residual scaling: GPT-2 style 1/sqrt(2*L) on output projections.
+    // Depth-dependent residual scaling: 1/sqrt(2*L) on output projections.
     let depth_scale = (1.0f64 / ((2.0f64 * num_layers as f64).sqrt())) as f32;
     let s_qkv = (1.0 / (d as f64).sqrt()) as f32;
     let s_out = (1.0 / (d as f64).sqrt()) as f32 * depth_scale;
@@ -2098,8 +2098,10 @@ impl TransformerModel {
             }
 
             // Logits: x_norm[nt,D] @ embed^T → logits[nt,V]
+            // Scale logits by 1/sqrt(d) to stabilize tied-embeddings training.
+            let logit_scale = f16::from_f32(1.0f32 / (d as f32).sqrt());
             gemm(&self.blas, &self.x_norm_buf, &self.embed, &mut self.logits_buf,
-                 nt, d, v, false, true, one, f16::from_f32(0.0));
+                 nt, d, v, false, true, logit_scale, f16::from_f32(0.0));
 
             // CE loss + d_logits for all nt positions (512 threads for better vocab coverage)
             unsafe {
@@ -2115,8 +2117,10 @@ impl TransformerModel {
 
             // ── BACKWARD PASS ────────────────────────────────────────
             // Tied embed grad from output head: g_embed += d_logits^T @ x_norm
-            // x_norm_buf currently holds x_norm (final LN output) — use it before overwrite.
+            // x_norm_buf currently holds final LN output — use it before overwrite.
             // g_embed_head_f16[v,D] += d_logits[nt,v]^T @ x_norm[nt,D]  → [v, D]
+            // The forward pass applied alpha=logit_scale to the logits GEMM, so cuBLAS
+            // accumulates the correct scaled gradient automatically.
             {
                 unsafe {
                     gemm(&self.blas, &self.d_logits, &self.x_norm_buf, &mut self.g_embed_head_f16,
@@ -3241,12 +3245,13 @@ pub fn pretrain_from_files(
     model: &mut TransformerModel,
     tokenizer: &mut Tokenizer,
     data_dir: &str,
+    selected_files: &[std::path::PathBuf],
     checkpoint_path: &str,
 ) -> anyhow::Result<()> {
     let lr: f32 = std::env::var("ARIA_LR")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(LEARNING_RATE);
-    let max_seqs: usize = std::env::var("ARIA_MAX_SEQS")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(MAX_SEQS_PER_EPOCH);
+    let max_seqs: Option<usize> = std::env::var("ARIA_MAX_SEQS")
+        .ok().and_then(|s| s.parse().ok());
     let epochs: usize = std::env::var("ARIA_EPOCHS")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(PRETRAIN_EPOCHS);
     let warmup_steps: usize = std::env::var("ARIA_WARMUP")
@@ -3255,20 +3260,28 @@ pub fn pretrain_from_files(
     let max_len    = MAX_TOKENS_PER_SEQ;
     let min_len    = MIN_TOKENS_PER_SEQ;
 
-    println!("LR: {lr}  Epochs: {epochs}  Batch: {batch_size}  SeqLen: {max_len}  MaxSeqs: {max_seqs}  Warmup: {warmup_steps}");
+    let max_seqs_str = max_seqs.map(|n| n.to_string()).unwrap_or_else(|| "all".to_string());
+    println!("LR: {lr}  Epochs: {epochs}  Batch: {batch_size}  SeqLen: {max_len}  MaxSeqs: {max_seqs_str}  Warmup: {warmup_steps}");
 
-    // Load or build sequence cache + index
-    let cache_path = format!("{}/sequences_cache_transformer_v{}_len{}.bin",
-                             data_dir, tokenizer.vocab_size(), max_len);
+    // Cache name depends on selected files so changing the dataset set rebuilds the cache.
+    let file_hash = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        for p in selected_files { p.hash(&mut h); }
+        h.finish()
+    };
+    let cache_path = format!("{}/sequences_cache_transformer_v{}_len{}_set{:016x}.bin",
+                             data_dir, tokenizer.vocab_size(), max_len, file_hash);
     let index_path = format!("{}.idx", cache_path);
 
     // Build cache+index if missing (streams directly to disk — no RAM spike)
     if !std::path::Path::new(&cache_path).exists() || !std::path::Path::new(&index_path).exists() {
-        build_seq_cache_streaming(tokenizer, data_dir, &cache_path, &index_path, max_len, min_len, max_seqs)?;
+        build_seq_cache_streaming(tokenizer, selected_files, &cache_path, &index_path, max_len, min_len, max_seqs)?;
     }
 
     let offsets = load_seq_index(&index_path)?;
-    let n = offsets.len().min(max_seqs);
+    let n = if let Some(cap) = max_seqs { offsets.len().min(cap) } else { offsets.len() };
     println!("Sequences: {}", n);
 
     let mut rng = rand::thread_rng();
@@ -3280,7 +3293,7 @@ pub fn pretrain_from_files(
     seq_by_offset.sort_by_key(|&i| offsets[i]);
 
     let mut global_batches = 0usize;
-    const CHECKPOINT_EVERY_BATCHES: usize = 50_000;
+    const CHECKPOINT_EVERY_BATCHES: usize = 80_000;
 
     for epoch in 0..epochs {
         let mut epoch_loss = 0.0f32;
@@ -3372,18 +3385,8 @@ fn build_seq_cache(tok: &mut Tokenizer, data_dir: &str, max_len: usize, min_len:
     panic!("build_seq_cache should not be called directly — use build_seq_cache_streaming");
 }
 
-fn build_seq_cache_streaming(
-    tok: &mut Tokenizer,
-    data_dir: &str,
-    cache_path: &str,
-    index_path: &str,
-    max_len: usize,
-    min_len: usize,
-    max_seqs: usize,
-) -> anyhow::Result<usize> {
-    use std::io::{BufRead, Write, Seek, SeekFrom};
-
-    let mut files: Vec<std::path::PathBuf> = Vec::new();
+pub fn list_jsonl_files(data_dir: &str) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    let mut files = Vec::new();
     match fs::read_dir(data_dir) {
         Ok(rd) => {
             for entry in rd.flatten() {
@@ -3396,11 +3399,24 @@ fn build_seq_cache_streaming(
         Err(e) => anyhow::bail!("Cannot read {}: {}", data_dir, e),
     }
     files.sort();
+    Ok(files)
+}
 
-    if files.is_empty() { anyhow::bail!("No .jsonl files found in {}", data_dir); }
+fn build_seq_cache_streaming(
+    tok: &mut Tokenizer,
+    files: &[std::path::PathBuf],
+    cache_path: &str,
+    index_path: &str,
+    max_len: usize,
+    min_len: usize,
+    max_seqs: Option<usize>,
+) -> anyhow::Result<usize> {
+    use std::io::{BufRead, Write, Seek, SeekFrom};
+
+    if files.is_empty() { anyhow::bail!("No .jsonl files selected"); }
 
     println!("Building sequence cache (streaming) from {} files:", files.len());
-    for p in &files { println!("  - {}", p.display()); }
+    for p in files { println!("  - {}", p.display()); }
 
     let mut cache_w = std::io::BufWriter::new(fs::File::create(cache_path)?);
     let mut idx_w   = std::io::BufWriter::new(fs::File::create(index_path)?);
@@ -3411,14 +3427,14 @@ fn build_seq_cache_streaming(
 
     let mut count = 0usize;
 
-    'outer: for path in &files {
+    'outer: for path in files {
         let f = match fs::File::open(path) {
             Ok(f) => f,
             Err(e) => { eprintln!("Warning: cannot open {}: {}", path.display(), e); continue; }
         };
         let reader = std::io::BufReader::new(f);
         for line in reader.lines() {
-            if count >= max_seqs { break 'outer; }
+            if let Some(cap) = max_seqs { if count >= cap { break 'outer; } }
             let line = match line { Ok(l) => l, Err(_) => continue };
             let line = line.trim();
             if line.is_empty() { continue; }
