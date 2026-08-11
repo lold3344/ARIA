@@ -28,6 +28,15 @@ panic = "abort"
 [profile.dev]
 opt-level = 2
 
+[features]
+default = []
+train_debug = []
+
 [[bin]]
 name = "aria"
 path = "src/main.rs"
+
+[[bin]]
+name = "train_debug"
+path = "src/bin/train_debug.rs"
+required-features = ["train_debug"]

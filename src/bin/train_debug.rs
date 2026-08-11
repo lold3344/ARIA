@@ -121,7 +121,7 @@ fn main() -> anyhow::Result<()> {
     let vocab_lines: usize = std::env::var("ARIA_VOCAB_LINES")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(2_000_000);
 
-    println!("Building vocabulary from dialog file (max {} records)...", vocab_lines);
+    println!("[train_debug] Building vocabulary from dialog file (max {} records)...", vocab_lines);
     let mut tokenizer = Tokenizer::new();
     feed_tokenizer(data_dir, &mut tokenizer, vocab_lines)?;
     tokenizer.freeze();
@@ -141,19 +141,19 @@ fn main() -> anyhow::Result<()> {
     let (_, _, n) = aria::transformer_cuda::prepare_seq_cache(
         &mut tokenizer, data_dir, &selected_files, max_seq, 2, max_seqs
     )?;
-    println!("Cache ready: {} sequences\n", n);
+    println!("[train_debug] Cache ready: {} sequences\n", n);
 
-    println!("Initializing fresh Transformer model...");
+    println!("[train_debug] Initializing fresh Transformer model...");
     let mut model = TransformerModel::new(vocab_size, d_model, num_heads, num_layers, ffn_dim, max_seq);
 
-    println!("Starting supervised dialog training...");
+    println!("[train_debug] Starting supervised dialog training with gradient diagnostics...");
     aria::transformer_cuda::pretrain_from_files(
         &mut model, &mut tokenizer, data_dir, &selected_files, checkpoint_path
     )?;
 
-    println!("\nSaving final checkpoint...");
+    println!("\n[train_debug] Saving final checkpoint...");
     model.save_checkpoint(checkpoint_path, &tokenizer)?;
 
-    println!("Done.");
+    println!("[train_debug] Done.");
     Ok(())
 }

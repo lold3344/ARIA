@@ -1202,6 +1202,56 @@ impl TransformerModel {
         (logits, kv)
     }
 
+    /// Diagnostic helper: find which gradient tensor contains non-finite values.
+    #[cfg(feature = "train_debug")]
+    pub fn diagnose_inf_grad(&self, ctx: &str) {
+        let nl = self.num_layers;
+        let check_f16 = |name: &str, buf: &CudaSlice<f16>| {
+            let v: Vec<f16> = self.stream.clone_dtoh(buf).unwrap();
+            let mut inf_n = 0usize; let mut nan_n = 0usize; let mut max_v = 0.0f32;
+            for &x in &v {
+                let fx = x.to_f32();
+                if fx.is_infinite() { inf_n += 1; }
+                if fx.is_nan() { nan_n += 1; }
+                max_v = max_v.max(fx.abs());
+            }
+            if inf_n > 0 || nan_n > 0 {
+                eprintln!("[DIAG][{}] {}: f16 len={} inf={} nan={} max_abs={}", ctx, name, v.len(), inf_n, nan_n, max_v);
+            }
+        };
+        let check_f32 = |name: &str, buf: &CudaSlice<f32>| {
+            let v: Vec<f32> = self.stream.clone_dtoh(buf).unwrap();
+            let mut inf_n = 0usize; let mut nan_n = 0usize; let mut max_v = 0.0f32;
+            for &x in &v {
+                if x.is_infinite() { inf_n += 1; }
+                if x.is_nan() { nan_n += 1; }
+                max_v = max_v.max(x.abs());
+            }
+            if inf_n > 0 || nan_n > 0 {
+                eprintln!("[DIAG][{}] {}: f32 len={} inf={} nan={} max_abs={}", ctx, name, v.len(), inf_n, nan_n, max_v);
+            }
+        };
+        check_f32("g_embed", &self.g_embed);
+        check_f32("g_pos",   &self.g_pos);
+        check_f32("g_ln_f_g", &self.g_ln_f_g);
+        check_f32("g_ln_f_b", &self.g_ln_f_b);
+        for li in 0..nl {
+            let lname = format!("L{}", li);
+            check_f16(&format!("{} g_w_qkv", lname), &self.grads[li].g_w_qkv);
+            check_f16(&format!("{} g_w_out", lname), &self.grads[li].g_w_out);
+            check_f16(&format!("{} g_w_ff1", lname), &self.grads[li].g_w_ff1);
+            check_f16(&format!("{} g_w_ff2", lname), &self.grads[li].g_w_ff2);
+            check_f32(&format!("{} g_b_qkv", lname), &self.grads[li].g_b_qkv);
+            check_f32(&format!("{} g_b_out", lname), &self.grads[li].g_b_out);
+            check_f32(&format!("{} g_b_ff1", lname), &self.grads[li].g_b_ff1);
+            check_f32(&format!("{} g_b_ff2", lname), &self.grads[li].g_b_ff2);
+            check_f32(&format!("{} g_ln1_g", lname), &self.grads[li].g_ln1_g);
+            check_f32(&format!("{} g_ln1_b", lname), &self.grads[li].g_ln1_b);
+            check_f32(&format!("{} g_ln2_g", lname), &self.grads[li].g_ln2_g);
+            check_f32(&format!("{} g_ln2_b", lname), &self.grads[li].g_ln2_b);
+        }
+    }
+
     // Single-step inference using KV-cache
     pub fn step(&self, token: usize, kv: &KVCache) -> (Vec<f32>, KVCache) {
         let d = self.d_model;
@@ -2586,6 +2636,8 @@ impl TransformerModel {
         let grads_finite = global_norm.is_finite();
         if !grads_finite {
             eprintln!("[WARN] global_grad_norm is not finite ({:?}); zeroing gradients and skipping update", global_norm);
+            #[cfg(feature = "train_debug")]
+            self.diagnose_inf_grad("apply_gradients");
             macro_rules! zero_g_f16 { ($g:expr) => {{
                 let n = ($g).len();
                 if n > 0 { unsafe { self.stream.launch_builder(&self.fns.zero_f16).arg(&mut ($g)).arg(&(n as i32)).launch(cfg1d(n)).unwrap(); } }
@@ -3263,22 +3315,9 @@ pub fn pretrain_from_files(
     let max_seqs_str = max_seqs.map(|n| n.to_string()).unwrap_or_else(|| "all".to_string());
     println!("LR: {lr}  Epochs: {epochs}  Batch: {batch_size}  SeqLen: {max_len}  MaxSeqs: {max_seqs_str}  Warmup: {warmup_steps}");
 
-    // Cache name depends on selected files so changing the dataset set rebuilds the cache.
-    let file_hash = {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut h = DefaultHasher::new();
-        for p in selected_files { p.hash(&mut h); }
-        h.finish()
-    };
-    let cache_path = format!("{}/sequences_cache_transformer_v{}_len{}_set{:016x}.bin",
-                             data_dir, tokenizer.vocab_size(), max_len, file_hash);
-    let index_path = format!("{}.idx", cache_path);
-
-    // Build cache+index if missing (streams directly to disk — no RAM spike)
-    if !std::path::Path::new(&cache_path).exists() || !std::path::Path::new(&index_path).exists() {
-        build_seq_cache_streaming(tokenizer, selected_files, &cache_path, &index_path, max_len, min_len, max_seqs)?;
-    }
+    let (cache_path, index_path, n) = prepare_seq_cache(
+        tokenizer, data_dir, selected_files, max_len, min_len, max_seqs
+    )?;
 
     let offsets = load_seq_index(&index_path)?;
     let n = if let Some(cap) = max_seqs { offsets.len().min(cap) } else { offsets.len() };
@@ -3286,6 +3325,8 @@ pub fn pretrain_from_files(
 
     let mut rng = rand::thread_rng();
     let n_batches = (n + batch_size - 1) / batch_size;
+    let total_steps = epochs * n_batches;
+    let warmup_steps = warmup_steps.min(total_steps / 4).max(100);
 
     // Pre-sort all offsets once for near-sequential disk access each epoch.
     // This array only stores indices sorted by file offset — O(n log n) once.
@@ -3320,7 +3361,6 @@ pub fn pretrain_from_files(
             }
             if batch_seqs.is_empty() { continue; }
 
-            let total_steps = epochs * n_batches;
             let current_step = epoch * n_batches + step;
             let step_lr = if current_step < warmup_steps {
                 lr * (current_step as f32 + 1.0) / warmup_steps as f32
@@ -3330,6 +3370,11 @@ pub fn pretrain_from_files(
                 let cos = (std::f32::consts::PI * progress).cos();
                 lr * (0.3 + 0.7 * (cos * 0.5 + 0.5))
             };
+
+            #[cfg(feature = "train_debug")]
+            if !step_lr.is_finite() {
+                eprintln!("[train_debug] non-finite lr at step {current_step}, warmup={warmup_steps}, total={total_steps}");
+            }
 
             let loss = model.train_batch_masked(&batch_seqs, &batch_masks, step_lr);
             epoch_loss += loss;
@@ -3385,6 +3430,59 @@ fn build_seq_cache(tok: &mut Tokenizer, data_dir: &str, max_len: usize, min_len:
     panic!("build_seq_cache should not be called directly — use build_seq_cache_streaming");
 }
 
+/// Build or verify the sequence cache before allocating the CUDA model.
+/// Returns `(cache_path, index_path, total_sequences)`.
+pub fn prepare_seq_cache(
+    tokenizer: &mut Tokenizer,
+    data_dir: &str,
+    selected_files: &[std::path::PathBuf],
+    max_len: usize,
+    min_len: usize,
+    max_seqs: Option<usize>,
+) -> anyhow::Result<(String, String, usize)> {
+    // Cache name depends on selected files so changing the dataset set rebuilds the cache.
+    let file_hash = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        for p in selected_files { p.hash(&mut h); }
+        h.finish()
+    };
+    let vocab_size = tokenizer.vocab_size();
+    let cache_path = format!("{}/sequences_cache_transformer_v{}_len{}_set{:016x}.bin",
+                             data_dir, vocab_size, max_len, file_hash);
+    let index_path = format!("{}.idx", cache_path);
+
+    // Build cache+index if missing or if the cache header count is zero (incomplete).
+    let cache_exists_and_valid = {
+        let cache_path = cache_path.clone();
+        move || -> bool {
+            if !std::path::Path::new(&cache_path).exists() || !std::path::Path::new(&format!("{}.idx", cache_path)).exists() {
+                return false;
+            }
+            if let Ok(file) = fs::File::open(&cache_path) {
+                let mut f = std::io::BufReader::new(file);
+                let mut buf = [0u8; 8];
+                if std::io::Read::read_exact(&mut f, &mut buf).is_ok() {
+                    let n = u64::from_le_bytes(buf);
+                    return n > 0;
+                }
+            }
+            false
+        }
+    };
+
+    if !cache_exists_and_valid() {
+        let _ = fs::remove_file(&cache_path);
+        let _ = fs::remove_file(&index_path);
+        build_seq_cache_streaming(tokenizer, selected_files, &cache_path, &index_path, max_len, min_len, max_seqs)?;
+    }
+
+    let offsets = load_seq_index(&index_path)?;
+    let n = offsets.len();
+    Ok((cache_path, index_path, n))
+}
+
 pub fn list_jsonl_files(data_dir: &str) -> anyhow::Result<Vec<std::path::PathBuf>> {
     let mut files = Vec::new();
     match fs::read_dir(data_dir) {
@@ -3426,6 +3524,10 @@ fn build_seq_cache_streaming(
     idx_w.write_all(&0u64.to_le_bytes())?;
 
     let mut count = 0usize;
+    let mut lines_read = 0usize;
+    let mut empty_text = 0usize;
+    let mut wrong_len = 0usize;
+    let mut parse_err = 0usize;
 
     'outer: for path in files {
         let f = match fs::File::open(path) {
@@ -3435,13 +3537,17 @@ fn build_seq_cache_streaming(
         let reader = std::io::BufReader::new(f);
         for line in reader.lines() {
             if let Some(cap) = max_seqs { if count >= cap { break 'outer; } }
-            let line = match line { Ok(l) => l, Err(_) => continue };
+            let line = match line { Ok(l) => l, Err(_) => { parse_err += 1; continue; } };
             let line = line.trim();
-            if line.is_empty() { continue; }
+            if line.is_empty() { empty_text += 1; continue; }
+            lines_read += 1;
             if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) {
                 if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
                     let (ids, mask) = tok.encode_dialog(text);
-                    if ids.len() < min_len || ids.len() > max_len { continue; }
+                    if ids.len() < min_len || ids.len() > max_len {
+                        wrong_len += 1;
+                        continue;
+                    }
 
                     // record offset in index
                     let offset = cache_w.seek(SeekFrom::Current(0))?;
@@ -3451,23 +3557,33 @@ fn build_seq_cache_streaming(
                     // write seq to cache
                     cache_w.write_all(&(ids.len() as u32).to_le_bytes())?;
                     for &id in &ids { cache_w.write_all(&(id as u32).to_le_bytes())?; }
-                    for &m  in &mask { cache_w.write_all(&m.to_bits().to_le_bytes())?; }
+                    // mask length is ids.len() - 1 (one weight per target position)
+                    for &m in &mask { cache_w.write_all(&m.to_bits().to_le_bytes())?; }
 
                     count += 1;
                     if count % 100_000 == 0 {
                         print!("\r  cached {} sequences...", count);
                         std::io::stdout().flush().ok();
                     }
+                } else {
+                    empty_text += 1;
                 }
+            } else {
+                parse_err += 1;
             }
         }
     }
 
-    // patch count at start of both files
+    println!("\n  Cache stats: lines_read={} parse_err={} empty_text={} wrong_len={} cached={}",
+             lines_read, parse_err, empty_text, wrong_len, count);
+
+    // patch count at start of both files and flush to disk
     cache_w.seek(SeekFrom::Start(0))?;
     cache_w.write_all(&(count as u64).to_le_bytes())?;
+    cache_w.flush()?;
     idx_w.seek(SeekFrom::Start(0))?;
     idx_w.write_all(&(count as u64).to_le_bytes())?;
+    idx_w.flush()?;
 
     println!("\n  Done: {} sequences cached", count);
     Ok(count)

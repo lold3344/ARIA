@@ -41,12 +41,17 @@
   - `load_checkpoint()` -- inference mode: loads weights + tokenizer only (no optimizer state, no OOM)
   - `load_checkpoint_for_training()` -- training resume: loads weights + Adam state + FP32 master weights
 - Removed obsolete separate `aria_tokenizer.json` save path; tokenizer is always embedded in GGUF
+- Interactive dataset selection in `train_fresh` / `train_debug` (`all` or numbered files)
+- Sequence cache now depends on the selected dataset set; stale/incomplete caches are auto-removed and rebuilt
+- Fixed streaming cache header bug: count is now flushed to disk, empty/broken caches are detected and rebuilt
+- Adaptive warmup: `warmup_steps = min(user_warmup, total_steps / 4).max(100)` so small tests reach full LR quickly
+- Added `train_debug` binary with per-gradient NaN/inf diagnostics
 - Training verified on RTX 4060:
   - `MICRO_BATCH_N = 4`
   - `PRETRAIN_BATCH_SIZE = 512`
   - `max_seq_len = 512`
   - Speed: ~170 seq/s
-  - Stable loss decrease confirmed on 5000-sequence smoke test
+  - Stable loss decrease confirmed: 10.35 → 7.36 on 200k sequences / 2 epochs
 
 ### v3.5.2
 - **GGUF checkpoint format** -- weights, tokenizer, and Adam state in a single .gguf file
@@ -158,6 +163,12 @@ Set-Item Env:ARIA_CONTINUE_TRAIN 1
 .\target\release\inference.exe your prompt here
 .\target\release\debug_logits.exe
 
+### Debug training (gradient diagnostics)
+
+.\target\release\train_debug.exe "data base"
+
+Same as `train_fresh.exe`, but compiled with `#[cfg(feature = "train_debug")]` diagnostics that print the first tensor with non-finite gradients on each step. Use for tracking down NaN/inf sources.
+
 ### Export Q4_0 Inference Model
 
 .\target\release\export_gguf.exe aria json/aria_checkpoint.gguf aria json/aria_inference.gguf
@@ -177,7 +188,7 @@ Use USER / ASSISTANT tokens for dialog fine-tuning. The tokenizer is trained fro
 | Variable | Description | Default |
 |---|---|---|
 | ARIA_LR | Peak learning rate | 0.0003 |
-| ARIA_WARMUP | Warmup steps | 1000 |
+| ARIA_WARMUP | Warmup steps (capped at total_steps/4) | 1000 |
 | ARIA_MAX_SEQS | Sequences per epoch (omit to use all selected sequences) | -- |
 | ARIA_EPOCHS | Number of epochs | 5 |
 | ARIA_VOCAB_LINES | Lines for tokenizer training | 500,000 |
@@ -188,7 +199,7 @@ Gradient clipping is always enabled (norm=1.0) with NaN/inf fallback.
 
 Intermediate checkpoints are saved as `aria json/aria_checkpoint.gguf.<N>_batches.gguf`.
 
-LR schedule: linear warmup to ARIA_LR over ARIA_WARMUP steps, then cosine decay to 0.3x ARIA_LR.
+LR schedule: linear warmup to ARIA_LR over `min(ARIA_WARMUP, total_steps/4)` steps (at least 100), then cosine decay to 0.3x ARIA_LR.
 
 Quick run on selected datasets (e.g. only wiki + sberquad):
 # at prompt type: 14 17
@@ -204,6 +215,7 @@ Smoke test (used for stability validation):
 # at prompt type: all
 Set-Item Env:ARIA_MAX_SEQS 5000
 Set-Item Env:ARIA_EPOCHS 5
+Set-Item Env:ARIA_LR 0.0001
 .\target\release\train_fresh.exe "data base"
 
 ## Interactive Commands
