@@ -46,6 +46,7 @@
 - Fixed streaming cache header bug: count is now flushed to disk, empty/broken caches are detected and rebuilt
 - Adaptive warmup: `warmup_steps = min(user_warmup, total_steps / 4).max(100)` so small tests reach full LR quickly
 - Added `train_debug` binary with per-gradient NaN/inf diagnostics
+- Added Tauri 2.0 GUI wrapper (`aria-gui.exe`) for training and inference
 - Training verified on RTX 4060:
   - `MICRO_BATCH_N = 4`
   - `PRETRAIN_BATCH_SIZE = 512`
@@ -174,6 +175,46 @@ Same as `train_fresh.exe`, but compiled with `#[cfg(feature = "train_debug")]` d
 .\target\release\export_gguf.exe aria json/aria_checkpoint.gguf aria json/aria_inference.gguf
 
 Produces a ~300MB inference-only file with no optimizer state or master weights.
+
+## ARIA GUI (Tauri)
+
+A desktop wrapper is available in `src-tauri/` with a web frontend in `gui/`.
+
+### Build and run
+
+cd gui && npm install && npm run build
+cd ../src-tauri && cargo build --release
+..\src-tauri\target\release\aria-gui.exe
+
+### Features
+
+- **Training tab**: choose mode (Train Fresh / Debug Training / SFT Train / Tiny Train), set LR/warmup/epochs, select datasets, toggle cache reuse, start/stop training.
+- **Inference tab**: select a `.gguf` checkpoint and run Greedy / Sample / Inference / Test Suite / Debug Logits.
+- **Tools tab**: refresh file lists, delete all `.gguf` or sequence caches, export a Q4_0 inference model.
+- **Console**: streams stdout/stderr from the running CLI binary in real time. Lines are printed as `println!` instead of carriage-return progress bars so they appear immediately in the GUI.
+
+Training modes map to the CLI binaries:
+
+| GUI mode | Binary |
+|---|---|
+| Train Fresh | `train_fresh.exe` |
+| Debug Training | `train_debug.exe` |
+| SFT Train | `sft_train.exe` |
+| Tiny Train | `tiny_train.exe` |
+
+Inference modes map to:
+
+| GUI mode | Binary |
+|---|---|
+| Greedy | `greedy_test.exe` |
+| Sample | `sample_test.exe` |
+| Inference | `inference.exe` |
+| Test Suite | `test_suite.exe` |
+| Debug Logits | `debug_logits.exe` |
+
+### Note on the Chat tab
+
+The Chat tab is currently a placeholder. Real interactive chat requires a persistent stdin handle to the `aria.exe` interactive binary, which is not implemented in this minimal GUI version. Use `aria.exe` directly in a terminal for interactive conversation.
 
 ## Dataset Format
 

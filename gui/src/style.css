@@ -276,3 +276,9 @@ button.danger:hover {
   border-radius: 6px;
   color: var(--text);
 }
+
+.hint {
+  color: var(--text-dim);
+  font-size: 12px;
+  margin: 0 0 12px;
+}

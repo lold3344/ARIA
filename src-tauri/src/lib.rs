@@ -13,6 +13,7 @@ pub fn run() {
             commands::start_training,
             commands::stop_training,
             commands::start_inference,
+            commands::export_gguf,
             commands::send_chat_message,
             files::list_gguf,
             files::list_datasets,

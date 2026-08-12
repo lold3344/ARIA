@@ -3409,10 +3409,9 @@ pub fn pretrain_from_files(
                 let remaining = n_batches.saturating_sub(step + 1);
                 let elapsed = t0.elapsed().as_secs_f32();
                 let seq_per_s = ((step + 1) * batch_size) as f32 / elapsed.max(0.001);
-                print!("\r  Epoch {}/{}  |  batch {}/{}  ({} remaining)  |  loss={:.4}  |  {:.0} seq/s  |  lr={:.6}       ",
+                println!("  Epoch {}/{}  |  batch {}/{}  ({} remaining)  |  loss={:.4}  |  {:.0} seq/s  |  lr={:.6}",
                     epoch+1, epochs, step+1, n_batches, remaining,
                     epoch_loss / epoch_batches as f32, seq_per_s, step_lr);
-                std::io::stdout().flush().ok();
             }
         }
 
@@ -3580,8 +3579,7 @@ fn build_seq_cache_streaming(
 
                     count += 1;
                     if count % 100_000 == 0 {
-                        print!("\r  cached {} sequences...", count);
-                        std::io::stdout().flush().ok();
+                        println!("  cached {} sequences...", count);
                     }
                 } else {
                     empty_text += 1;

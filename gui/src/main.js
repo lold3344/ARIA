@@ -186,6 +186,8 @@ function render() {
             <select id="train-mode">
               <option value="fresh">Train Fresh</option>
               <option value="debug">Debug Training</option>
+              <option value="sft">SFT Train</option>
+              <option value="tiny">Tiny Train</option>
             </select>
           </label>
           <label>Max Seqs
@@ -218,11 +220,13 @@ function render() {
         <label>Weights
           <select id="weights-select"></select>
         </label>
-        <label>Mode
+          <label>Mode
           <select id="inference-mode">
             <option value="greedy">Greedy</option>
             <option value="sample">Sample</option>
             <option value="inference">Inference</option>
+            <option value="test_suite">Test Suite</option>
+            <option value="debug_logits">Debug Logits</option>
           </select>
         </label>
         <label>Prompt
@@ -235,10 +239,11 @@ function render() {
 
       <section id="tab-chat" class="tab">
         <h2>Chat</h2>
+        <p class="hint">Not yet implemented. Chat will run interactive inference with persistent stdin.</p>
         <div id="chat-history" class="chat-box"></div>
         <div class="chat-input-row">
-          <input id="chat-input" type="text" placeholder="Type message..." />
-          <button id="btn-send">Send</button>
+          <input id="chat-input" type="text" placeholder="Type message..." disabled />
+          <button id="btn-send" disabled>Send</button>
         </div>
       </section>
 
@@ -252,6 +257,18 @@ function render() {
         <label>Cache for training
           <select id="cache-select"></select>
         </label>
+        <h3>Export Q4_0</h3>
+        <div class="grid">
+          <label>Source
+            <input id="export-source" type="text" value="aria_checkpoint.gguf" />
+          </label>
+          <label>Target
+            <input id="export-target" type="text" value="aria_inference.gguf" />
+          </label>
+        </div>
+        <div class="buttons">
+          <button id="btn-export">Export GGUF</button>
+        </div>
       </section>
 
       <section id="console-section">
@@ -280,6 +297,7 @@ function bindActions() {
   el('btn-delete-gguf').addEventListener('click', deleteAllGguf)
   el('btn-delete-cache').addEventListener('click', deleteAllCache)
   el('btn-refresh').addEventListener('click', refreshLists)
+  el('btn-export').addEventListener('click', exportGguf)
 
   el('btn-send').addEventListener('click', () => {
     const input = el('chat-input')
@@ -289,6 +307,20 @@ function bindActions() {
     input.value = ''
     hist.scrollTop = hist.scrollHeight
   })
+}
+
+async function exportGguf() {
+  const source = el('export-source').value
+  const target = el('export-target').value
+  clearLog()
+  logLine('[INFO] Starting export...')
+  try {
+    const id = await invoke('export_gguf', { source, target })
+    currentProcessId = id
+    logLine(`[INFO] Export started: ${id}`)
+  } catch (e) {
+    logLine(`[ERR] export_gguf: ${e}`)
+  }
 }
 
 function escapeHtml(text) {

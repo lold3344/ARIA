@@ -116,9 +116,8 @@ pub async fn spawn_process(
     // On Windows, disable creation of a console window for the child.
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         #[allow(unused_imports)]
-        let _ = ();
+        use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
 
