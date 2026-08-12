@@ -153,8 +153,25 @@ pub async fn spawn_process(
         let id2 = id.clone();
         let mut rx = tx.subscribe();
         tokio::spawn(async move {
-            while let Ok(line) = rx.recv().await {
-                let _ = app.emit("process-log", serde_json::json!({"id": &id2, "line": line }));
+            let mut buffer = Vec::with_capacity(64);
+            let mut last_emit = std::time::Instant::now();
+            loop {
+                match rx.recv().await {
+                    Ok(line) => {
+                        buffer.push(line);
+                        if buffer.len() >= 64 || last_emit.elapsed().as_millis() >= 250 {
+                            let _ = app.emit("process-log", serde_json::json!({"id": &id2, "lines": buffer }));
+                            buffer = Vec::with_capacity(64);
+                            last_emit = std::time::Instant::now();
+                        }
+                    }
+                    Err(_) => {
+                        if !buffer.is_empty() {
+                            let _ = app.emit("process-log", serde_json::json!({"id": &id2, "lines": buffer }));
+                        }
+                        break;
+                    }
+                }
             }
         });
     }

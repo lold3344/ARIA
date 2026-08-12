@@ -3338,6 +3338,7 @@ pub fn pretrain_from_files(
     )?;
 
     let offsets = load_seq_index(&index_path)?;
+    let sources = load_seq_sources(&index_path)?;
     let n = if let Some(cap) = max_seqs { offsets.len().min(cap) } else { offsets.len() };
     println!("Sequences: {}", n);
 
@@ -3355,9 +3356,12 @@ pub fn pretrain_from_files(
     const CHECKPOINT_EVERY_BATCHES: usize = 80_000;
 
     for epoch in 0..epochs {
-        let mut epoch_loss = 0.0f32;
-        let mut epoch_batches = 0usize;
-        let t0 = Instant::now();
+    let mut epoch_loss = 0.0f32;
+    let mut epoch_batches = 0usize;
+    let t0 = Instant::now();
+
+    #[cfg(feature = "train_debug")]
+    let selected_files_dbg: Vec<String> = selected_files.iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string()).collect();
 
         // Shuffle within windows of `window` sequences so the order varies each
         // epoch but disk reads remain clustered (forward-only within each window).
@@ -3395,6 +3399,18 @@ pub fn pretrain_from_files(
             }
 
             let loss = model.train_batch_masked(&batch_seqs, &batch_masks, step_lr);
+
+            #[cfg(feature = "train_debug")]
+            if !loss.is_finite() {
+                eprintln!("[train_debug] non-finite loss={loss} at step {current_step}");
+                for (bi, &seq_idx) in batch_indices.iter().enumerate() {
+                    if bi >= sources.len() { break; }
+                    let src = &sources[seq_idx];
+                    let fname = selected_files_dbg.get(src.file_id as usize).map(|s| s.as_str()).unwrap_or("?");
+                    eprintln!("[train_debug] batch seq {bi} -> file [{}] {} line {}", src.file_id, fname, src.line_no);
+                }
+            }
+
             epoch_loss += loss;
             epoch_batches += 1;
             global_batches += 1;
@@ -3531,13 +3547,14 @@ fn build_seq_cache_streaming(
     if files.is_empty() { anyhow::bail!("No .jsonl files selected"); }
 
     println!("Building sequence cache (streaming) from {} files:", files.len());
-    for p in files { println!("  - {}", p.display()); }
+    for (fid, p) in files.iter().enumerate() { println!("  [{}] {}", fid, p.display()); }
 
     let mut cache_w = std::io::BufWriter::new(fs::File::create(cache_path)?);
     let mut idx_w   = std::io::BufWriter::new(fs::File::create(index_path)?);
 
     // placeholder count (will patch at end)
     cache_w.write_all(&0u64.to_le_bytes())?;
+    // Index format: u64 count, then per seq: u64 offset, u32 len, u32 file_id, u32 line_no
     idx_w.write_all(&0u64.to_le_bytes())?;
 
     let mut count = 0usize;
@@ -3546,13 +3563,14 @@ fn build_seq_cache_streaming(
     let mut wrong_len = 0usize;
     let mut parse_err = 0usize;
 
-    'outer: for path in files {
+    'outer: for (file_id, path) in files.iter().enumerate() {
+        let file_id = file_id as u32;
         let f = match fs::File::open(path) {
             Ok(f) => f,
             Err(e) => { eprintln!("Warning: cannot open {}: {}", path.display(), e); continue; }
         };
         let reader = std::io::BufReader::new(f);
-        for line in reader.lines() {
+        for (line_no, line) in reader.lines().enumerate() {
             if let Some(cap) = max_seqs { if count >= cap { break 'outer; } }
             let line = match line { Ok(l) => l, Err(_) => { parse_err += 1; continue; } };
             let line = line.trim();
@@ -3570,6 +3588,8 @@ fn build_seq_cache_streaming(
                     let offset = cache_w.seek(SeekFrom::Current(0))?;
                     idx_w.write_all(&offset.to_le_bytes())?;
                     idx_w.write_all(&(ids.len() as u32).to_le_bytes())?;
+                    idx_w.write_all(&file_id.to_le_bytes())?;
+                    idx_w.write_all(&(line_no as u32 + 1).to_le_bytes())?;
 
                     // write seq to cache
                     cache_w.write_all(&(ids.len() as u32).to_le_bytes())?;
@@ -3645,7 +3665,14 @@ fn load_seq_cache(path: &str) -> anyhow::Result<Vec<(Vec<usize>, Vec<f32>)>> {
     Ok(seqs)
 }
 
-// Index format: u64 count, then per seq: u64 byte_offset, u32 seq_len
+/// Index entry linking a cached sequence back to its source file and line.
+#[derive(Clone, Debug)]
+pub struct SeqSourceInfo {
+    pub file_id: u32,
+    pub line_no: u32,
+}
+
+// Index format: u64 count, then per seq: u64 byte_offset, u32 seq_len, u32 file_id, u32 line_no
 fn build_seq_index(cache_path: &str, index_path: &str) -> anyhow::Result<()> {
     use std::io::{Read, Write, Seek, SeekFrom};
     let mut f = std::io::BufReader::new(fs::File::open(cache_path)?);
@@ -3686,6 +3713,8 @@ fn load_seq_index(index_path: &str) -> anyhow::Result<Vec<u64>> {
         f.read_exact(&mut buf8)?;
         offsets.push(u64::from_le_bytes(buf8));
         f.read_exact(&mut buf4)?; // skip len
+        f.read_exact(&mut buf4)?; // skip file_id
+        f.read_exact(&mut buf4)?; // skip line_no
     }
     Ok(offsets)
 }
@@ -3702,8 +3731,29 @@ fn load_seq_lengths(index_path: &str) -> anyhow::Result<Vec<usize>> {
         f.read_exact(&mut buf8)?; // skip offset
         f.read_exact(&mut buf4)?;
         lens.push(u32::from_le_bytes(buf4) as usize);
+        f.read_exact(&mut buf4)?; // skip file_id
+        f.read_exact(&mut buf4)?; // skip line_no
     }
     Ok(lens)
+}
+
+pub fn load_seq_sources(index_path: &str) -> anyhow::Result<Vec<SeqSourceInfo>> {
+    use std::io::Read;
+    let mut f = std::io::BufReader::new(fs::File::open(index_path)?);
+    let mut buf8 = [0u8; 8];
+    f.read_exact(&mut buf8)?;
+    let n = u64::from_le_bytes(buf8) as usize;
+    let mut sources = Vec::with_capacity(n);
+    let mut buf4 = [0u8; 4];
+    for _ in 0..n {
+        f.read_exact(&mut buf8)?; // skip offset
+        f.read_exact(&mut buf4)?; // skip len
+        let file_id = u32::from_le_bytes(buf4);
+        f.read_exact(&mut buf4)?;
+        let line_no = u32::from_le_bytes(buf4);
+        sources.push(SeqSourceInfo { file_id, line_no });
+    }
+    Ok(sources)
 }
 
 fn read_seq_at(f: &mut std::io::BufReader<fs::File>, offset: u64) -> anyhow::Result<(Vec<usize>, Vec<f32>)> {

@@ -337,8 +337,14 @@ async function init() {
   await refreshLists()
 
   await listen('process-log', event => {
-    const { line } = event.payload
-    logLine(line)
+    const payload = event.payload
+    if (payload.lines && Array.isArray(payload.lines)) {
+      for (const line of payload.lines) {
+        logLine(line)
+      }
+    } else if (payload.line) {
+      logLine(payload.line)
+    }
   })
 }
 
