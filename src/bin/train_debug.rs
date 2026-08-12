@@ -116,7 +116,7 @@ fn main() -> anyhow::Result<()> {
     let num_heads  = 14;
     let num_layers = 20;
     let ffn_dim    = 3584;
-    let max_seq    = 512;
+    let max_seq    = aria::transformer_cuda::MAX_TOKENS_PER_SEQ;
 
     let vocab_lines: usize = std::env::var("ARIA_VOCAB_LINES")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(2_000_000);
@@ -139,7 +139,7 @@ fn main() -> anyhow::Result<()> {
     let max_seqs: Option<usize> = std::env::var("ARIA_MAX_SEQS")
         .ok().and_then(|s| s.parse().ok());
     let (_, _, n) = aria::transformer_cuda::prepare_seq_cache(
-        &mut tokenizer, data_dir, &selected_files, max_seq, 2, max_seqs
+        &mut tokenizer, data_dir, &selected_files, max_seq, aria::transformer_cuda::MIN_TOKENS_PER_SEQ, max_seqs
     )?;
     println!("[train_debug] Cache ready: {} sequences\n", n);
 

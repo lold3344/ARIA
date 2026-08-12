@@ -106,8 +106,8 @@ impl GpuContext {
 //  Constants
 // ─────────────────────────────────────────────────────────────
 const LEARNING_RATE:       f32   = 3e-4;
-const MAX_TOKENS_PER_SEQ:  usize = 256;
-const MIN_TOKENS_PER_SEQ:  usize = 6;
+pub const MAX_TOKENS_PER_SEQ:  usize = 256;
+pub const MIN_TOKENS_PER_SEQ:  usize = 6;
 const PRETRAIN_EPOCHS:     usize = 5;
 const PRETRAIN_BATCH_SIZE: usize = 512;
 const MAX_SEQS_PER_EPOCH:  usize = 25_000_000;
@@ -1235,6 +1235,9 @@ impl TransformerModel {
         check_f32("g_pos",   &self.g_pos);
         check_f32("g_ln_f_g", &self.g_ln_f_g);
         check_f32("g_ln_f_b", &self.g_ln_f_b);
+        check_f16("g_embed_head_f16", &self.g_embed_head_f16);
+        check_f16("d_logits", &self.d_logits);
+        check_f16("dx_buf", &self.dx_buf);
         for li in 0..nl {
             let lname = format!("L{}", li);
             check_f16(&format!("{} g_w_qkv", lname), &self.grads[li].g_w_qkv);
@@ -1250,6 +1253,21 @@ impl TransformerModel {
             check_f32(&format!("{} g_ln2_g", lname), &self.grads[li].g_ln2_g);
             check_f32(&format!("{} g_ln2_b", lname), &self.grads[li].g_ln2_b);
         }
+    }
+
+    /// Returns (min_id, max_id, num_out_of_range) for the token ids in ids_buf.
+    pub fn diagnose_ids(&self, nt: usize) -> (i32, i32, usize) {
+        let ids: Vec<i32> = self.stream.clone_dtoh(&self.ids_buf).unwrap();
+        let mut min_id = i32::MAX;
+        let mut max_id = i32::MIN;
+        let mut bad = 0usize;
+        for i in 0..nt {
+            let id = ids[i];
+            min_id = min_id.min(id);
+            max_id = max_id.max(id);
+            if id < 0 || id >= self.vocab_size as i32 { bad += 1; }
+        }
+        (min_id, max_id, bad)
     }
 
     // Single-step inference using KV-cache
