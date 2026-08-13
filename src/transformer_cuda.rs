@@ -380,6 +380,12 @@ pub struct TransformerModel {
     d_ctx_buf:  CudaSlice<f16>,  // [H, max_T, dh]
 
     cuda_graph: Option<CudaGraph>,  // captured fwd+bwd graph for full micro-batches
+
+    // Debug: source info for the last training batch (used to diagnose inf gradients).
+    #[cfg(feature = "train_debug")]
+    last_batch_sources: Vec<SeqSourceInfo>,
+    #[cfg(feature = "train_debug")]
+    last_batch_files: Vec<String>,
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1039,6 +1045,10 @@ impl TransformerModel {
             int4_quantized: false,
             gradient_checkpointing: false,
             lora_backward_enabled: false,
+            #[cfg(feature = "train_debug")]
+            last_batch_sources: Vec::new(),
+            #[cfg(feature = "train_debug")]
+            last_batch_files: Vec::new(),
         }
     }
 
@@ -1868,6 +1878,44 @@ impl TransformerModel {
         loss
     }
 
+    /// Store source info for the current batch so apply_gradients can diagnose inf sources.
+    #[cfg(feature = "train_debug")]
+    pub fn set_batch_sources(&mut self, sources: Vec<SeqSourceInfo>, files: Vec<String>) {
+        self.last_batch_sources = sources;
+        self.last_batch_files = files;
+    }
+
+    /// Returns true if any gradient is non-finite.
+    #[cfg(feature = "train_debug")]
+    pub fn grads_contain_nonfinite(&self) -> bool {
+        let check_f16 = |buf: &CudaSlice<f16>| -> bool {
+            if buf.is_empty() { return false; }
+            let v: Vec<f16> = self.stream.clone_dtoh(buf).unwrap();
+            v.iter().any(|&x| !x.to_f32().is_finite())
+        };
+        let check_f32 = |buf: &CudaSlice<f32>| -> bool {
+            if buf.is_empty() { return false; }
+            let v: Vec<f32> = self.stream.clone_dtoh(buf).unwrap();
+            v.iter().any(|&x| !x.is_finite())
+        };
+        if check_f32(&self.g_embed) || check_f32(&self.g_pos) ||
+           check_f32(&self.g_ln_f_g) || check_f32(&self.g_ln_f_b) ||
+           check_f16(&self.g_embed_head_f16) || check_f16(&self.d_logits) || check_f16(&self.dx_buf) {
+            return true;
+        }
+        for li in 0..self.num_layers {
+            if check_f16(&self.grads[li].g_w_qkv) || check_f16(&self.grads[li].g_w_out) ||
+               check_f16(&self.grads[li].g_w_ff1) || check_f16(&self.grads[li].g_w_ff2) ||
+               check_f32(&self.grads[li].g_b_qkv) || check_f32(&self.grads[li].g_b_out) ||
+               check_f32(&self.grads[li].g_b_ff1) || check_f32(&self.grads[li].g_b_ff2) ||
+               check_f32(&self.grads[li].g_ln1_g) || check_f32(&self.grads[li].g_ln1_b) ||
+               check_f32(&self.grads[li].g_ln2_g) || check_f32(&self.grads[li].g_ln2_b) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn train_batch_gpu(&mut self, seqs: &[Vec<usize>], masks: &[Vec<f32>], lr: f32) -> f32 {
         let d   = self.d_model;
         let ff  = self.ffn_dim;
@@ -2655,7 +2703,14 @@ impl TransformerModel {
         if !grads_finite {
             eprintln!("[WARN] global_grad_norm is not finite ({:?}); zeroing gradients and skipping update", global_norm);
             #[cfg(feature = "train_debug")]
-            self.diagnose_inf_grad("apply_gradients");
+            {
+                self.diagnose_inf_grad("apply_gradients");
+                eprintln!("[train_debug] sources for the problematic batch:");
+                for (bi, src) in self.last_batch_sources.iter().enumerate() {
+                    let fname = self.last_batch_files.get(src.file_id as usize).map(|s| s.as_str()).unwrap_or("?");
+                    eprintln!("[train_debug]   seq {} -> file [{}] {} line {}", bi, src.file_id, fname, src.line_no);
+                }
+            }
             macro_rules! zero_g_f16 { ($g:expr) => {{
                 let n = ($g).len();
                 if n > 0 { unsafe { self.stream.launch_builder(&self.fns.zero_f16).arg(&mut ($g)).arg(&(n as i32)).launch(cfg1d(n)).unwrap(); } }
@@ -3398,13 +3453,21 @@ pub fn pretrain_from_files(
                 eprintln!("[train_debug] non-finite lr at step {current_step}, warmup={warmup_steps}, total={total_steps}");
             }
 
+            #[cfg(feature = "train_debug")]
+            {
+                let batch_srcs: Vec<SeqSourceInfo> = batch_indices.iter()
+                    .filter_map(|&idx| sources.get(idx).cloned())
+                    .collect();
+                model.set_batch_sources(batch_srcs, selected_files_dbg.clone());
+            }
+
             let loss = model.train_batch_masked(&batch_seqs, &batch_masks, step_lr);
 
             #[cfg(feature = "train_debug")]
             if !loss.is_finite() {
                 eprintln!("[train_debug] non-finite loss={loss} at step {current_step}");
                 for (bi, &seq_idx) in batch_indices.iter().enumerate() {
-                    if bi >= sources.len() { break; }
+                    if seq_idx >= sources.len() { break; }
                     let src = &sources[seq_idx];
                     let fname = selected_files_dbg.get(src.file_id as usize).map(|s| s.as_str()).unwrap_or("?");
                     eprintln!("[train_debug] batch seq {bi} -> file [{}] {} line {}", src.file_id, fname, src.line_no);
