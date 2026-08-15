@@ -1248,6 +1248,8 @@ impl TransformerModel {
         check_f16("g_embed_head_f16", &self.g_embed_head_f16);
         check_f16("d_logits", &self.d_logits);
         check_f16("dx_buf", &self.dx_buf);
+        check_f16("tmp_buf", &self.tmp_buf);
+        check_f16("x_norm_buf", &self.x_norm_buf);
         for li in 0..nl {
             let lname = format!("L{}", li);
             check_f16(&format!("{} g_w_qkv", lname), &self.grads[li].g_w_qkv);
@@ -1926,7 +1928,10 @@ impl TransformerModel {
         let mt  = self.max_seq_len;
         let nb  = seqs.len();
         if nb == 0 { return 0.0; }
-        let scale_f = 1.0f32;
+        // Normalize cross-entropy gradients by the number of target tokens in the batch.
+        // This prevents FP16 gradient overflow when many sequences are summed together.
+        let total_tokens: usize = seqs.iter().map(|s| s.len().saturating_sub(1)).sum();
+        let scale_f = 1.0f32 / total_tokens.max(1) as f32;
 
         self.adam_step += 1;
         let step = self.adam_step;
@@ -2628,8 +2633,8 @@ impl TransformerModel {
                 .launch(cfg).unwrap(); }
         }
 
-        // ── GRADIENT CLIPPING (global L2 norm ≤ 1.0) ─────────────
-        const MAX_GRAD_NORM: f32 = 1.0;
+        // ── GRADIENT CLIPPING (global L2 norm ≤ 0.5) ─────────────
+        const MAX_GRAD_NORM: f32 = 0.5;
 
         // Zero the accumulator scalar
         unsafe { self.stream.launch_builder(&self.fns.zero_scalar_f32)
