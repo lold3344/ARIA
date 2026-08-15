@@ -3811,6 +3811,7 @@ pub fn load_seq_sources(index_path: &str) -> anyhow::Result<Vec<SeqSourceInfo>> 
     for _ in 0..n {
         f.read_exact(&mut buf8)?; // skip offset
         f.read_exact(&mut buf4)?; // skip len
+        f.read_exact(&mut buf4)?;
         let file_id = u32::from_le_bytes(buf4);
         f.read_exact(&mut buf4)?;
         let line_no = u32::from_le_bytes(buf4);
